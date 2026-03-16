@@ -1,3 +1,5 @@
+#![allow(dead_code)] // legacy import-claw flow remains test-covered but is not exposed by the current daemon CLI
+
 use std::path::{Path, PathBuf};
 
 use clap::ValueEnum;
@@ -298,10 +300,16 @@ pub(crate) fn run_import_claw_cli(options: ImportClawCommandOptions) -> CliResul
             for warning in &result.warnings {
                 println!("- warning: {warning}");
             }
-            println!(
-                "next step: loongclaw chat --config {}",
-                result.output_path.display()
-            );
+            if let Ok(resolved_config) = load_or_default_config(&result.output_path, true) {
+                let config_path = result.output_path.display().to_string();
+                if let Some(primary_action) =
+                    crate::next_actions::collect_setup_next_actions(&resolved_config, &config_path)
+                        .into_iter()
+                        .next()
+                {
+                    println!("next step: {}", primary_action.command);
+                }
+            }
             Ok(())
         }
         ImportClawMode::Plan | ImportClawMode::Apply => {
@@ -430,7 +438,16 @@ pub(crate) fn run_import_claw_cli(options: ImportClawCommandOptions) -> CliResul
             for warning in &plan.warnings {
                 println!("- warning: {warning}");
             }
-            println!("next step: loongclaw chat --config {}", written.display());
+            if let Ok(resolved_config) = load_or_default_config(&written, true) {
+                let config_path = written.display().to_string();
+                if let Some(primary_action) =
+                    crate::next_actions::collect_setup_next_actions(&resolved_config, &config_path)
+                        .into_iter()
+                        .next()
+                {
+                    println!("next step: {}", primary_action.command);
+                }
+            }
             Ok(())
         }
     }

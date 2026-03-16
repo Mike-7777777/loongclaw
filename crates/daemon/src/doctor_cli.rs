@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::env;
 use std::fs;
 use std::path::Path;
 
@@ -15,17 +16,17 @@ pub(crate) struct DoctorCommandOptions {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DoctorCheckLevel {
+pub(crate) enum DoctorCheckLevel {
     Pass,
     Warn,
     Fail,
 }
 
 #[derive(Debug, Clone)]
-struct DoctorCheck {
-    name: String,
-    level: DoctorCheckLevel,
-    detail: String,
+pub(crate) struct DoctorCheck {
+    pub(crate) name: String,
+    pub(crate) level: DoctorCheckLevel,
+    pub(crate) detail: String,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -50,7 +51,7 @@ pub(crate) async fn run_doctor_cli(options: DoctorCommandOptions) -> CliResult<(
     config_mutated |= maybe_apply_provider_env_fix(&mut config, options.fix, &mut fixes);
     config_mutated |= maybe_apply_channel_env_fix(&mut config, options.fix, &mut fixes);
 
-    let has_provider_credentials = config.provider.authorization_header().is_some();
+    let has_provider_credentials = mvp::provider::provider_auth_ready(&config).await;
     if has_provider_credentials {
         checks.push(DoctorCheck {
             name: "provider credentials".to_owned(),
@@ -58,27 +59,7 @@ pub(crate) async fn run_doctor_cli(options: DoctorCommandOptions) -> CliResult<(
             detail: "provider credentials are available".to_owned(),
         });
     } else {
-        let mut hints = Vec::new();
-        if let Some(key) = config
-            .provider
-            .api_key
-            .as_deref()
-            .and_then(parse_provider_api_key_env_hint)
-            && !hints.iter().any(|existing| existing == key)
-        {
-            hints.push(key.to_owned());
-        }
-        if let Some(key) = config.provider.api_key_env.as_deref().map(str::trim)
-            && !key.is_empty()
-            && !hints.iter().any(|existing| existing == key)
-        {
-            hints.push(key.to_owned());
-        }
-        if let Some(default_key) = config.provider.kind.default_api_key_env()
-            && !hints.iter().any(|existing| existing == default_key)
-        {
-            hints.push(default_key.to_owned());
-        }
+        let hints = crate::onboard_cli::provider_credential_env_hints(&config.provider);
         let detail = if hints.is_empty() {
             "provider credentials are missing".to_owned()
         } else {
@@ -93,6 +74,8 @@ pub(crate) async fn run_doctor_cli(options: DoctorCommandOptions) -> CliResult<(
             detail,
         });
     }
+
+    checks.push(provider_transport_doctor_check(&config.provider));
 
     if options.skip_model_probe {
         checks.push(DoctorCheck {
@@ -169,6 +152,7 @@ pub(crate) async fn run_doctor_cli(options: DoctorCommandOptions) -> CliResult<(
         "create tool file root",
     ));
 
+    checks.extend(check_feishu_integration(&config, options.fix, &mut fixes));
     checks.extend(check_channel_surfaces(&config));
 
     if options.fix && config_mutated {
@@ -179,6 +163,7 @@ pub(crate) async fn run_doctor_cli(options: DoctorCommandOptions) -> CliResult<(
     }
 
     let summary = summarize_checks(&checks);
+    let next_steps = build_doctor_next_steps(&checks, &config_path, &config, options.fix);
     if options.json {
         let payload = json!({
             "ok": summary.fail == 0,
@@ -197,6 +182,7 @@ pub(crate) async fn run_doctor_cli(options: DoctorCommandOptions) -> CliResult<(
             }).collect::<Vec<_>>(),
             "fix_requested": options.fix,
             "applied_fixes": fixes,
+            "next_steps": next_steps,
         });
         let encoded = serde_json::to_string_pretty(&payload)
             .map_err(|error| format!("serialize doctor output failed: {error}"))?;
@@ -219,6 +205,12 @@ pub(crate) async fn run_doctor_cli(options: DoctorCommandOptions) -> CliResult<(
         "doctor summary: {} ok, {} warn, {} fail",
         summary.pass, summary.warn, summary.fail
     );
+    if !next_steps.is_empty() {
+        println!("next actions:");
+        for step in &next_steps {
+            println!("- {step}");
+        }
+    }
 
     if summary.fail > 0 {
         return Err("doctor detected failing checks".to_owned());
@@ -281,6 +273,426 @@ fn check_channel_surfaces(config: &mvp::config::LoongClawConfig) -> Vec<DoctorCh
     build_channel_surface_checks(&snapshots)
 }
 
+pub(crate) fn check_feishu_integration(
+    config: &mvp::config::LoongClawConfig,
+    fix: bool,
+    fixes: &mut Vec<String>,
+) -> Vec<DoctorCheck> {
+    if !feishu_integration_requested(&config.feishu) {
+        return Vec::new();
+    }
+
+    let mut checks = Vec::new();
+    let sqlite_path = config.feishu_integration.resolved_sqlite_path();
+    let sqlite_parent = sqlite_path.parent().unwrap_or(Path::new("."));
+    checks.push(check_directory_ready(
+        "feishu integration store",
+        sqlite_parent,
+        fix,
+        fixes,
+        "create feishu integration store directory",
+    ));
+
+    let store = mvp::feishu::FeishuTokenStore::new(sqlite_path);
+    let configured_ids = config.feishu.configured_account_ids();
+    let scoped = configured_ids.len() > 1;
+
+    for configured_id in configured_ids {
+        let resolved = match config.feishu.resolve_account(Some(configured_id.as_str())) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                checks.push(DoctorCheck {
+                    name: scoped_feishu_check_name(
+                        "feishu integration account",
+                        &configured_id,
+                        scoped,
+                    ),
+                    level: DoctorCheckLevel::Fail,
+                    detail: error,
+                });
+                continue;
+            }
+        };
+
+        let credentials_name = scoped_feishu_check_name(
+            "feishu integration credentials",
+            &resolved.configured_account_id,
+            scoped,
+        );
+        let has_app_id = resolved
+            .app_id()
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .is_some();
+        let has_app_secret = resolved
+            .app_secret()
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .is_some();
+        checks.push(DoctorCheck {
+            name: credentials_name,
+            level: if has_app_id && has_app_secret {
+                DoctorCheckLevel::Pass
+            } else {
+                DoctorCheckLevel::Fail
+            },
+            detail: if has_app_id && has_app_secret {
+                format!(
+                    "configured_account={} account={} app credentials are available",
+                    resolved.configured_account_id, resolved.account.id
+                )
+            } else {
+                format!(
+                    "configured_account={} account={} missing app credentials (need feishu.app_id/app_secret or account overrides)",
+                    resolved.configured_account_id, resolved.account.id
+                )
+            },
+        });
+
+        let grant_name =
+            scoped_feishu_check_name("feishu user grant", &resolved.configured_account_id, scoped);
+        let inventory =
+            match mvp::feishu::inspect_grants_for_account(&store, resolved.account.id.as_str()) {
+                Ok(inventory) => inventory,
+                Err(error) => {
+                    checks.push(DoctorCheck {
+                        name: grant_name,
+                        level: DoctorCheckLevel::Fail,
+                        detail: error,
+                    });
+                    continue;
+                }
+            };
+
+        if inventory.grants.is_empty() {
+            checks.push(DoctorCheck {
+                name: grant_name,
+                level: DoctorCheckLevel::Warn,
+                detail: format!(
+                    "configured_account={} account={} missing stored user grant; run `{}`",
+                    resolved.configured_account_id,
+                    resolved.account.id,
+                    crate::feishu_support::feishu_auth_start_command_hint(
+                        resolved.configured_account_id.as_str(),
+                        false,
+                        false,
+                    )
+                ),
+            });
+            continue;
+        }
+
+        let now_s = chrono::Utc::now().timestamp();
+        let required_scopes = config.feishu_integration.trimmed_default_scopes();
+        let Some(latest) = inventory.grants.first() else {
+            continue;
+        };
+        let effective_grant = inventory.effective_grant();
+        let effective_status =
+            mvp::feishu::auth::summarize_grant_status(effective_grant, now_s, &required_scopes);
+
+        checks.push(DoctorCheck {
+            name: grant_name,
+            level: DoctorCheckLevel::Pass,
+            detail: format!(
+                "configured_account={} account={} grants={} latest_open_id={} selected_open_id={} effective_open_id={}",
+                resolved.configured_account_id,
+                resolved.account.id,
+                inventory.grants.len(),
+                latest.principal.open_id,
+                inventory.selected_open_id.as_deref().unwrap_or("-"),
+                inventory.effective_open_id.as_deref().unwrap_or("-"),
+            ),
+        });
+        checks.push(DoctorCheck {
+            name: scoped_feishu_check_name(
+                "feishu selected grant",
+                &resolved.configured_account_id,
+                scoped,
+            ),
+            level: if inventory.selected_open_id.is_some() {
+                DoctorCheckLevel::Pass
+            } else if inventory.stale_selected_open_id.is_some() || inventory.selection_required() {
+                DoctorCheckLevel::Warn
+            } else {
+                DoctorCheckLevel::Pass
+            },
+            detail: if let Some(selected_open_id) = inventory.selected_open_id.as_deref() {
+                if let Some(selected_grant) = inventory
+                    .grants
+                    .iter()
+                    .find(|grant| grant.principal.open_id == selected_open_id)
+                {
+                    format!(
+                        "configured_account={} account={} selected_open_id={} selected_name={}",
+                        resolved.configured_account_id,
+                        resolved.account.id,
+                        selected_grant.principal.open_id,
+                        selected_grant.principal.name.as_deref().unwrap_or("-")
+                    )
+                } else {
+                    format!(
+                        "configured_account={} account={} stale selected_open_id={} (grant not found); rerun `{}`",
+                        resolved.configured_account_id,
+                        resolved.account.id,
+                        selected_open_id,
+                        crate::feishu_support::feishu_auth_select_command_hint(
+                            resolved.configured_account_id.as_str(),
+                        )
+                    )
+                }
+            } else if let Some(selected_open_id) = inventory
+                .stale_selected_open_id
+                .as_deref()
+                .filter(|_| inventory.selection_required())
+            {
+                format!(
+                    "configured_account={} account={} stale selected_open_id={} (grant not found); rerun `{}`",
+                    resolved.configured_account_id,
+                    resolved.account.id,
+                    selected_open_id,
+                    crate::feishu_support::feishu_auth_select_command_hint(
+                        resolved.configured_account_id.as_str(),
+                    )
+                )
+            } else if let Some(selected_open_id) = inventory.stale_selected_open_id.as_deref() {
+                format!(
+                    "configured_account={} account={} stale selected_open_id={} was cleared; single stored grant open_id={} now routes implicitly",
+                    resolved.configured_account_id,
+                    resolved.account.id,
+                    selected_open_id,
+                    latest.principal.open_id
+                )
+            } else if inventory.selection_required() {
+                format!(
+                    "configured_account={} account={} multiple stored grants without selected default; run `{}`",
+                    resolved.configured_account_id,
+                    resolved.account.id
+                    ,
+                    crate::feishu_support::feishu_auth_select_command_hint(
+                        resolved.configured_account_id.as_str(),
+                    )
+                )
+            } else {
+                format!(
+                    "configured_account={} account={} single stored grant open_id={} explicit selection not required",
+                    resolved.configured_account_id,
+                    resolved.account.id,
+                    latest.principal.open_id
+                )
+            },
+        });
+        checks.push(DoctorCheck {
+            name: scoped_feishu_check_name(
+                "feishu token freshness",
+                &resolved.configured_account_id,
+                scoped,
+            ),
+            level: if effective_grant.is_none() {
+                DoctorCheckLevel::Warn
+            } else if effective_status.refresh_token_expired {
+                DoctorCheckLevel::Fail
+            } else if effective_status.access_token_expired {
+                DoctorCheckLevel::Warn
+            } else {
+                DoctorCheckLevel::Pass
+            },
+            detail: if let Some(grant) = effective_grant {
+                format!(
+                    "configured_account={} account={} effective_open_id={} access_expired={} refresh_expired={}",
+                    resolved.configured_account_id,
+                    resolved.account.id,
+                    grant.principal.open_id,
+                    effective_status.access_token_expired,
+                    effective_status.refresh_token_expired
+                )
+            } else {
+                format!(
+                    "configured_account={} account={} cannot determine effective token freshness until a selected grant exists; run `{}`",
+                    resolved.configured_account_id,
+                    resolved.account.id,
+                    crate::feishu_support::feishu_auth_select_command_hint(
+                        resolved.configured_account_id.as_str(),
+                    )
+                )
+            },
+        });
+        checks.push(DoctorCheck {
+            name: scoped_feishu_check_name(
+                "feishu scope coverage",
+                &resolved.configured_account_id,
+                scoped,
+            ),
+            level: if effective_grant.is_none() {
+                DoctorCheckLevel::Warn
+            } else if effective_status.missing_scopes.is_empty() {
+                DoctorCheckLevel::Pass
+            } else {
+                DoctorCheckLevel::Warn
+            },
+            detail: if let Some(grant) = effective_grant {
+                format!(
+                    "configured_account={} account={} effective_open_id={} required_scopes={} missing_scopes={}",
+                    resolved.configured_account_id,
+                    resolved.account.id,
+                    grant.principal.open_id,
+                    required_scopes.join(","),
+                    effective_status.missing_scopes.join(",")
+                )
+            } else {
+                format!(
+                    "configured_account={} account={} cannot determine effective scope coverage until a selected grant exists; run `{}`",
+                    resolved.configured_account_id,
+                    resolved.account.id,
+                    crate::feishu_support::feishu_auth_select_command_hint(
+                        resolved.configured_account_id.as_str(),
+                    )
+                )
+            },
+        });
+        let doc_write_status = mvp::feishu::summarize_doc_write_scope_status(effective_grant);
+        checks.push(DoctorCheck {
+            name: scoped_feishu_check_name(
+                "feishu doc write readiness",
+                &resolved.configured_account_id,
+                scoped,
+            ),
+            level: if effective_grant.is_none() {
+                DoctorCheckLevel::Warn
+            } else if doc_write_status.ready {
+                DoctorCheckLevel::Pass
+            } else {
+                DoctorCheckLevel::Warn
+            },
+            detail: if let Some(grant) = effective_grant {
+                if doc_write_status.ready {
+                    format!(
+                        "configured_account={} account={} open_id={} doc_write_ready={} matched_scopes={} accepted_scopes={}",
+                        resolved.configured_account_id,
+                        resolved.account.id,
+                        grant.principal.open_id,
+                        doc_write_status.ready,
+                        doc_write_status.matched_scopes.join(","),
+                        doc_write_status.accepted_scopes.join(","),
+                    )
+                } else {
+                    format!(
+                        "configured_account={} account={} open_id={} doc_write_ready={} matched_scopes={} accepted_scopes={}; rerun `{}` to request document write scopes",
+                        resolved.configured_account_id,
+                        resolved.account.id,
+                        grant.principal.open_id,
+                        doc_write_status.ready,
+                        doc_write_status.matched_scopes.join(","),
+                        doc_write_status.accepted_scopes.join(","),
+                        crate::feishu_support::feishu_auth_start_command_hint(
+                            resolved.configured_account_id.as_str(),
+                            false,
+                            true,
+                        )
+                    )
+                }
+            } else {
+                format!(
+                    "configured_account={} account={} cannot determine active doc write readiness until a selected grant exists; select one with `{}`",
+                    resolved.configured_account_id,
+                    resolved.account.id,
+                    crate::feishu_support::feishu_auth_select_command_hint(
+                        resolved.configured_account_id.as_str(),
+                    )
+                )
+            },
+        });
+        let write_status = mvp::feishu::summarize_message_write_scope_status(effective_grant);
+        checks.push(DoctorCheck {
+            name: scoped_feishu_check_name(
+                "feishu message write readiness",
+                &resolved.configured_account_id,
+                scoped,
+            ),
+            level: if effective_grant.is_none() {
+                DoctorCheckLevel::Warn
+            } else if write_status.ready {
+                DoctorCheckLevel::Pass
+            } else {
+                DoctorCheckLevel::Warn
+            },
+            detail: if let Some(grant) = effective_grant {
+                if write_status.ready {
+                    format!(
+                        "configured_account={} account={} open_id={} write_ready={} matched_scopes={} accepted_scopes={}",
+                        resolved.configured_account_id,
+                        resolved.account.id,
+                        grant.principal.open_id,
+                        write_status.ready,
+                        write_status.matched_scopes.join(","),
+                        write_status.accepted_scopes.join(","),
+                    )
+                } else {
+                    format!(
+                        "configured_account={} account={} open_id={} write_ready={} matched_scopes={} accepted_scopes={}; rerun `{}` to request the recommended write scopes",
+                        resolved.configured_account_id,
+                        resolved.account.id,
+                        grant.principal.open_id,
+                        write_status.ready,
+                        write_status.matched_scopes.join(","),
+                        write_status.accepted_scopes.join(","),
+                        crate::feishu_support::feishu_auth_start_command_hint(
+                            resolved.configured_account_id.as_str(),
+                            true,
+                            false,
+                        )
+                    )
+                }
+            } else {
+                format!(
+                    "configured_account={} account={} cannot determine active write readiness until a selected grant exists; select one with `{}`",
+                    resolved.configured_account_id,
+                    resolved.account.id,
+                    crate::feishu_support::feishu_auth_select_command_hint(
+                        resolved.configured_account_id.as_str(),
+                    )
+                )
+            },
+        });
+    }
+
+    checks
+}
+
+fn feishu_integration_requested(config: &mvp::config::FeishuChannelConfig) -> bool {
+    config.enabled
+        || config
+            .account_id
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty())
+        || config
+            .default_account
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty())
+        || config
+            .app_id
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty())
+        || config
+            .app_secret
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty())
+        || !config.accounts.is_empty()
+}
+
+fn scoped_feishu_check_name(base_name: &str, configured_account_id: &str, scoped: bool) -> String {
+    if !scoped {
+        return base_name.to_owned();
+    }
+    format!("{base_name} [{configured_account_id}]")
+}
+
 fn build_channel_surface_checks(
     snapshots: &[mvp::channel::ChannelStatusSnapshot],
 ) -> Vec<DoctorCheck> {
@@ -325,6 +737,9 @@ fn build_channel_surface_checks(
                 ));
             }
         }
+        if let Some(check) = build_feishu_inbound_support_check(snapshot, scoped) {
+            checks.push(check);
+        }
     }
 
     checks
@@ -339,6 +754,52 @@ fn scoped_doctor_check_name(
         return base_name.to_owned();
     }
     format!("{base_name} [{}]", snapshot.configured_account_label)
+}
+
+fn build_feishu_inbound_support_check(
+    snapshot: &mvp::channel::ChannelStatusSnapshot,
+    scoped: bool,
+) -> Option<DoctorCheck> {
+    if snapshot.id != "feishu" {
+        return None;
+    }
+    let serve = snapshot.operation("serve")?;
+    if serve.health != mvp::channel::ChannelOperationHealth::Ready {
+        return None;
+    }
+
+    let message_types = snapshot_note_value(snapshot, "webhook_inbound_message_types")?;
+    let non_text_mode =
+        snapshot_note_value(snapshot, "webhook_inbound_non_text_mode").unwrap_or("unknown");
+    let binary_fetch =
+        snapshot_note_value(snapshot, "webhook_inbound_binary_fetch").unwrap_or("unknown");
+    let resource_download_tool =
+        snapshot_note_value(snapshot, "webhook_resource_download_tool").unwrap_or("unknown");
+    let resource_selection_mode =
+        snapshot_note_value(snapshot, "webhook_resource_selection_mode").unwrap_or("unknown");
+    let callback_event_types =
+        snapshot_note_value(snapshot, "webhook_callback_event_types").unwrap_or("unknown");
+    let callback_response_mode =
+        snapshot_note_value(snapshot, "webhook_callback_response_mode").unwrap_or("unknown");
+
+    Some(DoctorCheck {
+        name: scoped_doctor_check_name("feishu webhook inbound support", snapshot, scoped),
+        level: DoctorCheckLevel::Pass,
+        detail: format!(
+            "message_types={message_types} non_text_mode={non_text_mode} binary_fetch={binary_fetch} resource_download_tool={resource_download_tool} resource_selection_mode={resource_selection_mode} callback_event_types={callback_event_types} callback_response_mode={callback_response_mode}"
+        ),
+    })
+}
+
+fn snapshot_note_value<'a>(
+    snapshot: &'a mvp::channel::ChannelStatusSnapshot,
+    key: &str,
+) -> Option<&'a str> {
+    let prefix = format!("{key}=");
+    snapshot
+        .notes
+        .iter()
+        .find_map(|note| note.strip_prefix(prefix.as_str()))
 }
 
 fn doctor_check_spec(channel_id: &str, operation_id: &str) -> Option<DoctorChannelCheckSpec> {
@@ -439,40 +900,28 @@ fn maybe_apply_provider_env_fix(
     fix: bool,
     fixes: &mut Vec<String>,
 ) -> bool {
-    if !fix
-        || config
-            .provider
-            .api_key
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .is_some()
-    {
+    if !fix {
         return false;
     }
-
-    if let Some(existing_key) = config
-        .provider
-        .api_key_env
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned)
-    {
-        config.provider.api_key = Some(format!("${{{existing_key}}}"));
-        config.provider.api_key_env = None;
-        fixes.push(format!("migrate provider.api_key=${{{existing_key}}}"));
-        return true;
+    let Some(binding) =
+        crate::onboard_cli::preferred_provider_credential_env_binding(&config.provider)
+    else {
+        return false;
+    };
+    match binding.field {
+        crate::onboard_cli::ProviderCredentialEnvField::ApiKey => ensure_env_binding(
+            &mut config.provider.api_key_env,
+            &binding.env_name,
+            fixes,
+            "set provider.api_key_env",
+        ),
+        crate::onboard_cli::ProviderCredentialEnvField::OAuthAccessToken => ensure_env_binding(
+            &mut config.provider.oauth_access_token_env,
+            &binding.env_name,
+            fixes,
+            "set provider.oauth_access_token_env",
+        ),
     }
-
-    if let Some(default_key) = config.provider.kind.default_api_key_env() {
-        config.provider.api_key = Some(format!("${{{default_key}}}"));
-        config.provider.api_key_env = None;
-        fixes.push(format!("set provider.api_key=${{{default_key}}}"));
-        return true;
-    }
-
-    false
 }
 
 fn maybe_apply_channel_env_fix(
@@ -483,39 +932,9 @@ fn maybe_apply_channel_env_fix(
     if !fix {
         return false;
     }
-    let mut changed = false;
-
-    changed |= ensure_env_binding(
-        &mut config.telegram.bot_token_env,
-        "TELEGRAM_BOT_TOKEN",
-        fixes,
-        "set telegram.bot_token_env",
-    );
-    changed |= ensure_env_binding(
-        &mut config.feishu.app_id_env,
-        "FEISHU_APP_ID",
-        fixes,
-        "set feishu.app_id_env",
-    );
-    changed |= ensure_env_binding(
-        &mut config.feishu.app_secret_env,
-        "FEISHU_APP_SECRET",
-        fixes,
-        "set feishu.app_secret_env",
-    );
-    changed |= ensure_env_binding(
-        &mut config.feishu.verification_token_env,
-        "FEISHU_VERIFICATION_TOKEN",
-        fixes,
-        "set feishu.verification_token_env",
-    );
-    changed |= ensure_env_binding(
-        &mut config.feishu.encrypt_key_env,
-        "FEISHU_ENCRYPT_KEY",
-        fixes,
-        "set feishu.encrypt_key_env",
-    );
-
+    let channel_fixes = crate::migration::channels::apply_default_channel_env_bindings(config);
+    let changed = !channel_fixes.is_empty();
+    fixes.extend(channel_fixes);
     changed
 }
 
@@ -538,54 +957,36 @@ fn ensure_env_binding(
     true
 }
 
-fn parse_provider_api_key_env_hint(raw: &str) -> Option<&str> {
-    let trimmed = raw.trim();
-    if trimmed.len() >= 4 && trimmed[..4].eq_ignore_ascii_case("env:") {
-        let candidate = trimmed[4..].trim();
-        return looks_like_env_name(candidate).then_some(candidate);
+fn provider_transport_doctor_check(provider: &mvp::config::ProviderConfig) -> DoctorCheck {
+    let readiness = provider.transport_readiness();
+    DoctorCheck {
+        name: "provider transport".to_owned(),
+        level: match readiness.level {
+            mvp::config::ProviderTransportReadinessLevel::Ready => DoctorCheckLevel::Pass,
+            mvp::config::ProviderTransportReadinessLevel::Review => DoctorCheckLevel::Warn,
+            mvp::config::ProviderTransportReadinessLevel::Unsupported => DoctorCheckLevel::Fail,
+        },
+        detail: readiness.detail,
     }
-    if let Some(candidate) = parse_dollar_env_name(trimmed) {
-        return Some(candidate);
-    }
-    if let Some(candidate) = trimmed
-        .strip_prefix('%')
-        .and_then(|rest| rest.strip_suffix('%'))
-        .map(str::trim)
-        .filter(|value| looks_like_env_name(value))
-    {
-        return Some(candidate);
-    }
-    None
-}
-
-fn parse_dollar_env_name(raw: &str) -> Option<&str> {
-    let stripped = raw.strip_prefix('$')?.trim();
-    if stripped.is_empty() {
-        return None;
-    }
-    let candidate = stripped
-        .strip_prefix('{')
-        .and_then(|rest| rest.strip_suffix('}'))
-        .map(str::trim)
-        .unwrap_or(stripped);
-    looks_like_env_name(candidate).then_some(candidate)
-}
-
-fn looks_like_env_name(raw: &str) -> bool {
-    let mut chars = raw.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    if !(first.is_ascii_alphanumeric() || first == '_') {
-        return false;
-    }
-    chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' || ch == '.')
 }
 
 #[cfg(test)]
-pub(crate) fn resolve_secret_value(inline: Option<&str>, env_key: Option<&str>) -> Option<String> {
-    use std::env;
+fn collect_channel_doctor_checks(config: &mvp::config::LoongClawConfig) -> Vec<DoctorCheck> {
+    crate::migration::channels::collect_channel_doctor_checks(config)
+        .into_iter()
+        .map(|check| DoctorCheck {
+            name: check.name.to_owned(),
+            level: match check.level {
+                crate::migration::channels::ChannelCheckLevel::Pass => DoctorCheckLevel::Pass,
+                crate::migration::channels::ChannelCheckLevel::Warn => DoctorCheckLevel::Warn,
+                crate::migration::channels::ChannelCheckLevel::Fail => DoctorCheckLevel::Fail,
+            },
+            detail: check.detail,
+        })
+        .collect()
+}
 
+pub(crate) fn resolve_secret_value(inline: Option<&str>, env_key: Option<&str>) -> Option<String> {
     if let Some(value) = inline.map(str::trim).filter(|value| !value.is_empty()) {
         return Some(value.to_owned());
     }
@@ -646,8 +1047,131 @@ fn check_level_json(level: DoctorCheckLevel) -> &'static str {
     }
 }
 
+fn build_doctor_next_steps(
+    checks: &[DoctorCheck],
+    config_path: &Path,
+    config: &mvp::config::LoongClawConfig,
+    fix_requested: bool,
+) -> Vec<String> {
+    let mut steps = Vec::new();
+    let config_path_display = config_path.display().to_string();
+    let rerun_command = format!(
+        "{} doctor --config '{}'",
+        mvp::config::CLI_COMMAND_NAME,
+        config_path_display
+    );
+
+    if !fix_requested
+        && checks.iter().any(|check| {
+            check.detail.contains("rerun with --fix")
+                || matches!(
+                    check.name.as_str(),
+                    "memory path" | "tool file root" | "tool file root policy"
+                )
+                || check.name.ends_with("policy")
+        })
+    {
+        push_unique_step(
+            &mut steps,
+            format!("Apply safe local repairs: {rerun_command} --fix"),
+        );
+    }
+
+    if checks
+        .iter()
+        .any(|check| check.name == "provider credentials" && check.level != DoctorCheckLevel::Pass)
+    {
+        let hints = crate::onboard_cli::provider_credential_env_hints(&config.provider);
+        if !hints.is_empty() {
+            push_unique_step(
+                &mut steps,
+                format!("Set provider credentials in env: {}", hints.join(" or ")),
+            );
+        }
+    }
+
+    if checks
+        .iter()
+        .any(|check| check.name == "provider model probe" && check.level == DoctorCheckLevel::Fail)
+    {
+        push_unique_step(
+            &mut steps,
+            format!("Retry provider probe only after credentials are ready: {rerun_command}"),
+        );
+        push_unique_step(
+            &mut steps,
+            format!(
+                "If your provider blocks model listing during setup, retry with: {rerun_command} --skip-model-probe"
+            ),
+        );
+    }
+
+    let channel_actions =
+        crate::migration::channels::collect_channel_next_actions(config, &config_path_display);
+    if checks.iter().any(|check| {
+        check.level != DoctorCheckLevel::Pass
+            && (check.name.contains("channel")
+                || check.name.contains("default account policy")
+                || channel_actions
+                    .iter()
+                    .any(|action| check.name.to_ascii_lowercase().contains(action.id)))
+    }) {
+        for action in &channel_actions {
+            push_unique_step(
+                &mut steps,
+                format!("Bring {} online: {}", action.label, action.command),
+            );
+        }
+    }
+
+    if doctor_ready_for_first_turn(checks) {
+        for action in crate::next_actions::collect_setup_next_actions(config, &config_path_display)
+            .into_iter()
+            .take(2)
+        {
+            let prefix = match action.kind {
+                crate::next_actions::SetupNextActionKind::Ask => "Try a one-shot task",
+                crate::next_actions::SetupNextActionKind::Chat => "Open interactive chat",
+                crate::next_actions::SetupNextActionKind::Channel => "Open a channel",
+                crate::next_actions::SetupNextActionKind::Doctor => "Run diagnostics",
+            };
+            push_unique_step(&mut steps, format!("{prefix}: {}", action.command));
+        }
+    }
+
+    if (!checks.is_empty() && steps.is_empty())
+        || checks
+            .iter()
+            .any(|check| check.level != DoctorCheckLevel::Pass)
+    {
+        push_unique_step(&mut steps, format!("Re-run diagnostics: {rerun_command}"));
+    }
+
+    steps
+}
+
+fn doctor_ready_for_first_turn(checks: &[DoctorCheck]) -> bool {
+    checks
+        .iter()
+        .all(|check| check.level != DoctorCheckLevel::Fail)
+        && checks.iter().any(|check| {
+            check.name == "provider credentials" && check.level == DoctorCheckLevel::Pass
+        })
+}
+
+fn push_unique_step(steps: &mut Vec<String>, step: String) {
+    if !steps.iter().any(|existing| existing == &step) {
+        steps.push(step);
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static FEISHU_TEST_DB_COUNTER: AtomicU64 = AtomicU64::new(0);
+
     use super::*;
     use mvp::channel::{
         ChannelOperationHealth, ChannelOperationRuntime, ChannelOperationStatus,
@@ -677,23 +1201,240 @@ mod tests {
     }
 
     #[test]
-    fn maybe_apply_provider_env_fix_prefers_generic_api_key_reference() {
-        let mut config = mvp::config::LoongClawConfig::default();
-        config.provider.api_key = None;
-        config.provider.api_key_env = None;
-        let mut fixes = Vec::new();
+    fn channel_doctor_checks_omit_disabled_channels() {
+        let checks = collect_channel_doctor_checks(&mvp::config::LoongClawConfig::default());
+        assert!(
+            checks.is_empty(),
+            "disabled optional channels should not generate doctor warnings by default: {checks:#?}"
+        );
+    }
 
+    #[test]
+    fn channel_doctor_checks_report_enabled_channels_from_registry() {
+        let mut config = mvp::config::LoongClawConfig::default();
+        config.telegram.enabled = true;
+        config.telegram.bot_token = Some("123456:test-token".to_owned());
+        config.feishu.enabled = true;
+        config.feishu.app_id = Some("cli_a1b2c3".to_owned());
+        config.feishu.app_secret = Some("feishu-secret".to_owned());
+
+        let checks = collect_channel_doctor_checks(&config);
+        let names = checks
+            .iter()
+            .map(|check| check.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            names,
+            vec![
+                "telegram channel",
+                "feishu channel",
+                "feishu webhook verification"
+            ]
+        );
+        assert!(
+            checks
+                .iter()
+                .any(|check| check.name == "telegram channel"
+                    && check.level == DoctorCheckLevel::Pass),
+            "telegram doctor check should come from the channel registry: {checks:#?}"
+        );
+    }
+
+    #[test]
+    fn channel_env_fix_uses_registered_channel_defaults() {
+        let mut config = mvp::config::LoongClawConfig::default();
+        config.telegram.bot_token_env = None;
+        config.feishu.app_id_env = None;
+        config.feishu.app_secret_env = None;
+        config.feishu.verification_token_env = None;
+        config.feishu.encrypt_key_env = None;
+
+        let mut fixes = Vec::new();
+        let changed = maybe_apply_channel_env_fix(&mut config, true, &mut fixes);
+
+        assert!(changed);
+        assert_eq!(
+            config.telegram.bot_token_env.as_deref(),
+            Some("TELEGRAM_BOT_TOKEN")
+        );
+        assert_eq!(config.feishu.app_id_env.as_deref(), Some("FEISHU_APP_ID"));
+        assert_eq!(
+            config.feishu.app_secret_env.as_deref(),
+            Some("FEISHU_APP_SECRET")
+        );
+        assert_eq!(
+            config.feishu.verification_token_env.as_deref(),
+            Some("FEISHU_VERIFICATION_TOKEN")
+        );
+        assert_eq!(
+            config.feishu.encrypt_key_env.as_deref(),
+            Some("FEISHU_ENCRYPT_KEY")
+        );
+        assert_eq!(fixes.len(), 5);
+    }
+
+    #[test]
+    fn provider_credential_env_hints_prioritize_oauth_defaults() {
+        let hints = crate::onboard_cli::provider_credential_env_hints(
+            &mvp::config::ProviderConfig::default(),
+        );
+
+        assert!(
+            hints.contains(&"OPENAI_CODEX_OAUTH_TOKEN".to_owned()),
+            "doctor hints should include the provider's oauth default when available: {hints:?}"
+        );
+        assert!(
+            hints.contains(&"OPENAI_API_KEY".to_owned()),
+            "doctor hints should still include the api key fallback for providers that support both auth paths: {hints:?}"
+        );
+    }
+
+    #[test]
+    fn provider_env_fix_prefers_oauth_default_when_available() {
+        let mut config = mvp::config::LoongClawConfig::default();
+        config.provider.api_key_env = None;
+        config.provider.oauth_access_token_env = None;
+
+        let mut fixes = Vec::new();
         let changed = maybe_apply_provider_env_fix(&mut config, true, &mut fixes);
 
         assert!(changed);
         assert_eq!(
-            config.provider.api_key.as_deref(),
-            Some("${OPENAI_API_KEY}")
+            config.provider.oauth_access_token_env.as_deref(),
+            Some("OPENAI_CODEX_OAUTH_TOKEN")
         );
         assert_eq!(config.provider.api_key_env, None);
         assert_eq!(
             fixes,
-            vec!["set provider.api_key=${OPENAI_API_KEY}".to_owned()]
+            vec!["set provider.oauth_access_token_env=OPENAI_CODEX_OAUTH_TOKEN".to_owned()]
+        );
+    }
+
+    #[test]
+    fn provider_transport_doctor_check_warns_for_responses_compatibility_mode() {
+        let provider = mvp::config::ProviderConfig {
+            kind: mvp::config::ProviderKind::Deepseek,
+            model: "deepseek-chat".to_owned(),
+            wire_api: mvp::config::ProviderWireApi::Responses,
+            ..mvp::config::ProviderConfig::default()
+        };
+
+        let check = provider_transport_doctor_check(&provider);
+
+        assert_eq!(check.name, "provider transport");
+        assert_eq!(check.level, DoctorCheckLevel::Warn);
+        assert!(
+            check
+                .detail
+                .contains("retry chat_completions automatically"),
+            "doctor should surface the automatic transport fallback in review mode: {check:#?}"
+        );
+    }
+
+    fn unique_temp_feishu_db(label: &str) -> String {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before epoch")
+            .as_nanos();
+        let sequence = FEISHU_TEST_DB_COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir()
+            .join(format!(
+                "loongclaw-doctor-feishu-{label}-{}-{nanos}-{sequence}.sqlite3",
+                std::process::id()
+            ))
+            .display()
+            .to_string()
+    }
+
+    #[test]
+    fn feishu_integration_requested_is_false_for_default_config() {
+        let config = mvp::config::FeishuChannelConfig::default();
+        assert!(!feishu_integration_requested(&config));
+    }
+
+    #[test]
+    fn check_feishu_integration_warns_when_user_grants_are_missing() {
+        let mut config = mvp::config::LoongClawConfig::default();
+        config.feishu.enabled = true;
+        config.feishu.app_id = Some("cli_a1b2c3".to_owned());
+        config.feishu.app_secret = Some("app-secret".to_owned());
+        config.feishu_integration.sqlite_path = unique_temp_feishu_db("missing-grant");
+        let mut fixes = Vec::new();
+
+        let checks = check_feishu_integration(&config, false, &mut fixes);
+
+        assert!(
+            checks.iter().any(|check| {
+                check.name == "feishu integration credentials"
+                    && check.level == DoctorCheckLevel::Pass
+            }),
+            "configured Feishu account should report available credentials"
+        );
+        assert!(
+            checks.iter().any(|check| {
+                check.level == DoctorCheckLevel::Warn
+                    && check.name.contains("feishu user grant")
+                    && check.detail.contains("missing stored user grant")
+            }),
+            "missing grants should warn rather than fail hard"
+        );
+    }
+
+    #[test]
+    fn check_feishu_integration_passes_when_ready_grant_exists() {
+        let mut config = mvp::config::LoongClawConfig::default();
+        config.feishu.enabled = true;
+        config.feishu.app_id = Some("cli_a1b2c3".to_owned());
+        config.feishu.app_secret = Some("app-secret".to_owned());
+        config.feishu_integration.sqlite_path = unique_temp_feishu_db("ready-grant");
+        let resolved = config
+            .feishu
+            .resolve_account(None)
+            .expect("resolve default feishu account");
+        let store =
+            mvp::feishu::FeishuTokenStore::new(config.feishu_integration.resolved_sqlite_path());
+        store
+            .save_grant(&mvp::feishu::FeishuGrant {
+                principal: mvp::feishu::FeishuUserPrincipal {
+                    account_id: resolved.account.id,
+                    open_id: "ou_123".to_owned(),
+                    union_id: Some("on_456".to_owned()),
+                    user_id: Some("u_789".to_owned()),
+                    name: Some("Alice".to_owned()),
+                    tenant_key: Some("tenant_x".to_owned()),
+                    avatar_url: None,
+                    email: Some("alice@example.com".to_owned()),
+                    enterprise_email: None,
+                },
+                access_token: "u-token".to_owned(),
+                refresh_token: "r-token".to_owned(),
+                scopes: mvp::feishu::FeishuGrantScopeSet::from_scopes(
+                    config.feishu_integration.trimmed_default_scopes(),
+                ),
+                access_expires_at_s: chrono::Utc::now().timestamp() + 3600,
+                refresh_expires_at_s: chrono::Utc::now().timestamp() + 86_400,
+                refreshed_at_s: chrono::Utc::now().timestamp(),
+            })
+            .expect("save feishu grant");
+        let mut fixes = Vec::new();
+
+        let checks = check_feishu_integration(&config, false, &mut fixes);
+
+        assert!(
+            checks.iter().any(|check| {
+                check.name.contains("feishu user grant")
+                    && check.level == DoctorCheckLevel::Pass
+                    && check.detail.contains("latest_open_id=ou_123")
+            }),
+            "stored grants should be visible to doctor"
+        );
+        assert!(
+            checks.iter().any(|check| {
+                check.name.contains("feishu token freshness")
+                    && check.level == DoctorCheckLevel::Pass
+            }),
+            "ready grants should upgrade Feishu integration health to pass"
         );
     }
 
@@ -858,6 +1599,64 @@ mod tests {
     }
 
     #[test]
+    fn build_channel_surface_checks_reports_feishu_inbound_support_matrix() {
+        let snapshots = vec![ChannelStatusSnapshot {
+            id: "feishu",
+            configured_account_id: "feishu_main".to_owned(),
+            configured_account_label: "feishu_main".to_owned(),
+            is_default_account: true,
+            default_account_source:
+                mvp::config::ChannelDefaultAccountSelectionSource::ExplicitDefault,
+            label: "Feishu/Lark",
+            aliases: vec!["lark"],
+            transport: "feishu_openapi_webhook",
+            compiled: true,
+            enabled: true,
+            api_base_url: Some("https://open.feishu.cn".to_owned()),
+            notes: vec![
+                "webhook_inbound_message_types=text,image,file,post,audio,media,folder,sticker,interactive,share_chat,share_user,system,location,video_chat,todo,vote,merge_forward,share_calendar_event,calendar,general_calendar".to_owned(),
+                "webhook_inbound_non_text_mode=structured_text_summary".to_owned(),
+                "webhook_inbound_binary_fetch=disabled".to_owned(),
+                "webhook_resource_download_tool=feishu.messages.resource.get".to_owned(),
+                "webhook_resource_selection_mode=single_resource_default_or_unique_partial_inference_or_resource_inventory".to_owned(),
+                "webhook_callback_event_types=card.action.trigger,card.action.trigger_v1".to_owned(),
+                "webhook_callback_response_mode=noop_json".to_owned(),
+            ],
+            operations: vec![ChannelOperationStatus {
+                id: "serve",
+                label: "webhook reply server",
+                command: "feishu-serve",
+                health: ChannelOperationHealth::Ready,
+                detail: "ready".to_owned(),
+                issues: Vec::new(),
+                runtime: None,
+            }],
+        }];
+
+        let checks = build_channel_surface_checks(&snapshots);
+
+        assert!(checks.iter().any(|check| {
+            check.name == "feishu webhook inbound support"
+                && check.level == DoctorCheckLevel::Pass
+                && check
+                    .detail
+                    .contains("text,image,file,post,audio,media,folder,sticker,interactive,share_chat,share_user,system,location,video_chat,todo,vote,merge_forward,share_calendar_event,calendar,general_calendar")
+                && check.detail.contains("structured_text_summary")
+                && check.detail.contains("binary_fetch=disabled")
+                && check
+                    .detail
+                    .contains("resource_download_tool=feishu.messages.resource.get")
+                && check.detail.contains(
+                    "resource_selection_mode=single_resource_default_or_unique_partial_inference_or_resource_inventory"
+                )
+                && check
+                    .detail
+                    .contains("callback_event_types=card.action.trigger,card.action.trigger_v1")
+                && check.detail.contains("callback_response_mode=noop_json")
+        }));
+    }
+
+    #[test]
     fn build_channel_surface_checks_scopes_names_for_multi_account_snapshots() {
         let snapshots = vec![
             ChannelStatusSnapshot {
@@ -1009,5 +1808,88 @@ mod tests {
                 && check.detail.contains("alerts")
                 && check.detail.contains("default_account")
         }));
+    }
+
+    #[test]
+    fn build_channel_surface_checks_ignores_stub_surfaces_without_accounts() {
+        let snapshots: Vec<mvp::channel::ChannelStatusSnapshot> = Vec::new();
+
+        let checks = build_channel_surface_checks(&snapshots);
+
+        assert!(checks.is_empty());
+    }
+
+    #[test]
+    fn build_doctor_next_steps_guides_fix_and_provider_credentials() {
+        let checks = vec![
+            DoctorCheck {
+                name: "provider credentials".to_owned(),
+                level: DoctorCheckLevel::Warn,
+                detail: "provider credentials are missing (try env: OPENAI_CODEX_OAUTH_TOKEN, OPENAI_API_KEY)"
+                    .to_owned(),
+            },
+            DoctorCheck {
+                name: "memory path".to_owned(),
+                level: DoctorCheckLevel::Fail,
+                detail: "/tmp/loongclaw-memory is missing".to_owned(),
+            },
+        ];
+        let next_steps = build_doctor_next_steps(
+            &checks,
+            Path::new("/tmp/loongclaw.toml"),
+            &mvp::config::LoongClawConfig::default(),
+            false,
+        );
+
+        assert_eq!(
+            next_steps[0],
+            "Apply safe local repairs: loongclaw doctor --config '/tmp/loongclaw.toml' --fix"
+        );
+        assert!(
+            next_steps.iter().any(|step| {
+                step == "Set provider credentials in env: OPENAI_CODEX_OAUTH_TOKEN or OPENAI_API_KEY"
+            }),
+            "doctor should turn missing provider auth into a concrete next step: {next_steps:#?}"
+        );
+        assert!(
+            next_steps.iter().any(|step| step
+                == "Re-run diagnostics: loongclaw doctor --config '/tmp/loongclaw.toml'"),
+            "doctor should tell the operator how to confirm the repair path: {next_steps:#?}"
+        );
+    }
+
+    #[test]
+    fn build_doctor_next_steps_promotes_ask_and_chat_when_green() {
+        let checks = vec![
+            DoctorCheck {
+                name: "provider credentials".to_owned(),
+                level: DoctorCheckLevel::Pass,
+                detail: "provider credentials are available".to_owned(),
+            },
+            DoctorCheck {
+                name: "provider transport".to_owned(),
+                level: DoctorCheckLevel::Pass,
+                detail: "responses api".to_owned(),
+            },
+        ];
+        let next_steps = build_doctor_next_steps(
+            &checks,
+            Path::new("/tmp/loongclaw.toml"),
+            &mvp::config::LoongClawConfig::default(),
+            false,
+        );
+
+        assert!(
+            next_steps.iter().any(|step| {
+                step == "Try a one-shot task: loongclaw ask --config '/tmp/loongclaw.toml' --message \"Summarize this repository and suggest the best next step.\""
+            }),
+            "green doctor runs should hand the user into ask immediately: {next_steps:#?}"
+        );
+        assert!(
+            next_steps.iter().any(|step| {
+                step == "Open interactive chat: loongclaw chat --config '/tmp/loongclaw.toml'"
+            }),
+            "green doctor runs should still advertise chat as the follow-up path: {next_steps:#?}"
+        );
     }
 }

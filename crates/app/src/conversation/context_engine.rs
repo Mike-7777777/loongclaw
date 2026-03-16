@@ -10,6 +10,8 @@ use crate::{CliResult, KernelContext};
 use crate::memory;
 use std::collections::BTreeSet;
 
+use super::runtime_binding::ConversationRuntimeBinding;
+
 pub const CONTEXT_ENGINE_API_VERSION: u16 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -106,7 +108,7 @@ pub trait ConversationContextEngine: Send + Sync {
         &self,
         _config: &LoongClawConfig,
         _session_id: &str,
-        _kernel_ctx: Option<&KernelContext>,
+        _kernel_ctx: &KernelContext,
     ) -> CliResult<ContextEngineBootstrapResult> {
         Ok(ContextEngineBootstrapResult::default())
     }
@@ -115,7 +117,7 @@ pub trait ConversationContextEngine: Send + Sync {
         &self,
         _session_id: &str,
         _message: &Value,
-        _kernel_ctx: Option<&KernelContext>,
+        _kernel_ctx: &KernelContext,
     ) -> CliResult<ContextEngineIngestResult> {
         Ok(ContextEngineIngestResult::default())
     }
@@ -126,7 +128,7 @@ pub trait ConversationContextEngine: Send + Sync {
         _user_input: &str,
         _assistant_reply: &str,
         _messages: &[Value],
-        _kernel_ctx: Option<&KernelContext>,
+        _kernel_ctx: &KernelContext,
     ) -> CliResult<()> {
         Ok(())
     }
@@ -136,7 +138,7 @@ pub trait ConversationContextEngine: Send + Sync {
         _config: &LoongClawConfig,
         _session_id: &str,
         _messages: &[Value],
-        _kernel_ctx: Option<&KernelContext>,
+        _kernel_ctx: &KernelContext,
     ) -> CliResult<()> {
         Ok(())
     }
@@ -145,7 +147,7 @@ pub trait ConversationContextEngine: Send + Sync {
         &self,
         _parent_session_id: &str,
         _subagent_session_id: &str,
-        _kernel_ctx: Option<&KernelContext>,
+        _kernel_ctx: &KernelContext,
     ) -> CliResult<()> {
         Ok(())
     }
@@ -154,7 +156,7 @@ pub trait ConversationContextEngine: Send + Sync {
         &self,
         _parent_session_id: &str,
         _subagent_session_id: &str,
-        _kernel_ctx: Option<&KernelContext>,
+        _kernel_ctx: &KernelContext,
     ) -> CliResult<()> {
         Ok(())
     }
@@ -164,9 +166,9 @@ pub trait ConversationContextEngine: Send + Sync {
         config: &LoongClawConfig,
         session_id: &str,
         include_system_prompt: bool,
-        kernel_ctx: Option<&KernelContext>,
+        binding: ConversationRuntimeBinding<'_>,
     ) -> CliResult<AssembledConversationContext> {
-        self.assemble_messages(config, session_id, include_system_prompt, kernel_ctx)
+        self.assemble_messages(config, session_id, include_system_prompt, binding)
             .await
             .map(AssembledConversationContext::from_messages)
     }
@@ -176,7 +178,7 @@ pub trait ConversationContextEngine: Send + Sync {
         config: &LoongClawConfig,
         session_id: &str,
         include_system_prompt: bool,
-        kernel_ctx: Option<&KernelContext>,
+        binding: ConversationRuntimeBinding<'_>,
     ) -> CliResult<Vec<Value>>;
 }
 
@@ -197,7 +199,7 @@ where
         &self,
         config: &LoongClawConfig,
         session_id: &str,
-        kernel_ctx: Option<&KernelContext>,
+        kernel_ctx: &KernelContext,
     ) -> CliResult<ContextEngineBootstrapResult> {
         self.as_ref()
             .bootstrap(config, session_id, kernel_ctx)
@@ -208,7 +210,7 @@ where
         &self,
         session_id: &str,
         message: &Value,
-        kernel_ctx: Option<&KernelContext>,
+        kernel_ctx: &KernelContext,
     ) -> CliResult<ContextEngineIngestResult> {
         self.as_ref().ingest(session_id, message, kernel_ctx).await
     }
@@ -219,7 +221,7 @@ where
         user_input: &str,
         assistant_reply: &str,
         messages: &[Value],
-        kernel_ctx: Option<&KernelContext>,
+        kernel_ctx: &KernelContext,
     ) -> CliResult<()> {
         self.as_ref()
             .after_turn(
@@ -237,7 +239,7 @@ where
         config: &LoongClawConfig,
         session_id: &str,
         messages: &[Value],
-        kernel_ctx: Option<&KernelContext>,
+        kernel_ctx: &KernelContext,
     ) -> CliResult<()> {
         self.as_ref()
             .compact_context(config, session_id, messages, kernel_ctx)
@@ -248,7 +250,7 @@ where
         &self,
         parent_session_id: &str,
         subagent_session_id: &str,
-        kernel_ctx: Option<&KernelContext>,
+        kernel_ctx: &KernelContext,
     ) -> CliResult<()> {
         self.as_ref()
             .prepare_subagent_spawn(parent_session_id, subagent_session_id, kernel_ctx)
@@ -259,7 +261,7 @@ where
         &self,
         parent_session_id: &str,
         subagent_session_id: &str,
-        kernel_ctx: Option<&KernelContext>,
+        kernel_ctx: &KernelContext,
     ) -> CliResult<()> {
         self.as_ref()
             .on_subagent_ended(parent_session_id, subagent_session_id, kernel_ctx)
@@ -271,10 +273,10 @@ where
         config: &LoongClawConfig,
         session_id: &str,
         include_system_prompt: bool,
-        kernel_ctx: Option<&KernelContext>,
+        binding: ConversationRuntimeBinding<'_>,
     ) -> CliResult<AssembledConversationContext> {
         self.as_ref()
-            .assemble_context(config, session_id, include_system_prompt, kernel_ctx)
+            .assemble_context(config, session_id, include_system_prompt, binding)
             .await
     }
 
@@ -283,10 +285,10 @@ where
         config: &LoongClawConfig,
         session_id: &str,
         include_system_prompt: bool,
-        kernel_ctx: Option<&KernelContext>,
+        binding: ConversationRuntimeBinding<'_>,
     ) -> CliResult<Vec<Value>> {
         self.as_ref()
-            .assemble_messages(config, session_id, include_system_prompt, kernel_ctx)
+            .assemble_messages(config, session_id, include_system_prompt, binding)
             .await
     }
 }
@@ -316,14 +318,22 @@ impl ConversationContextEngine for DefaultContextEngine {
         config: &LoongClawConfig,
         session_id: &str,
         include_system_prompt: bool,
-        kernel_ctx: Option<&KernelContext>,
+        binding: ConversationRuntimeBinding<'_>,
     ) -> CliResult<Vec<Value>> {
+        if !binding.is_kernel_bound() {
+            return crate::provider::build_messages_for_session(
+                config,
+                session_id,
+                include_system_prompt,
+            );
+        }
+
         #[cfg_attr(not(feature = "memory-sqlite"), allow(unused_mut))]
         let mut messages = crate::provider::build_base_messages(config, include_system_prompt);
 
         #[cfg(feature = "memory-sqlite")]
         {
-            let turns = load_memory_window(config, session_id, kernel_ctx).await?;
+            let turns = load_memory_window(config, session_id, binding).await?;
             for turn in turns {
                 crate::provider::push_history_message(
                     &mut messages,
@@ -335,7 +345,7 @@ impl ConversationContextEngine for DefaultContextEngine {
 
         #[cfg(not(feature = "memory-sqlite"))]
         {
-            let _ = (session_id, kernel_ctx);
+            let _ = (session_id, binding);
         }
 
         Ok(messages)
@@ -357,7 +367,7 @@ impl ConversationContextEngine for LegacyContextEngine {
         config: &LoongClawConfig,
         session_id: &str,
         include_system_prompt: bool,
-        _kernel_ctx: Option<&KernelContext>,
+        _binding: ConversationRuntimeBinding<'_>,
     ) -> CliResult<Vec<Value>> {
         crate::provider::build_messages_for_session(config, session_id, include_system_prompt)
     }
@@ -367,11 +377,11 @@ impl ConversationContextEngine for LegacyContextEngine {
 async fn load_memory_window(
     config: &LoongClawConfig,
     session_id: &str,
-    kernel_ctx: Option<&KernelContext>,
+    binding: ConversationRuntimeBinding<'_>,
 ) -> CliResult<Vec<memory::WindowTurn>> {
     use std::collections::BTreeSet;
 
-    if let Some(ctx) = kernel_ctx {
+    if let Some(ctx) = binding.kernel_context() {
         let request = memory::build_window_request(session_id, config.memory.sliding_window);
         let caps = BTreeSet::from([Capability::MemoryRead]);
         let outcome = ctx

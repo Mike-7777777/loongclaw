@@ -43,12 +43,23 @@ pub use bridge_support_policy::{
 pub use security_scan_policy::{load_security_scan_profile_from_path, security_scan_policy};
 
 pub async fn execute_spec(spec: &RunnerSpec, include_audit: bool) -> SpecRunReport {
+    execute_spec_with_native_tool_executor(spec, include_audit, None).await
+}
+
+pub async fn execute_spec_with_native_tool_executor(
+    spec: &RunnerSpec,
+    include_audit: bool,
+    native_tool_executor: Option<crate::NativeToolExecutor>,
+) -> SpecRunReport {
     let mut pack = spec.pack.clone();
     let audit_sink = Arc::new(InMemoryAuditSink::default());
-    let mut kernel = crate::kernel_bootstrap::KernelBuilder::default()
+    let mut builder = crate::kernel_bootstrap::KernelBuilder::default()
         .clock(Arc::new(SystemClock) as Arc<dyn Clock>)
-        .audit(audit_sink.clone())
-        .build();
+        .audit(audit_sink.clone());
+    if let Some(executor) = native_tool_executor {
+        builder = builder.native_tool_executor(executor);
+    }
+    let mut kernel = builder.build();
 
     let mut integration_catalog = default_integration_catalog();
     let mut blocked_reason = None;
@@ -280,8 +291,13 @@ pub async fn execute_spec(spec: &RunnerSpec, include_audit: bool) -> SpecRunRepo
 
         if blocked_reason.is_none() {
             for pending in pending_absorb_inputs {
-                let absorb = scanner.absorb(&mut integration_catalog, &mut pack, &pending);
-                plugin_absorb_reports.push(absorb);
+                match scanner.absorb(&mut integration_catalog, &mut pack, &pending) {
+                    Ok(absorb) => plugin_absorb_reports.push(absorb),
+                    Err(error) => {
+                        blocked_reason = Some(format!("plugin absorb failed: {error}"));
+                        break;
+                    }
+                }
             }
         }
     }
@@ -1048,7 +1064,7 @@ fn register_dynamic_catalog_connectors(
     };
 
     for provider in snapshot {
-        kernel.register_connector(DynamicCatalogConnector {
+        kernel.register_core_connector_adapter(DynamicCatalogConnector {
             connector_name: provider.connector_name,
             provider_id: provider.provider_id,
             catalog: catalog.clone(),
@@ -1124,9 +1140,10 @@ async fn execute_spec_operation(
             payload,
         } => {
             let dispatch = kernel
-                .invoke_connector(
+                .execute_connector_core(
                     pack_id,
                     token,
+                    Some(connector_name.as_str()),
                     ConnectorCommand {
                         connector_name: connector_name.clone(),
                         operation: operation.clone(),

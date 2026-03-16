@@ -11,8 +11,8 @@ use crate::CliResult;
 use crate::config::{self, ResolvedTelegramChannelConfig};
 
 use super::{
-    ChannelAdapter, ChannelDelivery, ChannelInboundMessage, ChannelOutboundTarget,
-    ChannelOutboundTargetKind, ChannelPlatform, ChannelSession,
+    ChannelAdapter, ChannelDelivery, ChannelInboundMessage, ChannelOutboundMessage,
+    ChannelOutboundTarget, ChannelOutboundTargetKind, ChannelPlatform, ChannelSession,
 };
 
 pub(super) struct TelegramAdapter {
@@ -140,7 +140,11 @@ impl ChannelAdapter for TelegramAdapter {
         Ok(inbox)
     }
 
-    async fn send_text(&self, target: &ChannelOutboundTarget, text: &str) -> CliResult<()> {
+    async fn send_message(
+        &self,
+        target: &ChannelOutboundTarget,
+        message: &ChannelOutboundMessage,
+    ) -> CliResult<()> {
         if target.platform != ChannelPlatform::Telegram {
             return Err(format!(
                 "telegram adapter cannot send to {} target",
@@ -153,6 +157,17 @@ impl ChannelAdapter for TelegramAdapter {
                 target.kind.as_str()
             ));
         }
+        let text = match message {
+            ChannelOutboundMessage::Text(text) => text,
+            other @ ChannelOutboundMessage::MarkdownCard(_)
+            | other @ ChannelOutboundMessage::Post(_)
+            | other @ ChannelOutboundMessage::Image { .. }
+            | other @ ChannelOutboundMessage::File { .. } => {
+                return Err(format!(
+                    "telegram adapter only supports plain text outbound messages, got {other:?}"
+                ));
+            }
+        };
 
         let chat_id = target
             .trimmed_id()?
@@ -191,6 +206,41 @@ impl ChannelAdapter for TelegramAdapter {
     async fn complete_batch(&mut self) -> CliResult<()> {
         self.offset_tracker.complete_batch()
     }
+}
+
+pub(super) async fn run_telegram_send(
+    config: &ResolvedTelegramChannelConfig,
+    token: String,
+    target_kind: ChannelOutboundTargetKind,
+    target_id: &str,
+    text: &str,
+) -> CliResult<()> {
+    let adapter = TelegramAdapter::new(config, token);
+    let target = build_telegram_send_target(target_kind, target_id)?;
+    adapter.send_text(&target, text).await
+}
+
+fn build_telegram_send_target(
+    target_kind: ChannelOutboundTargetKind,
+    target_id: &str,
+) -> CliResult<ChannelOutboundTarget> {
+    if target_kind != ChannelOutboundTargetKind::Conversation {
+        return Err(format!(
+            "telegram send requires conversation target kind, got {}",
+            target_kind.as_str()
+        ));
+    }
+
+    let trimmed_target_id = target_id.trim();
+    if trimmed_target_id.is_empty() {
+        return Err("telegram outbound target id is empty".to_owned());
+    }
+
+    Ok(ChannelOutboundTarget::new(
+        ChannelPlatform::Telegram,
+        target_kind,
+        trimmed_target_id.to_owned(),
+    ))
 }
 
 pub(super) fn parse_telegram_updates(
@@ -253,6 +303,11 @@ pub(super) fn parse_telegram_updates(
                     .get("message_id")
                     .and_then(Value::as_i64)
                     .map(|value| value.to_string()),
+                sender_principal_key: None,
+                thread_root_id: None,
+                parent_message_id: None,
+                resources: Vec::new(),
+                feishu_callback: None,
             },
         });
     }

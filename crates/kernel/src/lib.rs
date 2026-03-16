@@ -35,8 +35,7 @@ pub use bootstrap::{
 };
 pub use clock::{Clock, FixedClock, SystemClock};
 pub use connector::{
-    ConnectorAdapter, ConnectorExtensionAdapter, ConnectorPlane, ConnectorRegistry, ConnectorTier,
-    CoreConnectorAdapter,
+    ConnectorExtensionAdapter, ConnectorPlane, ConnectorTier, CoreConnectorAdapter,
 };
 pub use contracts::{
     Capability, CapabilityToken, ConnectorCommand, ConnectorOutcome, ExecutionRoute, Fault,
@@ -51,7 +50,7 @@ pub use integration::{
     AutoProvisionAgent, AutoProvisionRequest, ChannelConfig, IntegrationCatalog, IntegrationHotfix,
     ProviderConfig, ProviderTemplate, ProvisionAction, ProvisionPlan,
 };
-pub use kernel::{ConnectorDispatch, KernelDispatch, LoongClawKernel};
+pub use kernel::{ConnectorDispatch, Kernel, KernelBuilder, KernelDispatch, LoongClawKernel};
 pub use memory::{
     CoreMemoryAdapter, MemoryCoreOutcome, MemoryCoreRequest, MemoryExtensionAdapter,
     MemoryExtensionOutcome, MemoryExtensionRequest, MemoryPlane, MemoryTier,

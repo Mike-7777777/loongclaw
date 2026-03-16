@@ -1,6 +1,6 @@
 use std::future::Future;
 
-use crate::{CliResult, KernelContext, config::ProviderConfig};
+use crate::{CliResult, config::ProviderConfig};
 
 use super::auth_profile_runtime::ProviderAuthProfile;
 use super::failover::ModelRequestError;
@@ -12,10 +12,11 @@ use super::profile_health_runtime::{
     ProviderProfileStatePolicy, mark_provider_profile_failure, mark_provider_profile_success,
     prioritize_provider_auth_profiles_by_health,
 };
+use super::runtime_binding::ProviderRuntimeBinding;
 
 pub(super) async fn request_across_model_candidates<T, F, Fut>(
     provider: &ProviderConfig,
-    kernel_ctx: Option<&KernelContext>,
+    binding: ProviderRuntimeBinding<'_>,
     auth_profiles: &[ProviderAuthProfile],
     profile_state_policy: Option<&ProviderProfileStatePolicy>,
     model_candidates: &[String],
@@ -24,7 +25,7 @@ pub(super) async fn request_across_model_candidates<T, F, Fut>(
     mut request_with_model: F,
 ) -> CliResult<T>
 where
-    F: FnMut(String, bool, Option<String>) -> Fut,
+    F: FnMut(String, bool, ProviderAuthProfile) -> Fut,
     Fut: Future<Output = Result<T, ModelRequestError>>,
 {
     if model_candidates.is_empty() {
@@ -38,13 +39,7 @@ where
     for (model_index, model) in model_candidates.iter().enumerate() {
         let mut model_switch_reason = None;
         for (profile_index, profile) in ordered_profiles.iter().enumerate() {
-            match request_with_model(
-                model.clone(),
-                auto_model_mode,
-                profile.authorization_header.clone(),
-            )
-            .await
-            {
+            match request_with_model(model.clone(), auto_model_mode, profile.clone()).await {
                 Ok(value) => {
                     if let Some(policy) = profile_state_policy {
                         mark_provider_profile_success(policy, profile);
@@ -57,9 +52,10 @@ where
                         try_next_model,
                         reason,
                         snapshot,
+                        ..
                     } = model_error;
                     record_provider_failover_audit_event(
-                        kernel_ctx,
+                        binding,
                         provider,
                         &snapshot,
                         try_next_model,

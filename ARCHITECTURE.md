@@ -12,14 +12,12 @@ contracts (leaf -- zero internal deps)
 ├── kernel --> contracts
 ├── protocol (independent leaf)
 ├── app --> contracts, kernel
-├── spec --> contracts, kernel, protocol (+ app: known deviation, tracked as D1)
+├── spec --> contracts, kernel, protocol
 ├── bench --> contracts, kernel, spec
 └── daemon (binary) --> all of the above
 ```
 
 No dependency cycles. This is non-negotiable.
-Tracked deviation D1: `spec -> app` is currently allowed for transitional runtime coupling and
-must be removed in a follow-up architecture refactor.
 
 | Crate | Role |
 |-------|------|
@@ -116,7 +114,12 @@ mechanically where possible.
 | Topic | Document |
 |-------|----------|
 | Full layer specification (L0-L9) | [Layered Kernel Design](docs/design-docs/layered-kernel-design.md) |
-| Stage-based roadmap | [Roadmap](docs/roadmap.md) |
+| Harness engineering & backpressure | [Harness Engineering](docs/design-docs/harness-engineering.md) |
+| Design decisions, patterns & catalog | [Design Docs Index](docs/design-docs/index.md) |
+| Security model & gaps | [Security](docs/SECURITY.md) |
+| Stage-based roadmap | [Roadmap](docs/ROADMAP.md) |
 | Build and kernel invariants | [Reliability](docs/RELIABILITY.md) |
+| Domain quality grades | [Quality Score](docs/QUALITY_SCORE.md) |
+| Product principles | [Product Sense](docs/PRODUCT_SENSE.md) |
 | Contributor workflow and recipes | [CONTRIBUTING.md](CONTRIBUTING.md) |
 | Examples and spec files | [Examples](examples/README.md) |

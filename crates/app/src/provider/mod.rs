@@ -7,7 +7,7 @@ use serde_json::Value;
 #[cfg(test)]
 use tokio::time::sleep;
 
-use crate::{CliResult, KernelContext};
+use crate::CliResult;
 
 use super::config::LoongClawConfig;
 #[cfg(test)]
@@ -38,9 +38,11 @@ mod request_message_runtime;
 mod request_payload_runtime;
 mod request_planner;
 mod request_session_runtime;
+mod runtime_binding;
 mod shape;
 mod transport;
 
+pub use runtime_binding::ProviderRuntimeBinding;
 pub use shape::extract_provider_turn;
 
 #[cfg(test)]
@@ -163,30 +165,29 @@ pub fn build_messages_for_session(
 pub async fn request_completion(
     config: &LoongClawConfig,
     messages: &[Value],
-    kernel_ctx: Option<&KernelContext>,
+    binding: ProviderRuntimeBinding<'_>,
 ) -> CliResult<String> {
     let session = prepare_provider_request_session(config).await?;
     request_across_model_candidates(
         &config.provider,
-        kernel_ctx,
+        binding,
         &session.auth_profiles,
         session.profile_state_policy.as_ref(),
         &session.model_candidates,
         session.auto_model_mode,
         session.model_candidate_cooldown_policy.as_ref(),
-        |model, auto_model_mode, authorization_header| {
+        |model, auto_model_mode, auth_profile| {
             request_completion_with_model(
                 config,
                 messages,
                 model,
-                session.runtime_contract,
-                &session.capability_profile,
                 auto_model_mode,
-                authorization_header,
+                auth_profile,
                 &session.endpoint,
                 &session.headers,
                 &session.request_policy,
                 &session.client,
+                &session.auth_context,
             )
         },
     )
@@ -196,30 +197,54 @@ pub async fn request_completion(
 pub async fn request_turn(
     config: &LoongClawConfig,
     messages: &[Value],
-    kernel_ctx: Option<&KernelContext>,
+    binding: ProviderRuntimeBinding<'_>,
+) -> CliResult<crate::conversation::turn_engine::ProviderTurn> {
+    request_turn_in_view(
+        config,
+        messages,
+        &crate::tools::runtime_tool_view(),
+        binding,
+    )
+    .await
+}
+
+pub async fn request_turn_in_view(
+    config: &LoongClawConfig,
+    messages: &[Value],
+    tool_view: &crate::tools::ToolView,
+    binding: ProviderRuntimeBinding<'_>,
 ) -> CliResult<crate::conversation::turn_engine::ProviderTurn> {
     let session = prepare_provider_request_session(config).await?;
+    let tool_runtime_config =
+        crate::tools::runtime_config::ToolRuntimeConfig::from_loongclaw_config(config, None);
+    let runtime_tool_view =
+        crate::tools::runtime_tool_view_with_runtime_config(&config.tools, &tool_runtime_config);
+    let tool_definitions = if tool_view == &runtime_tool_view {
+        crate::tools::provider_tool_definitions_with_config(Some(&tool_runtime_config))
+    } else {
+        crate::tools::try_provider_tool_definitions_for_view(tool_view)?
+    };
     request_across_model_candidates(
         &config.provider,
-        kernel_ctx,
+        binding,
         &session.auth_profiles,
         session.profile_state_policy.as_ref(),
         &session.model_candidates,
         session.auto_model_mode,
         session.model_candidate_cooldown_policy.as_ref(),
-        |model, auto_model_mode, authorization_header| {
+        |model, auto_model_mode, auth_profile| {
             request_turn_with_model(
                 config,
                 messages,
                 model,
-                session.runtime_contract,
-                &session.capability_profile,
                 auto_model_mode,
-                authorization_header,
+                tool_definitions.as_slice(),
+                auth_profile,
                 &session.endpoint,
                 &session.headers,
                 &session.request_policy,
                 &session.client,
+                &session.auth_context,
             )
         },
     )
@@ -228,6 +253,30 @@ pub async fn request_turn(
 
 pub async fn fetch_available_models(config: &LoongClawConfig) -> CliResult<Vec<String>> {
     fetch_available_models_with_profiles(config).await
+}
+
+pub async fn provider_auth_ready(config: &LoongClawConfig) -> bool {
+    if config.provider.resolved_auth_secret().is_some() {
+        return true;
+    }
+
+    for header_name in ["authorization", "x-api-key"] {
+        if config
+            .provider
+            .header_value(header_name)
+            .is_some_and(|value| !value.trim().is_empty())
+        {
+            return true;
+        }
+    }
+
+    if config.provider.kind == crate::config::ProviderKind::Bedrock
+        && let Ok(auth_context) = transport::resolve_request_auth_context(&config.provider).await
+    {
+        return auth_context.has_bedrock_sigv4_fallback();
+    }
+
+    false
 }
 
 #[cfg(test)]

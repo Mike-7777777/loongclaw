@@ -4,7 +4,9 @@ use std::time::Duration;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
+    future::Future,
     path::Path,
+    pin::Pin,
     sync::Arc,
 };
 
@@ -15,7 +17,10 @@ use clap::CommandFactory;
 use clap::{Parser, Subcommand, ValueEnum};
 #[cfg(test)]
 use kernel::{AuditEventKind, ExecutionRoute, HarnessKind, PluginBridgeKind, VerticalPackManifest};
-use kernel::{Capability, ConnectorCommand, FixedClock, InMemoryAuditSink, TaskIntent};
+use kernel::{
+    Capability, ConnectorCommand, FixedClock, InMemoryAuditSink, TaskIntent, ToolCoreOutcome,
+    ToolCoreRequest,
+};
 use serde::Serialize;
 use serde_json::{Value, json};
 #[cfg(test)]
@@ -29,12 +34,21 @@ pub(crate) use loongclaw_spec::spec_runtime::*;
 use loongclaw_spec::{CliResult, DEFAULT_AGENT_ID, DEFAULT_PACK_ID, kernel_bootstrap};
 
 use loongclaw_bench::{
-    run_programmatic_pressure_baseline_lint_cli, run_programmatic_pressure_benchmark_cli,
-    run_wasm_cache_benchmark_cli,
+    run_memory_context_benchmark_cli, run_programmatic_pressure_baseline_lint_cli,
+    run_programmatic_pressure_benchmark_cli, run_wasm_cache_benchmark_cli,
 };
 mod doctor_cli;
+mod feishu_cli;
+mod feishu_support;
 mod import_claw_cli;
+mod import_cli;
+mod migration;
+mod next_actions;
 mod onboard_cli;
+mod onboard_presentation;
+mod provider_presentation;
+mod skills_cli;
+mod source_presentation;
 #[cfg(test)]
 pub(crate) use loongclaw_spec::programmatic::{
     acquire_programmatic_circuit_slot, record_programmatic_circuit_outcome,
@@ -43,10 +57,51 @@ pub(crate) use loongclaw_spec::programmatic::{
 mod tests;
 
 const PUBLIC_GITHUB_REPO: &str = "loongclaw-ai/loongclaw";
+const CLI_COMMAND_NAME: &str = mvp::config::CLI_COMMAND_NAME;
+
+fn native_spec_tool_executor(request: ToolCoreRequest) -> Option<Result<ToolCoreOutcome, String>> {
+    if mvp::tools::canonical_tool_name(request.tool_name.as_str()) != "claw.import" {
+        return None;
+    }
+    Some(mvp::tools::execute_tool_core(request))
+}
+
+type ChannelCliCommandFuture<'a> = Pin<Box<dyn Future<Output = CliResult<()>> + Send + 'a>>;
+
+#[derive(Debug, Clone, Copy)]
+struct ChannelSendCliArgs<'a> {
+    config_path: Option<&'a str>,
+    account: Option<&'a str>,
+    target: &'a str,
+    target_kind: mvp::channel::ChannelOutboundTargetKind,
+    text: &'a str,
+    as_card: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ChannelServeCliArgs<'a> {
+    config_path: Option<&'a str>,
+    account: Option<&'a str>,
+    once: bool,
+    bind_override: Option<&'a str>,
+    path_override: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ChannelSendCliSpec {
+    family: mvp::channel::ChannelCommandFamilyDescriptor,
+    run: for<'a> fn(ChannelSendCliArgs<'a>) -> ChannelCliCommandFuture<'a>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ChannelServeCliSpec {
+    family: mvp::channel::ChannelCommandFamilyDescriptor,
+    run: for<'a> fn(ChannelServeCliArgs<'a>) -> ChannelCliCommandFuture<'a>,
+}
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "loongclaw",
+    name = CLI_COMMAND_NAME,
     about = "LoongClaw low-level runtime daemon",
     version
 )]
@@ -145,6 +200,36 @@ enum Commands {
         #[arg(long, default_value_t = 1.5)]
         min_speedup_ratio: f64,
     },
+    /// Benchmark memory prompt-context hydration across window-only, rebuild, steady-state, and shrink catch-up summary paths
+    BenchmarkMemoryContext {
+        #[arg(
+            long,
+            default_value = "target/benchmarks/memory-context-benchmark-report.json"
+        )]
+        output: String,
+        #[arg(long)]
+        temp_root: Option<String>,
+        #[arg(long, default_value_t = 256)]
+        history_turns: usize,
+        #[arg(long, default_value_t = 24)]
+        sliding_window: usize,
+        #[arg(long, default_value_t = 1024)]
+        summary_max_chars: usize,
+        #[arg(long, default_value_t = 24)]
+        words_per_turn: usize,
+        #[arg(long, default_value_t = 12)]
+        rebuild_iterations: usize,
+        #[arg(long, default_value_t = 32)]
+        hot_iterations: usize,
+        #[arg(long, default_value_t = 4)]
+        warmup_iterations: usize,
+        #[arg(long, default_value_t = 1)]
+        suite_repetitions: usize,
+        #[arg(long, default_value_t = false)]
+        enforce_gate: bool,
+        #[arg(long, default_value_t = 1.2)]
+        min_steady_state_speedup_ratio: f64,
+    },
     /// Validate config semantics and report structured diagnostics
     ValidateConfig {
         #[arg(long)]
@@ -158,74 +243,80 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         fail_on_diagnostics: bool,
     },
-    /// Guided onboarding for a fast first chat with preflight diagnostics
+    #[command(
+        about = "Guided onboarding for fast first-chat setup with preflight diagnostics",
+        long_about = "Guided onboarding for fast first-chat setup with preflight diagnostics.\n\nThis is the default path for most users. LoongClaw will detect reusable settings for provider, channels, or workspace guidance, suggest a starting point, and walk through quick review before first chat."
+    )]
     Onboard {
-        /// Target config output path (defaults to ~/.loongclaw/config.toml)
+        /// Write the resulting config to a custom path instead of the default loongclaw config location
         #[arg(long)]
         output: Option<String>,
-        /// Overwrite existing output config if present
+        /// Overwrite an existing target config path instead of stopping for manual review
         #[arg(long, default_value_t = false)]
         force: bool,
-        /// Run onboarding in non-interactive mode using provided flags/defaults
+        /// Use provided flags only and skip interactive prompts except required safety checks
         #[arg(long, default_value_t = false)]
         non_interactive: bool,
-        /// Accept generated config values that may require manual hardening later
+        /// Confirm the onboarding risk acknowledgement in non-interactive mode
         #[arg(long, default_value_t = false)]
         accept_risk: bool,
-        /// Provider identifier to prefill in generated config
-        #[arg(long)]
+        #[arg(
+            long,
+            value_name = mvp::config::PROVIDER_SELECTOR_PLACEHOLDER,
+            help = mvp::config::PROVIDER_SELECTOR_HUMAN_SUMMARY
+        )]
         provider: Option<String>,
-        /// Model identifier to prefill in generated config
+        /// Preselect the model to use after the provider choice is resolved
         #[arg(long)]
         model: Option<String>,
-        /// Environment variable name holding the provider API key
-        #[arg(long, alias = "api-key-env")]
-        api_key: Option<String>,
-        /// Default personality profile for the generated config
-        #[arg(long)]
-        personality: Option<String>,
-        /// Default memory profile for the generated config
-        #[arg(long)]
-        memory_profile: Option<String>,
-        /// Override system prompt text in generated config
+        /// Provider credential environment variable name, for example OPENAI_API_KEY
+        #[arg(long = "api-key", alias = "api-key-env")]
+        api_key_env: Option<String>,
+        /// Preseed the CLI system prompt instead of editing it interactively
         #[arg(long)]
         system_prompt: Option<String>,
-        /// Skip provider model probe during onboarding diagnostics
+        /// Skip probing the resolved provider model list during onboarding
         #[arg(long, default_value_t = false)]
         skip_model_probe: bool,
     },
-    /// Import prompt/identity traits from another claw workspace into LoongClaw config
-    ImportClaw {
-        /// Source config file to import from
-        #[arg(long)]
-        input: Option<String>,
-        /// Target config file to write import plan/apply result
+    #[command(
+        about = "Preview or apply migration sources explicitly",
+        long_about = "Power-user import flow for previewing or applying detected migration sources explicitly.\n\nUse this when you want exact CLI control over which source and domains are reused. If you want the guided path, use `loongclaw onboard` instead. When the same source kind resolves to multiple detected configs, rerun with `--source-path <path>` to choose one exact source."
+    )]
+    Import {
+        /// Write the imported config to a custom path instead of the default loongclaw config location
         #[arg(long)]
         output: Option<String>,
-        /// Explicit source kind (auto-detected when omitted)
-        #[arg(long)]
-        source: Option<String>,
-        /// Import mode (`plan` preview or `apply` mutation)
-        #[arg(long, value_enum, default_value = "plan")]
-        mode: import_claw_cli::ImportClawMode,
-        /// Emit machine-readable JSON output
-        #[arg(long, default_value_t = false)]
-        json: bool,
-        /// Source selection identifier (alias: --selection-id)
-        #[arg(long, visible_alias = "selection-id")]
-        source_id: Option<String>,
-        /// Merge memory profiles conservatively to avoid destructive overwrites
-        #[arg(long, default_value_t = false)]
-        safe_profile_merge: bool,
-        /// Primary source identifier for multi-source imports
-        #[arg(long, visible_alias = "primary-selection-id")]
-        primary_source_id: Option<String>,
-        /// Apply external-skills import plan when running in apply mode
-        #[arg(long, default_value_t = false)]
-        apply_external_skills_plan: bool,
-        /// Force apply even when importer detects non-fatal safeguards
+        /// Overwrite an existing target config path instead of stopping for manual review
         #[arg(long, default_value_t = false)]
         force: bool,
+        /// Print the selected import candidate preview in text mode
+        #[arg(long, default_value_t = false)]
+        preview: bool,
+        /// Apply the selected import candidate to the target config path
+        #[arg(long, default_value_t = false)]
+        apply: bool,
+        /// Emit machine-readable preview JSON for scripting or automation
+        #[arg(long, default_value_t = false)]
+        json: bool,
+        /// Limit selection to one source kind such as recommended, existing, codex, or env
+        #[arg(long)]
+        from: Option<String>,
+        /// Choose one exact detected source path when multiple candidates of the same kind exist
+        #[arg(long)]
+        source_path: Option<String>,
+        #[arg(
+            long,
+            value_name = mvp::config::PROVIDER_SELECTOR_PLACEHOLDER,
+            help = mvp::config::PROVIDER_SELECTOR_HUMAN_SUMMARY
+        )]
+        provider: Option<String>,
+        /// Reuse only the listed domains, for example provider,channels
+        #[arg(long, value_delimiter = ',')]
+        include: Vec<String>,
+        /// Exclude the listed domains from the selected import candidate
+        #[arg(long, value_delimiter = ',')]
+        exclude: Vec<String>,
     },
     /// Run configuration diagnostics and optionally apply safe config/path fixes
     Doctor {
@@ -241,6 +332,15 @@ enum Commands {
         /// Skip provider model probing during diagnostics
         #[arg(long, default_value_t = false)]
         skip_model_probe: bool,
+    },
+    /// Manage installed external skills through an operator-facing CLI surface
+    Skills {
+        #[arg(long, global = true)]
+        config: Option<String>,
+        #[arg(long, global = true, default_value_t = false)]
+        json: bool,
+        #[command(subcommand)]
+        command: skills_cli::SkillsCommands,
     },
     /// List compiled channel surfaces, aliases, and readiness status
     Channels {
@@ -258,6 +358,13 @@ enum Commands {
     },
     /// List available conversation context engines and selected runtime engine
     ListContextEngines {
+        #[arg(long)]
+        config: Option<String>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// List available memory systems and selected runtime memory system
+    ListMemorySystems {
         #[arg(long)]
         config: Option<String>,
         #[arg(long, default_value_t = false)]
@@ -334,6 +441,26 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    #[command(
+        about = "Run one non-interactive assistant turn",
+        long_about = "Run one non-interactive one-shot assistant turn.\n\nUse this when you want a fast answer without entering the interactive `loongclaw chat` REPL. The command reuses the normal CLI conversation runtime, session memory, provider selection, and ACP options."
+    )]
+    Ask {
+        #[arg(long)]
+        config: Option<String>,
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long)]
+        message: String,
+        #[arg(long, default_value_t = false)]
+        acp: bool,
+        #[arg(long, default_value_t = false)]
+        acp_event_stream: bool,
+        #[arg(long = "acp-bootstrap-mcp-server")]
+        acp_bootstrap_mcp_server: Vec<String>,
+        #[arg(long = "acp-cwd")]
+        acp_cwd: Option<String>,
+    },
     /// Start interactive CLI chat channel with sliding-window memory
     Chat {
         #[arg(long)]
@@ -360,6 +487,23 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    /// Send one Telegram message
+    TelegramSend {
+        #[arg(long)]
+        config: Option<String>,
+        #[arg(long)]
+        account: Option<String>,
+        #[arg(long = "target")]
+        target: String,
+        #[arg(
+            long,
+            default_value_t = default_telegram_send_target_kind(),
+            value_parser = parse_telegram_send_target_kind
+        )]
+        target_kind: mvp::channel::ChannelOutboundTargetKind,
+        #[arg(long)]
+        text: String,
+    },
     /// Run Telegram channel polling/response loop
     TelegramServe {
         #[arg(long)]
@@ -376,11 +520,33 @@ enum Commands {
         #[arg(long)]
         account: Option<String>,
         #[arg(long)]
-        receive_id: String,
+        receive_id_type: Option<String>,
+        #[arg(long = "target", visible_alias = "receive-id")]
+        target: String,
+        #[arg(
+            long,
+            default_value_t = default_feishu_send_target_kind(),
+            value_parser = parse_feishu_send_target_kind
+        )]
+        target_kind: mvp::channel::ChannelOutboundTargetKind,
         #[arg(long)]
-        text: String,
+        text: Option<String>,
+        #[arg(long = "post-json")]
+        post_json: Option<String>,
+        #[arg(long)]
+        image_key: Option<String>,
+        #[arg(long)]
+        file_key: Option<String>,
+        #[arg(long)]
+        image_path: Option<String>,
+        #[arg(long)]
+        file_path: Option<String>,
+        #[arg(long)]
+        file_type: Option<String>,
         #[arg(long, default_value_t = false)]
         card: bool,
+        #[arg(long)]
+        uuid: Option<String>,
     },
     /// Run Feishu event callback server and auto-reply via provider
     FeishuServe {
@@ -392,6 +558,11 @@ enum Commands {
         bind: Option<String>,
         #[arg(long)]
         path: Option<String>,
+    },
+    /// Run the Feishu integration namespace
+    Feishu {
+        #[command(subcommand)]
+        command: feishu_cli::FeishuCommand,
     },
 }
 
@@ -427,6 +598,7 @@ async fn main() {
                 &output,
                 enforce_gate,
                 preflight_fail_on_warnings,
+                Some(native_spec_tool_executor),
             )
             .await
         }
@@ -460,6 +632,33 @@ async fn main() {
             enforce_gate,
             min_speedup_ratio,
         ),
+        Commands::BenchmarkMemoryContext {
+            output,
+            temp_root,
+            history_turns,
+            sliding_window,
+            summary_max_chars,
+            words_per_turn,
+            rebuild_iterations,
+            hot_iterations,
+            warmup_iterations,
+            suite_repetitions,
+            enforce_gate,
+            min_steady_state_speedup_ratio,
+        } => run_memory_context_benchmark_cli(
+            &output,
+            temp_root.as_deref(),
+            history_turns,
+            sliding_window,
+            summary_max_chars,
+            words_per_turn,
+            rebuild_iterations,
+            hot_iterations,
+            warmup_iterations,
+            suite_repetitions,
+            enforce_gate,
+            min_steady_state_speedup_ratio,
+        ),
         Commands::ValidateConfig {
             config,
             json,
@@ -480,9 +679,7 @@ async fn main() {
             accept_risk,
             provider,
             model,
-            api_key,
-            personality,
-            memory_profile,
+            api_key_env,
             system_prompt,
             skip_model_probe,
         } => {
@@ -493,37 +690,38 @@ async fn main() {
                 accept_risk,
                 provider,
                 model,
-                api_key,
-                personality,
-                memory_profile,
+                api_key_env,
                 system_prompt,
                 skip_model_probe,
             })
             .await
         }
-        Commands::ImportClaw {
-            input,
+        Commands::Import {
             output,
-            source,
-            mode,
-            json,
-            source_id,
-            safe_profile_merge,
-            primary_source_id,
-            apply_external_skills_plan,
             force,
-        } => import_claw_cli::run_import_claw_cli(import_claw_cli::ImportClawCommandOptions {
-            input,
-            output,
-            source,
-            mode,
+            preview,
+            apply,
             json,
-            source_id,
-            safe_profile_merge,
-            primary_source_id,
-            apply_external_skills_plan,
-            force,
-        }),
+            from,
+            source_path,
+            provider,
+            include,
+            exclude,
+        } => {
+            import_cli::run_import_cli(import_cli::ImportCommandOptions {
+                output,
+                force,
+                preview,
+                apply,
+                json,
+                from,
+                source_path,
+                provider,
+                include,
+                exclude,
+            })
+            .await
+        }
         Commands::Doctor {
             config,
             fix,
@@ -538,10 +736,22 @@ async fn main() {
             })
             .await
         }
+        Commands::Skills {
+            config,
+            json,
+            command,
+        } => skills_cli::run_skills_cli(skills_cli::SkillsCommandOptions {
+            config,
+            json,
+            command,
+        }),
         Commands::Channels { config, json } => run_channels_cli(config.as_deref(), json),
         Commands::ListModels { config, json } => run_list_models_cli(config.as_deref(), json).await,
         Commands::ListContextEngines { config, json } => {
             run_list_context_engines_cli(config.as_deref(), json)
+        }
+        Commands::ListMemorySystems { config, json } => {
+            run_list_memory_systems_cli(config.as_deref(), json)
         }
         Commands::ListAcpBackends { config, json } => {
             run_list_acp_backends_cli(config.as_deref(), json)
@@ -596,6 +806,26 @@ async fn main() {
             backend,
             json,
         } => run_acp_doctor_cli(config.as_deref(), backend.as_deref(), json).await,
+        Commands::Ask {
+            config,
+            session,
+            message,
+            acp,
+            acp_event_stream,
+            acp_bootstrap_mcp_server,
+            acp_cwd,
+        } => {
+            run_ask_cli(
+                config.as_deref(),
+                session.as_deref(),
+                &message,
+                acp,
+                acp_event_stream,
+                &acp_bootstrap_mcp_server,
+                acp_cwd.as_deref(),
+            )
+            .await
+        }
         Commands::Chat {
             config,
             session,
@@ -620,26 +850,83 @@ async fn main() {
             limit,
             json,
         } => run_safe_lane_summary_cli(config.as_deref(), session.as_deref(), limit, json),
+        Commands::TelegramSend {
+            config,
+            account,
+            target,
+            target_kind,
+            text,
+        } => {
+            run_channel_send_cli(
+                TELEGRAM_SEND_CLI_SPEC,
+                ChannelSendCliArgs {
+                    config_path: config.as_deref(),
+                    account: account.as_deref(),
+                    target: &target,
+                    target_kind,
+                    text: &text,
+                    as_card: false,
+                },
+            )
+            .await
+        }
         Commands::TelegramServe {
             config,
             once,
             account,
-        } => run_telegram_serve_cli(config.as_deref(), once, account.as_deref()).await,
+        } => {
+            run_channel_serve_cli(
+                TELEGRAM_SERVE_CLI_SPEC,
+                ChannelServeCliArgs {
+                    config_path: config.as_deref(),
+                    account: account.as_deref(),
+                    once,
+                    bind_override: None,
+                    path_override: None,
+                },
+            )
+            .await
+        }
         Commands::FeishuSend {
             config,
             account,
-            receive_id,
+            receive_id_type,
+            target,
+            target_kind,
             text,
+            post_json,
+            image_key,
+            file_key,
+            image_path,
+            file_path,
+            file_type,
             card,
+            uuid,
         } => {
-            run_feishu_send_cli(
-                config.as_deref(),
-                account.as_deref(),
-                &receive_id,
-                &text,
-                card,
-            )
-            .await
+            if target_kind == mvp::channel::ChannelOutboundTargetKind::MessageReply {
+                Err(
+                    "legacy `feishu-send` no longer supports `message_reply` execution; use `loongclaw feishu reply` for reply targets".to_owned(),
+                )
+            } else {
+                mvp::channel::run_feishu_send(
+                    config.as_deref(),
+                    account.as_deref(),
+                    &mvp::channel::FeishuChannelSendRequest {
+                        receive_id: target,
+                        receive_id_type,
+                        text,
+                        post_json,
+                        image_key,
+                        file_key,
+                        image_path,
+                        file_path,
+                        file_type,
+                        card,
+                        uuid,
+                    },
+                )
+                .await
+            }
         }
         Commands::FeishuServe {
             config,
@@ -647,14 +934,19 @@ async fn main() {
             bind,
             path,
         } => {
-            run_feishu_serve_cli(
-                config.as_deref(),
-                account.as_deref(),
-                bind.as_deref(),
-                path.as_deref(),
+            run_channel_serve_cli(
+                FEISHU_SERVE_CLI_SPEC,
+                ChannelServeCliArgs {
+                    config_path: config.as_deref(),
+                    account: account.as_deref(),
+                    once: false,
+                    bind_override: bind.as_deref(),
+                    path_override: path.as_deref(),
+                },
             )
             .await
         }
+        Commands::Feishu { command } => feishu_cli::run_feishu_command(command).await,
     };
     if let Err(error) = result {
         // startup error reporting
@@ -690,9 +982,10 @@ async fn run_demo() -> CliResult<()> {
     );
 
     let connector_dispatch = kernel
-        .invoke_connector(
+        .execute_connector_core(
             DEFAULT_PACK_ID,
             &token,
+            None,
             ConnectorCommand {
                 connector_name: "webhook".to_owned(),
                 operation: "notify".to_owned(),
@@ -747,9 +1040,10 @@ async fn invoke_connector_cli(operation: &str, payload_raw: &str) -> CliResult<(
         .map_err(|error| format!("token issue failed: {error}"))?;
 
     let dispatch = kernel
-        .invoke_connector(
+        .execute_connector_core(
             DEFAULT_PACK_ID,
             &token,
+            None,
             ConnectorCommand {
                 connector_name: "webhook".to_owned(),
                 operation: operation.to_owned(),
@@ -796,9 +1090,10 @@ async fn run_audit_demo() -> CliResult<()> {
     fixed_clock.advance_by(5);
 
     let _ = kernel
-        .invoke_connector(
+        .execute_connector_core(
             DEFAULT_PACK_ID,
             &token,
+            None,
             ConnectorCommand {
                 connector_name: "webhook".to_owned(),
                 operation: "notify".to_owned(),
@@ -828,7 +1123,9 @@ fn init_spec_cli(output_path: &str) -> CliResult<()> {
 
 async fn run_spec_cli(spec_path: &str, print_audit: bool) -> CliResult<()> {
     let spec = read_spec_file(spec_path)?;
-    let report = execute_spec(&spec, print_audit).await;
+    let report =
+        execute_spec_with_native_tool_executor(&spec, print_audit, Some(native_spec_tool_executor))
+            .await;
     let pretty = serde_json::to_string_pretty(&report)
         .map_err(|error| format!("serialize spec run report failed: {error}"))?;
     println!("{pretty}");
@@ -962,13 +1259,11 @@ async fn run_list_models_cli(config_path: Option<&str>, as_json: bool) -> CliRes
 
 fn run_channels_cli(config_path: Option<&str>, as_json: bool) -> CliResult<()> {
     let (resolved_path, config) = mvp::config::load(config_path)?;
-    let snapshots = mvp::channel::channel_status_snapshots(&config);
+    let inventory = mvp::channel::channel_inventory(&config);
+    let resolved_path_display = resolved_path.display().to_string();
 
     if as_json {
-        let payload = json!({
-            "config": resolved_path.display().to_string(),
-            "channels": snapshots,
-        });
+        let payload = build_channels_cli_json_payload(&resolved_path_display, &inventory);
         let pretty = serde_json::to_string_pretty(&payload)
             .map_err(|error| format!("serialize channel status output failed: {error}"))?;
         println!("{pretty}");
@@ -977,89 +1272,237 @@ fn run_channels_cli(config_path: Option<&str>, as_json: bool) -> CliResult<()> {
 
     println!(
         "{}",
-        render_channel_snapshots_text(&resolved_path.display().to_string(), &snapshots)
+        render_channel_surfaces_text(&resolved_path_display, &inventory)
     );
     Ok(())
 }
 
-fn render_channel_snapshots_text(
+#[derive(Debug, Clone, Serialize)]
+struct ChannelsCliJsonSchema {
+    version: u32,
+    primary_channel_view: &'static str,
+    catalog_view: &'static str,
+    legacy_channel_views: &'static [&'static str],
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ChannelsCliJsonPayload {
+    config: String,
+    schema: ChannelsCliJsonSchema,
+    channels: Vec<mvp::channel::ChannelStatusSnapshot>,
+    catalog_only_channels: Vec<mvp::channel::ChannelCatalogEntry>,
+    channel_catalog: Vec<mvp::channel::ChannelCatalogEntry>,
+    channel_surfaces: Vec<mvp::channel::ChannelSurface>,
+}
+
+const CHANNELS_CLI_JSON_SCHEMA_VERSION: u32 = 1;
+const CHANNELS_CLI_JSON_LEGACY_VIEWS: &[&str] = &["channels", "catalog_only_channels"];
+
+fn build_channels_cli_json_payload(
     config_path: &str,
-    snapshots: &[mvp::channel::ChannelStatusSnapshot],
+    inventory: &mvp::channel::ChannelInventory,
+) -> ChannelsCliJsonPayload {
+    ChannelsCliJsonPayload {
+        config: config_path.to_owned(),
+        schema: ChannelsCliJsonSchema {
+            version: CHANNELS_CLI_JSON_SCHEMA_VERSION,
+            primary_channel_view: "channel_surfaces",
+            catalog_view: "channel_catalog",
+            legacy_channel_views: CHANNELS_CLI_JSON_LEGACY_VIEWS,
+        },
+        channels: inventory.channels.clone(),
+        catalog_only_channels: inventory.catalog_only_channels.clone(),
+        channel_catalog: inventory.channel_catalog.clone(),
+        channel_surfaces: inventory.channel_surfaces.clone(),
+    }
+}
+
+fn render_channel_surfaces_text(
+    config_path: &str,
+    inventory: &mvp::channel::ChannelInventory,
 ) -> String {
     let mut lines = vec![format!("config={config_path}")];
-    for snapshot in snapshots {
-        let aliases = if snapshot.aliases.is_empty() {
-            "-".to_owned()
-        } else {
-            snapshot.aliases.join(",")
-        };
-        let api_base_url = snapshot.api_base_url.as_deref().unwrap_or("-");
-        lines.push(format!(
-            "{} [{}] configured_account={} default_account={} default_source={} compiled={} enabled={} aliases={} api_base_url={}",
-            snapshot.label,
-            snapshot.id,
-            snapshot.configured_account_id,
-            snapshot.is_default_account,
-            snapshot.default_account_source.as_str(),
-            snapshot.compiled,
-            snapshot.enabled,
-            aliases,
-            api_base_url
-        ));
-        lines.push(format!("  transport={}", snapshot.transport));
-        lines.push(format!(
-            "  configured_account_label={}",
-            snapshot.configured_account_label
-        ));
-        for note in &snapshot.notes {
-            lines.push(format!("  note: {note}"));
+    let mut catalog_only_surfaces = Vec::new();
+
+    for surface in &inventory.channel_surfaces {
+        if surface.catalog.implementation_status
+            == mvp::channel::ChannelCatalogImplementationStatus::Stub
+        {
+            catalog_only_surfaces.push(surface);
+            continue;
         }
-        for operation in &snapshot.operations {
+
+        push_channel_surface_header(&mut lines, surface);
+        lines.push(render_channel_onboarding_line(&surface.catalog.onboarding));
+        for snapshot in &surface.configured_accounts {
+            let api_base_url = snapshot.api_base_url.as_deref().unwrap_or("-");
             lines.push(format!(
-                "  op {} ({}) {}: {}",
-                operation.id,
-                operation.command,
-                operation.health.as_str(),
-                operation.detail
+                "  account configured_account={} configured_account_label={} default_account={} default_source={} compiled={} enabled={} api_base_url={}",
+                snapshot.configured_account_id,
+                snapshot.configured_account_label,
+                snapshot.is_default_account,
+                snapshot.default_account_source.as_str(),
+                snapshot.compiled,
+                snapshot.enabled,
+                api_base_url
             ));
-            if let Some(runtime) = &operation.runtime {
-                lines.push(format!(
-                    "    runtime account={} account_id={} running={} stale={} busy={} active_runs={} instance_count={} running_instances={} stale_instances={} last_run_activity_at={} last_heartbeat_at={} pid={}",
-                    runtime
-                        .account_label
-                        .as_deref()
-                        .unwrap_or("-"),
-                    runtime
-                        .account_id
-                        .as_deref()
-                        .unwrap_or("-"),
-                    runtime.running,
-                    runtime.stale,
-                    runtime.busy,
-                    runtime.active_runs,
-                    runtime.instance_count,
-                    runtime.running_instances,
-                    runtime.stale_instances,
-                    runtime
-                        .last_run_activity_at
-                        .map(|value| value.to_string())
-                        .unwrap_or_else(|| "-".to_owned()),
-                    runtime
-                        .last_heartbeat_at
-                        .map(|value| value.to_string())
-                        .unwrap_or_else(|| "-".to_owned()),
-                    runtime
-                        .pid
-                        .map(|value| value.to_string())
-                        .unwrap_or_else(|| "-".to_owned())
-                ));
+            for note in &snapshot.notes {
+                lines.push(format!("    note: {note}"));
             }
-            for issue in &operation.issues {
-                lines.push(format!("    issue: {issue}"));
+            for operation in &snapshot.operations {
+                let catalog_operation = surface.catalog.operation(operation.id);
+                let requirement_ids = catalog_operation
+                    .map(|catalog_operation| {
+                        render_channel_operation_requirement_ids(catalog_operation.requirements)
+                    })
+                    .unwrap_or_else(|| "-".to_owned());
+                lines.push(format!(
+                    "    op {} ({}) {}: {} target_kinds={} requirements={}",
+                    operation.id,
+                    operation.command,
+                    operation.health.as_str(),
+                    operation.detail,
+                    render_channel_target_kind_ids(
+                        catalog_operation
+                            .map(|catalog_operation| catalog_operation.supported_target_kinds)
+                            .unwrap_or(&[])
+                    ),
+                    requirement_ids,
+                ));
+                if let Some(runtime) = &operation.runtime {
+                    lines.push(format!(
+                        "      runtime account={} account_id={} running={} stale={} busy={} active_runs={} instance_count={} running_instances={} stale_instances={} last_run_activity_at={} last_heartbeat_at={} pid={}",
+                        runtime
+                            .account_label
+                            .as_deref()
+                            .unwrap_or("-"),
+                        runtime
+                            .account_id
+                            .as_deref()
+                            .unwrap_or("-"),
+                        runtime.running,
+                        runtime.stale,
+                        runtime.busy,
+                        runtime.active_runs,
+                        runtime.instance_count,
+                        runtime.running_instances,
+                        runtime.stale_instances,
+                        runtime
+                            .last_run_activity_at
+                            .map(|value| value.to_string())
+                            .unwrap_or_else(|| "-".to_owned()),
+                        runtime
+                            .last_heartbeat_at
+                            .map(|value| value.to_string())
+                            .unwrap_or_else(|| "-".to_owned()),
+                        runtime
+                            .pid
+                            .map(|value| value.to_string())
+                            .unwrap_or_else(|| "-".to_owned())
+                    ));
+                }
+                for issue in &operation.issues {
+                    lines.push(format!("      issue: {issue}"));
+                }
+            }
+        }
+    }
+
+    if !catalog_only_surfaces.is_empty() {
+        lines.push("catalog-only channels:".to_owned());
+        for surface in catalog_only_surfaces {
+            push_channel_surface_header(&mut lines, surface);
+            lines.push(render_channel_onboarding_line(&surface.catalog.onboarding));
+            for operation in &surface.catalog.operations {
+                lines.push(format!(
+                    "  catalog op {} ({}) availability={} tracks_runtime={} target_kinds={} requirements={}",
+                    operation.id,
+                    operation.command,
+                    operation.availability.as_str(),
+                    operation.tracks_runtime,
+                    render_channel_target_kind_ids(operation.supported_target_kinds),
+                    render_channel_operation_requirement_ids(operation.requirements)
+                ));
             }
         }
     }
     lines.join("\n")
+}
+
+fn render_channel_onboarding_line(
+    onboarding: &mvp::channel::ChannelOnboardingDescriptor,
+) -> String {
+    format!(
+        "  onboarding strategy={} status_command=\"{}\" repair_command={} setup_hint=\"{}\"",
+        onboarding.strategy.as_str(),
+        onboarding.status_command,
+        onboarding
+            .repair_command
+            .map(|command| format!("\"{command}\""))
+            .unwrap_or_else(|| "-".to_owned()),
+        onboarding.setup_hint
+    )
+}
+
+fn render_channel_operation_requirement_ids(
+    requirements: &[mvp::channel::ChannelCatalogOperationRequirement],
+) -> String {
+    if requirements.is_empty() {
+        return "-".to_owned();
+    }
+    requirements
+        .iter()
+        .map(|requirement| requirement.id)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn render_channel_target_kind_ids(
+    target_kinds: &[mvp::channel::ChannelCatalogTargetKind],
+) -> String {
+    if target_kinds.is_empty() {
+        return "-".to_owned();
+    }
+    target_kinds
+        .iter()
+        .map(|kind| kind.as_str())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn push_channel_surface_header(lines: &mut Vec<String>, surface: &mvp::channel::ChannelSurface) {
+    let aliases = if surface.catalog.aliases.is_empty() {
+        "-".to_owned()
+    } else {
+        surface.catalog.aliases.join(",")
+    };
+    let capabilities = if surface.catalog.capabilities.is_empty() {
+        "-".to_owned()
+    } else {
+        surface
+            .catalog
+            .capabilities
+            .iter()
+            .map(|capability| capability.as_str())
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let target_kinds = render_channel_target_kind_ids(&surface.catalog.supported_target_kinds);
+    lines.push(format!(
+        "{} [{}] implementation_status={} capabilities={} aliases={} transport={} target_kinds={} configured_accounts={} default_configured_account={}",
+        surface.catalog.label,
+        surface.catalog.id,
+        surface.catalog.implementation_status.as_str(),
+        capabilities,
+        aliases,
+        surface.catalog.transport,
+        target_kinds,
+        surface.configured_accounts.len(),
+        surface
+            .default_configured_account_id
+            .as_deref()
+            .unwrap_or("-")
+    ));
 }
 
 fn run_list_context_engines_cli(config_path: Option<&str>, as_json: bool) -> CliResult<()> {
@@ -1121,6 +1564,26 @@ fn run_list_context_engines_cli(config_path: Option<&str>, as_json: bool) -> Cli
             format_capability_names(&metadata.capability_names())
         );
     }
+    Ok(())
+}
+
+fn run_list_memory_systems_cli(config_path: Option<&str>, as_json: bool) -> CliResult<()> {
+    let (resolved_path, config) = mvp::config::load(config_path)?;
+    let snapshot = mvp::memory::collect_memory_system_runtime_snapshot(&config)?;
+
+    if as_json {
+        let payload =
+            build_memory_systems_cli_json_payload(&resolved_path.display().to_string(), &snapshot);
+        let pretty = serde_json::to_string_pretty(&payload)
+            .map_err(|error| format!("serialize memory-system output failed: {error}"))?;
+        println!("{pretty}");
+        return Ok(());
+    }
+
+    println!(
+        "{}",
+        render_memory_system_snapshot_text(&resolved_path.display().to_string(), &snapshot)
+    );
     Ok(())
 }
 
@@ -1536,7 +1999,30 @@ async fn run_chat_cli(
     acp_bootstrap_mcp_server: &[String],
     acp_cwd: Option<&str>,
 ) -> CliResult<()> {
-    let options = mvp::chat::CliChatOptions {
+    let options = build_cli_chat_options(acp, acp_event_stream, acp_bootstrap_mcp_server, acp_cwd);
+    mvp::chat::run_cli_chat(config_path, session, &options).await
+}
+
+async fn run_ask_cli(
+    config_path: Option<&str>,
+    session: Option<&str>,
+    message: &str,
+    acp: bool,
+    acp_event_stream: bool,
+    acp_bootstrap_mcp_server: &[String],
+    acp_cwd: Option<&str>,
+) -> CliResult<()> {
+    let options = build_cli_chat_options(acp, acp_event_stream, acp_bootstrap_mcp_server, acp_cwd);
+    mvp::chat::run_cli_ask(config_path, session, message, &options).await
+}
+
+fn build_cli_chat_options(
+    acp: bool,
+    acp_event_stream: bool,
+    acp_bootstrap_mcp_server: &[String],
+    acp_cwd: Option<&str>,
+) -> mvp::chat::CliChatOptions {
+    mvp::chat::CliChatOptions {
         acp_requested: acp,
         acp_event_stream,
         acp_bootstrap_mcp_servers: acp_bootstrap_mcp_server.to_vec(),
@@ -1544,8 +2030,7 @@ async fn run_chat_cli(
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(std::path::PathBuf::from),
-    };
-    mvp::chat::run_cli_chat(config_path, session, &options).await
+    }
 }
 
 fn run_acp_event_summary_cli(
@@ -1848,31 +2333,187 @@ fn format_milli_ratio(value: Option<u32>) -> String {
         .unwrap_or_else(|| "-".to_owned())
 }
 
-async fn run_telegram_serve_cli(
-    config_path: Option<&str>,
-    once: bool,
-    account: Option<&str>,
-) -> CliResult<()> {
-    mvp::channel::run_telegram_channel(config_path, once, account).await
+async fn with_graceful_shutdown<F>(serve_future: F) -> CliResult<()>
+where
+    F: std::future::Future<Output = CliResult<()>>,
+{
+    tokio::select! {
+        result = serve_future => result,
+        result = wait_for_shutdown_signal() => result,
+    }
 }
 
-async fn run_feishu_send_cli(
-    config_path: Option<&str>,
-    account: Option<&str>,
-    receive_id: &str,
-    text: &str,
-    as_card: bool,
-) -> CliResult<()> {
-    mvp::channel::run_feishu_send(config_path, account, receive_id, text, as_card).await
+#[cfg(unix)]
+async fn wait_for_shutdown_signal() -> CliResult<()> {
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .map_err(|error| format!("failed to register SIGTERM handler: {error}"))?;
+
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => {
+            result.map_err(|error| format!("failed to register Ctrl-C handler: {error}"))?;
+            eprintln!("\nReceived Ctrl-C, shutting down gracefully...");
+            Ok(())
+        }
+        _ = sigterm.recv() => {
+            eprintln!("\nReceived SIGTERM, shutting down gracefully...");
+            Ok(())
+        }
+    }
 }
 
-async fn run_feishu_serve_cli(
-    config_path: Option<&str>,
-    account: Option<&str>,
-    bind_override: Option<&str>,
-    path_override: Option<&str>,
+#[cfg(not(unix))]
+async fn wait_for_shutdown_signal() -> CliResult<()> {
+    tokio::signal::ctrl_c()
+        .await
+        .map_err(|error| format!("failed to register Ctrl-C handler: {error}"))?;
+    eprintln!("\nReceived Ctrl-C, shutting down gracefully...");
+    Ok(())
+}
+
+const TELEGRAM_SEND_CLI_SPEC: ChannelSendCliSpec = ChannelSendCliSpec {
+    family: mvp::channel::TELEGRAM_COMMAND_FAMILY_DESCRIPTOR,
+    run: run_telegram_send_cli_impl,
+};
+
+const FEISHU_SEND_CLI_SPEC: ChannelSendCliSpec = ChannelSendCliSpec {
+    family: mvp::channel::FEISHU_COMMAND_FAMILY_DESCRIPTOR,
+    run: run_feishu_send_cli_impl,
+};
+
+const TELEGRAM_SERVE_CLI_SPEC: ChannelServeCliSpec = ChannelServeCliSpec {
+    family: mvp::channel::TELEGRAM_COMMAND_FAMILY_DESCRIPTOR,
+    run: run_telegram_serve_cli_impl,
+};
+
+const FEISHU_SERVE_CLI_SPEC: ChannelServeCliSpec = ChannelServeCliSpec {
+    family: mvp::channel::FEISHU_COMMAND_FAMILY_DESCRIPTOR,
+    run: run_feishu_serve_cli_impl,
+};
+
+async fn run_channel_send_cli(
+    spec: ChannelSendCliSpec,
+    args: ChannelSendCliArgs<'_>,
 ) -> CliResult<()> {
-    mvp::channel::run_feishu_channel(config_path, account, bind_override, path_override).await
+    let _ = spec.family;
+    (spec.run)(args).await
+}
+
+async fn run_channel_serve_cli(
+    spec: ChannelServeCliSpec,
+    args: ChannelServeCliArgs<'_>,
+) -> CliResult<()> {
+    let _ = spec.family;
+    (spec.run)(args).await
+}
+
+fn run_telegram_send_cli_impl(args: ChannelSendCliArgs<'_>) -> ChannelCliCommandFuture<'_> {
+    Box::pin(async move {
+        let _ = args.as_card;
+        mvp::channel::run_telegram_send(
+            args.config_path,
+            args.account,
+            args.target,
+            args.target_kind,
+            args.text,
+        )
+        .await
+    })
+}
+
+fn run_feishu_send_cli_impl(args: ChannelSendCliArgs<'_>) -> ChannelCliCommandFuture<'_> {
+    Box::pin(async move {
+        mvp::channel::run_feishu_send(
+            args.config_path,
+            args.account,
+            &mvp::channel::FeishuChannelSendRequest {
+                receive_id: args.target.to_owned(),
+                receive_id_type: Some(args.target_kind.as_str().to_owned()),
+                text: Some(args.text.to_owned()),
+                post_json: None,
+                image_key: None,
+                file_key: None,
+                image_path: None,
+                file_path: None,
+                file_type: None,
+                card: args.as_card,
+                uuid: None,
+            },
+        )
+        .await
+    })
+}
+
+fn run_telegram_serve_cli_impl(args: ChannelServeCliArgs<'_>) -> ChannelCliCommandFuture<'_> {
+    Box::pin(async move {
+        let _ = (args.bind_override, args.path_override);
+        with_graceful_shutdown(mvp::channel::run_telegram_channel(
+            args.config_path,
+            args.once,
+            args.account,
+        ))
+        .await
+    })
+}
+
+fn default_channel_send_target_kind(
+    spec: ChannelSendCliSpec,
+) -> mvp::channel::ChannelOutboundTargetKind {
+    spec.family.default_send_target_kind()
+}
+
+fn parse_channel_send_target_kind(
+    spec: ChannelSendCliSpec,
+    raw: &str,
+) -> Result<mvp::channel::ChannelOutboundTargetKind, String> {
+    let target_kind = raw.parse::<mvp::channel::ChannelOutboundTargetKind>()?;
+    let channel_id = spec.family.channel_id();
+    let operation = spec.family.send();
+    if !operation.supports_target_kind(target_kind) {
+        let supported = operation
+            .supported_target_kinds
+            .iter()
+            .map(|kind| format!("`{}`", kind.as_str()))
+            .collect::<Vec<_>>()
+            .join(" or ");
+        return Err(format!(
+            "{channel_id} --target-kind does not support `{}`; use {}",
+            target_kind.as_str(),
+            supported
+        ));
+    }
+    Ok(target_kind)
+}
+
+fn default_telegram_send_target_kind() -> mvp::channel::ChannelOutboundTargetKind {
+    default_channel_send_target_kind(TELEGRAM_SEND_CLI_SPEC)
+}
+
+fn parse_telegram_send_target_kind(
+    raw: &str,
+) -> Result<mvp::channel::ChannelOutboundTargetKind, String> {
+    parse_channel_send_target_kind(TELEGRAM_SEND_CLI_SPEC, raw)
+}
+
+fn default_feishu_send_target_kind() -> mvp::channel::ChannelOutboundTargetKind {
+    default_channel_send_target_kind(FEISHU_SEND_CLI_SPEC)
+}
+
+fn parse_feishu_send_target_kind(
+    raw: &str,
+) -> Result<mvp::channel::ChannelOutboundTargetKind, String> {
+    parse_channel_send_target_kind(FEISHU_SEND_CLI_SPEC, raw)
+}
+
+fn run_feishu_serve_cli_impl(args: ChannelServeCliArgs<'_>) -> ChannelCliCommandFuture<'_> {
+    Box::pin(async move {
+        with_graceful_shutdown(mvp::channel::run_feishu_channel(
+            args.config_path,
+            args.account,
+            args.bind_override,
+            args.path_override,
+        ))
+        .await
+    })
 }
 
 fn parse_json_payload(raw: &str, context: &str) -> CliResult<Value> {
@@ -1894,6 +2535,97 @@ fn context_engine_metadata_json(
         payload.insert("source".to_owned(), json!(source));
     }
     Value::Object(payload)
+}
+
+fn memory_system_metadata_json(
+    metadata: &mvp::memory::MemorySystemMetadata,
+    source: Option<&str>,
+) -> Value {
+    let mut payload = serde_json::Map::new();
+    payload.insert("id".to_owned(), json!(metadata.id));
+    payload.insert("api_version".to_owned(), json!(metadata.api_version));
+    payload.insert(
+        "capabilities".to_owned(),
+        json!(metadata.capability_names()),
+    );
+    payload.insert("summary".to_owned(), json!(metadata.summary));
+    if let Some(source) = source {
+        payload.insert("source".to_owned(), json!(source));
+    }
+    Value::Object(payload)
+}
+
+fn memory_system_policy_json(policy: &mvp::memory::MemorySystemPolicySnapshot) -> Value {
+    json!({
+        "backend": policy.backend.as_str(),
+        "profile": policy.profile.as_str(),
+        "mode": policy.mode.as_str(),
+        "ingest_mode": policy.ingest_mode.as_str(),
+        "fail_open": policy.fail_open,
+        "strict_mode_requested": policy.strict_mode_requested,
+        "strict_mode_active": policy.strict_mode_active,
+        "effective_fail_open": policy.effective_fail_open,
+    })
+}
+
+fn build_memory_systems_cli_json_payload(
+    config_path: &str,
+    snapshot: &mvp::memory::MemorySystemRuntimeSnapshot,
+) -> Value {
+    json!({
+        "config": config_path,
+        "selected": memory_system_metadata_json(
+            &snapshot.selected_metadata,
+            Some(snapshot.selected.source.as_str())
+        ),
+        "available": snapshot
+            .available
+            .iter()
+            .map(|metadata| memory_system_metadata_json(metadata, None))
+            .collect::<Vec<_>>(),
+        "policy": memory_system_policy_json(&snapshot.policy),
+    })
+}
+
+fn render_memory_system_snapshot_text(
+    config_path: &str,
+    snapshot: &mvp::memory::MemorySystemRuntimeSnapshot,
+) -> String {
+    let mut lines = vec![
+        format!("config={config_path}"),
+        format!(
+            "selected={} source={} api_version={} capabilities={} summary={}",
+            snapshot.selected_metadata.id,
+            snapshot.selected.source.as_str(),
+            snapshot.selected_metadata.api_version,
+            format_capability_names(&snapshot.selected_metadata.capability_names()),
+            snapshot.selected_metadata.summary
+        ),
+        format!(
+            "policy=backend:{} profile:{} mode:{} ingest_mode:{} fail_open:{} strict_mode_requested:{} strict_mode_active:{} effective_fail_open:{}",
+            snapshot.policy.backend.as_str(),
+            snapshot.policy.profile.as_str(),
+            snapshot.policy.mode.as_str(),
+            snapshot.policy.ingest_mode.as_str(),
+            snapshot.policy.fail_open,
+            snapshot.policy.strict_mode_requested,
+            snapshot.policy.strict_mode_active,
+            snapshot.policy.effective_fail_open,
+        ),
+        "available:".to_owned(),
+    ];
+
+    for metadata in &snapshot.available {
+        lines.push(format!(
+            "- {} api_version={} capabilities={} summary={}",
+            metadata.id,
+            metadata.api_version,
+            format_capability_names(&metadata.capability_names()),
+            metadata.summary
+        ));
+    }
+
+    lines.join("\n")
 }
 
 fn acp_backend_metadata_json(
@@ -2229,6 +2961,21 @@ fn write_json_file<T: Serialize>(path: &str, value: &T) -> CliResult<()> {
 mod cli_tests {
     use super::*;
 
+    fn channel_catalog_command_family(
+        raw: &str,
+    ) -> mvp::channel::ChannelCatalogCommandFamilyDescriptor {
+        mvp::channel::resolve_channel_catalog_command_family_descriptor(raw)
+            .expect("channel catalog command family")
+    }
+
+    fn channel_send_command(raw: &str) -> &'static str {
+        channel_catalog_command_family(raw).send.command
+    }
+
+    fn channel_default_send_target_kind(raw: &str) -> mvp::channel::ChannelOutboundTargetKind {
+        channel_catalog_command_family(raw).default_send_target_kind
+    }
+
     #[test]
     fn root_help_uses_onboarding_language() {
         let mut command = Cli::command();
@@ -2239,7 +2986,12 @@ mod cli_tests {
         let help = String::from_utf8(rendered).expect("help is valid utf-8");
 
         assert!(help.contains("onboarding"));
-        assert!(!help.contains("setup"));
+        assert!(
+            !help
+                .lines()
+                .any(|line| line.trim_start().starts_with("setup ")),
+            "root help should not advertise a standalone `setup` subcommand: {help}"
+        );
     }
 
     #[test]
@@ -2268,13 +3020,13 @@ mod cli_tests {
             "--non-interactive",
             "--accept-risk",
             "--api-key",
-            "${OPENAI_API_KEY}",
+            "OPENAI_API_KEY",
         ])
         .expect("`--api-key` should parse");
 
         match cli.command {
-            Some(Commands::Onboard { api_key, .. }) => {
-                assert_eq!(api_key.as_deref(), Some("${OPENAI_API_KEY}"));
+            Some(Commands::Onboard { api_key_env, .. }) => {
+                assert_eq!(api_key_env.as_deref(), Some("OPENAI_API_KEY"));
             }
             other => panic!("unexpected command parsed: {other:?}"),
         }
@@ -2293,8 +3045,110 @@ mod cli_tests {
         .expect("legacy `--api-key-env` alias should still parse");
 
         match cli.command {
-            Some(Commands::Onboard { api_key, .. }) => {
-                assert_eq!(api_key.as_deref(), Some("OPENAI_API_KEY"));
+            Some(Commands::Onboard { api_key_env, .. }) => {
+                assert_eq!(api_key_env.as_deref(), Some("OPENAI_API_KEY"));
+            }
+            other => panic!("unexpected command parsed: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn benchmark_memory_context_cli_parses_custom_knobs() {
+        let cli = Cli::try_parse_from([
+            "loongclaw",
+            "benchmark-memory-context",
+            "--output",
+            "target/benchmarks/test-memory-context-report.json",
+            "--temp-root",
+            "target/benchmarks/tmp-local",
+            "--history-turns",
+            "96",
+            "--sliding-window",
+            "12",
+            "--summary-max-chars",
+            "640",
+            "--words-per-turn",
+            "18",
+            "--rebuild-iterations",
+            "3",
+            "--hot-iterations",
+            "7",
+            "--warmup-iterations",
+            "2",
+            "--suite-repetitions",
+            "3",
+            "--enforce-gate",
+            "--min-steady-state-speedup-ratio",
+            "1.35",
+        ])
+        .expect("benchmark-memory-context CLI should parse");
+
+        match cli.command {
+            Some(Commands::BenchmarkMemoryContext {
+                output,
+                temp_root,
+                history_turns,
+                sliding_window,
+                summary_max_chars,
+                words_per_turn,
+                rebuild_iterations,
+                hot_iterations,
+                warmup_iterations,
+                suite_repetitions,
+                enforce_gate,
+                min_steady_state_speedup_ratio,
+            }) => {
+                assert_eq!(
+                    output,
+                    "target/benchmarks/test-memory-context-report.json".to_owned()
+                );
+                assert_eq!(temp_root, Some("target/benchmarks/tmp-local".to_owned()));
+                assert_eq!(history_turns, 96);
+                assert_eq!(sliding_window, 12);
+                assert_eq!(summary_max_chars, 640);
+                assert_eq!(words_per_turn, 18);
+                assert_eq!(rebuild_iterations, 3);
+                assert_eq!(hot_iterations, 7);
+                assert_eq!(warmup_iterations, 2);
+                assert_eq!(suite_repetitions, 3);
+                assert!(enforce_gate);
+                assert!((min_steady_state_speedup_ratio - 1.35).abs() < f64::EPSILON);
+            }
+            other => panic!("unexpected command parsed: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn benchmark_memory_context_cli_uses_stable_default_sample_sizes() {
+        let cli = Cli::try_parse_from(["loongclaw", "benchmark-memory-context"])
+            .expect("benchmark-memory-context CLI should parse with defaults");
+
+        match cli.command {
+            Some(Commands::BenchmarkMemoryContext {
+                rebuild_iterations,
+                hot_iterations,
+                warmup_iterations,
+                suite_repetitions,
+                ..
+            }) => {
+                assert_eq!(rebuild_iterations, 12);
+                assert_eq!(hot_iterations, 32);
+                assert_eq!(warmup_iterations, 4);
+                assert_eq!(suite_repetitions, 1);
+            }
+            other => panic!("unexpected command parsed: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn memory_systems_cli_parses() {
+        let cli = Cli::try_parse_from(["loongclaw", "list-memory-systems"])
+            .expect("`list-memory-systems` should parse");
+
+        match cli.command {
+            Some(Commands::ListMemorySystems { config, json }) => {
+                assert!(config.is_none());
+                assert!(!json);
             }
             other => panic!("unexpected command parsed: {other:?}"),
         }
@@ -2431,5 +3285,256 @@ mod cli_tests {
             }
             other => panic!("unexpected command parse result: {other:?}"),
         }
+    }
+
+    #[test]
+    fn feishu_send_cli_accepts_generic_target_and_target_kind() {
+        let cli = Cli::try_parse_from([
+            "loongclaw",
+            channel_send_command("feishu"),
+            "--target",
+            "om_123",
+            "--target-kind",
+            "message_reply",
+            "--text",
+            "hello",
+        ])
+        .expect("generic feishu target flags should parse");
+
+        match cli.command {
+            Some(Commands::FeishuSend {
+                target,
+                target_kind,
+                text,
+                ..
+            }) => {
+                assert_eq!(target, "om_123");
+                assert_eq!(
+                    target_kind,
+                    mvp::channel::ChannelOutboundTargetKind::MessageReply
+                );
+                assert_eq!(text.as_deref(), Some("hello"));
+            }
+            other => panic!("unexpected command parse result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn feishu_send_cli_keeps_receive_id_alias() {
+        let cli = Cli::try_parse_from([
+            "loongclaw",
+            channel_send_command("feishu"),
+            "--receive-id",
+            "ou_123",
+            "--text",
+            "hello",
+        ])
+        .expect("legacy receive-id alias should still parse");
+
+        match cli.command {
+            Some(Commands::FeishuSend {
+                target,
+                target_kind,
+                text,
+                ..
+            }) => {
+                assert_eq!(target, "ou_123");
+                assert_eq!(
+                    target_kind,
+                    mvp::channel::ChannelOutboundTargetKind::ReceiveId
+                );
+                assert_eq!(text.as_deref(), Some("hello"));
+            }
+            other => panic!("unexpected command parse result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn feishu_send_cli_rejects_unsupported_conversation_target_kind() {
+        let error = Cli::try_parse_from([
+            "loongclaw",
+            channel_send_command("feishu"),
+            "--target",
+            "oc_123",
+            "--target-kind",
+            "conversation",
+            "--text",
+            "hello",
+        ])
+        .expect_err("conversation target kind should be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("use `receive_id` or `message_reply`")
+        );
+    }
+
+    #[test]
+    fn feishu_send_cli_defaults_target_kind_from_catalog_metadata() {
+        let cli = Cli::try_parse_from([
+            "loongclaw",
+            channel_send_command("feishu"),
+            "--target",
+            "ou_123",
+            "--text",
+            "hello",
+        ])
+        .expect("default feishu target kind should parse from catalog metadata");
+
+        match cli.command {
+            Some(Commands::FeishuSend { target_kind, .. }) => {
+                assert_eq!(target_kind, channel_default_send_target_kind("feishu"));
+            }
+            other => panic!("unexpected command parse result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn telegram_send_cli_accepts_generic_target_and_defaults_to_conversation() {
+        let cli = Cli::try_parse_from([
+            "loongclaw",
+            channel_send_command("telegram"),
+            "--target",
+            "123:topic:7",
+            "--text",
+            "hello",
+        ])
+        .expect("telegram send CLI should parse");
+
+        match cli.command {
+            Some(Commands::TelegramSend {
+                target,
+                target_kind,
+                text,
+                ..
+            }) => {
+                assert_eq!(target, "123:topic:7");
+                assert_eq!(target_kind, channel_default_send_target_kind("telegram"));
+                assert_eq!(text, "hello");
+            }
+            other => panic!("unexpected command parse result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn telegram_send_cli_rejects_non_conversation_target_kind() {
+        let error = Cli::try_parse_from([
+            "loongclaw",
+            channel_send_command("telegram"),
+            "--target",
+            "123",
+            "--target-kind",
+            "message_reply",
+            "--text",
+            "hello",
+        ])
+        .expect_err("telegram send should reject non-conversation kinds");
+
+        assert!(error.to_string().contains(
+            "telegram --target-kind does not support `message_reply`; use `conversation`"
+        ));
+    }
+
+    fn fake_send_cli_runner(args: ChannelSendCliArgs<'_>) -> ChannelCliCommandFuture<'_> {
+        Box::pin(async move {
+            Err(format!(
+                "config={}|account={}|target={}|target_kind={}|text={}|card={}",
+                args.config_path.unwrap_or("-"),
+                args.account.unwrap_or("-"),
+                args.target,
+                args.target_kind.as_str(),
+                args.text,
+                args.as_card
+            ))
+        })
+    }
+
+    fn fake_serve_cli_runner(args: ChannelServeCliArgs<'_>) -> ChannelCliCommandFuture<'_> {
+        Box::pin(async move {
+            Err(format!(
+                "config={}|account={}|once={}|bind={}|path={}",
+                args.config_path.unwrap_or("-"),
+                args.account.unwrap_or("-"),
+                args.once,
+                args.bind_override.unwrap_or("-"),
+                args.path_override.unwrap_or("-")
+            ))
+        })
+    }
+
+    #[test]
+    fn run_channel_send_cli_forwards_common_arguments_to_runner() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build test runtime");
+        let error = runtime
+            .block_on(run_channel_send_cli(
+                ChannelSendCliSpec {
+                    family: mvp::channel::FEISHU_COMMAND_FAMILY_DESCRIPTOR,
+                    run: fake_send_cli_runner,
+                },
+                ChannelSendCliArgs {
+                    config_path: Some("/tmp/loongclaw.toml"),
+                    account: Some("ops"),
+                    target: "om_42",
+                    target_kind: mvp::channel::ChannelOutboundTargetKind::MessageReply,
+                    text: "hello",
+                    as_card: true,
+                },
+            ))
+            .expect_err("fake runner should surface forwarded arguments");
+
+        assert_eq!(
+            error,
+            "config=/tmp/loongclaw.toml|account=ops|target=om_42|target_kind=message_reply|text=hello|card=true"
+        );
+    }
+
+    #[test]
+    fn run_channel_serve_cli_forwards_optional_arguments_to_runner() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build test runtime");
+        let error = runtime
+            .block_on(run_channel_serve_cli(
+                ChannelServeCliSpec {
+                    family: mvp::channel::FEISHU_COMMAND_FAMILY_DESCRIPTOR,
+                    run: fake_serve_cli_runner,
+                },
+                ChannelServeCliArgs {
+                    config_path: Some("/tmp/loongclaw.toml"),
+                    account: Some("ops"),
+                    once: true,
+                    bind_override: Some("127.0.0.1:8123"),
+                    path_override: Some("/hooks/feishu"),
+                },
+            ))
+            .expect_err("fake runner should surface forwarded arguments");
+
+        assert_eq!(
+            error,
+            "config=/tmp/loongclaw.toml|account=ops|once=true|bind=127.0.0.1:8123|path=/hooks/feishu"
+        );
+    }
+
+    #[test]
+    fn default_channel_send_target_kind_uses_command_family_send_metadata() {
+        assert_eq!(
+            default_channel_send_target_kind(ChannelSendCliSpec {
+                family: mvp::channel::FEISHU_COMMAND_FAMILY_DESCRIPTOR,
+                run: fake_send_cli_runner,
+            }),
+            mvp::channel::ChannelOutboundTargetKind::ReceiveId
+        );
+        assert_eq!(
+            default_channel_send_target_kind(ChannelSendCliSpec {
+                family: mvp::channel::TELEGRAM_COMMAND_FAMILY_DESCRIPTOR,
+                run: fake_send_cli_runner,
+            }),
+            mvp::channel::ChannelOutboundTargetKind::Conversation
+        );
     }
 }

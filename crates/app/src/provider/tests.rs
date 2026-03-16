@@ -1,7 +1,7 @@
 use super::*;
-use crate::config::{
-    FeishuChannelConfig, MemoryConfig, ProviderConfig, ReasoningEffort, ToolConfig,
-};
+use crate::KernelContext;
+use crate::config::{LoongClawConfig, ProviderConfig, ReasoningEffort};
+use crate::test_support::ScopedEnv;
 use loongclaw_contracts::{Capability, ExecutionRoute, HarnessKind};
 use loongclaw_kernel::{
     AuditEventKind, FixedClock, InMemoryAuditSink, LoongClawKernel, StaticPolicyEngine,
@@ -10,6 +10,8 @@ use loongclaw_kernel::{
 use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
@@ -82,12 +84,67 @@ fn next_temp_path(prefix: &str, extension: &str) -> PathBuf {
     ))
 }
 
+#[tokio::test]
+async fn provider_auth_ready_accepts_x_api_key_providers() {
+    let config = LoongClawConfig {
+        provider: ProviderConfig {
+            kind: ProviderKind::Anthropic,
+            api_key: Some("anthropic-secret".to_owned()),
+            ..ProviderConfig::default()
+        },
+        ..LoongClawConfig::default()
+    };
+
+    assert!(provider_auth_ready(&config).await);
+}
+
+#[tokio::test]
+async fn provider_auth_ready_accepts_manual_auth_headers_for_custom_provider() {
+    let config = LoongClawConfig {
+        provider: ProviderConfig {
+            kind: ProviderKind::Custom,
+            headers: BTreeMap::from([("authorization".to_owned(), "Token manual-auth".to_owned())]),
+            ..ProviderConfig::default()
+        },
+        ..LoongClawConfig::default()
+    };
+
+    assert!(provider_auth_ready(&config).await);
+}
+
+#[cfg(feature = "provider-bedrock")]
+#[tokio::test]
+async fn provider_auth_ready_accepts_bedrock_sigv4_credentials() {
+    let mut env = ScopedEnv::new();
+    env.set("AWS_ACCESS_KEY_ID", "test-access-key");
+    env.set("AWS_SECRET_ACCESS_KEY", "test-secret-key");
+    env.set("AWS_REGION", "us-west-2");
+    env.remove("AWS_SESSION_TOKEN");
+
+    let config = LoongClawConfig {
+        provider: ProviderConfig {
+            kind: ProviderKind::Bedrock,
+            ..ProviderConfig::default()
+        },
+        ..LoongClawConfig::default()
+    };
+
+    assert!(provider_auth_ready(&config).await);
+}
+
 fn cleanup_sqlite_artifacts(path: &Path) {
     let _ = std::fs::remove_file(path);
     let wal = format!("{}-wal", path.display());
     let shm = format!("{}-shm", path.display());
     let _ = std::fs::remove_file(wal);
     let _ = std::fs::remove_file(shm);
+}
+
+fn test_config(provider: ProviderConfig) -> LoongClawConfig {
+    LoongClawConfig {
+        provider,
+        ..LoongClawConfig::default()
+    }
 }
 
 #[test]
@@ -113,6 +170,8 @@ fn resolve_provider_auth_profiles_prefers_oauth_then_api_key() {
         profiles[1].authorization_header.as_deref(),
         Some("Bearer api-key")
     );
+    assert_eq!(profiles[0].x_api_key_header, None);
+    assert_eq!(profiles[1].x_api_key_header, None);
 }
 
 #[test]
@@ -145,10 +204,14 @@ fn provider_profile_health_prioritizes_available_profile() {
     let first = ProviderAuthProfile {
         id: "profile-a".to_owned(),
         authorization_header: Some("Bearer a".to_owned()),
+        x_api_key_header: None,
+        auth_cache_key: Some("Bearer a".to_owned()),
     };
     let second = ProviderAuthProfile {
         id: "profile-b".to_owned(),
         authorization_header: Some("Bearer b".to_owned()),
+        x_api_key_header: None,
+        auth_cache_key: Some("Bearer b".to_owned()),
     };
 
     mark_provider_profile_failure(&policy, &first, ProviderFailoverReason::RateLimited);
@@ -232,6 +295,8 @@ fn provider_profile_health_observe_only_mode_bypasses_cooldown_windows() {
     let profile = ProviderAuthProfile {
         id: "profile-observe".to_owned(),
         authorization_header: Some("Bearer observe".to_owned()),
+        x_api_key_header: None,
+        auth_cache_key: Some("Bearer observe".to_owned()),
     };
 
     mark_provider_profile_failure(&policy, &profile, ProviderFailoverReason::RateLimited);
@@ -555,17 +620,7 @@ fn provider_profile_state_snapshot_skips_unknown_reason_entries() {
 
 #[test]
 fn message_builder_includes_system_prompt() {
-    let config = LoongClawConfig {
-        provider: ProviderConfig::default(),
-        cli: crate::config::CliChannelConfig::default(),
-        telegram: crate::config::TelegramChannelConfig::default(),
-        feishu: FeishuChannelConfig::default(),
-        tools: ToolConfig::default(),
-        memory: MemoryConfig::default(),
-        conversation: crate::config::ConversationConfig::default(),
-        external_skills: crate::config::ExternalSkillsConfig::default(),
-        acp: crate::config::AcpConfig::default(),
-    };
+    let config = test_config(ProviderConfig::default());
 
     let messages =
         build_messages_for_session(&config, "noop-session", true).expect("build messages");
@@ -575,17 +630,7 @@ fn message_builder_includes_system_prompt() {
 
 #[test]
 fn build_messages_includes_capability_snapshot_block() {
-    let config = LoongClawConfig {
-        provider: ProviderConfig::default(),
-        cli: crate::config::CliChannelConfig::default(),
-        telegram: crate::config::TelegramChannelConfig::default(),
-        feishu: FeishuChannelConfig::default(),
-        tools: ToolConfig::default(),
-        memory: MemoryConfig::default(),
-        conversation: crate::config::ConversationConfig::default(),
-        external_skills: crate::config::ExternalSkillsConfig::default(),
-        acp: crate::config::AcpConfig::default(),
-    };
+    let config = test_config(ProviderConfig::default());
 
     let messages =
         build_messages_for_session(&config, "noop-session", true).expect("build messages");
@@ -611,17 +656,7 @@ fn build_messages_includes_capability_snapshot_block() {
 
 #[test]
 fn completion_body_includes_reasoning_effort_when_configured() {
-    let mut config = LoongClawConfig {
-        provider: ProviderConfig::default(),
-        cli: crate::config::CliChannelConfig::default(),
-        telegram: crate::config::TelegramChannelConfig::default(),
-        feishu: FeishuChannelConfig::default(),
-        tools: ToolConfig::default(),
-        memory: MemoryConfig::default(),
-        conversation: crate::config::ConversationConfig::default(),
-        external_skills: crate::config::ExternalSkillsConfig::default(),
-        acp: crate::config::AcpConfig::default(),
-    };
+    let mut config = test_config(ProviderConfig::default());
     config.provider.reasoning_effort = Some(ReasoningEffort::High);
 
     let body = build_completion_request_body(
@@ -634,21 +669,47 @@ fn completion_body_includes_reasoning_effort_when_configured() {
 }
 
 #[test]
+fn responses_completion_body_uses_input_shape_and_responses_specific_fields() {
+    let mut config = test_config(ProviderConfig {
+        wire_api: crate::config::ProviderWireApi::Responses,
+        max_tokens: Some(512),
+        ..ProviderConfig::default()
+    });
+    config.provider.reasoning_effort = Some(ReasoningEffort::High);
+
+    let body = build_completion_request_body(
+        &config,
+        &[
+            json!({
+                "role": "system",
+                "content": "You are concise."
+            }),
+            json!({
+                "role": "user",
+                "content": "ping"
+            }),
+        ],
+        "gpt-5.1-mini",
+        CompletionPayloadMode::default_for(&config.provider),
+    );
+    assert_eq!(body["model"], "gpt-5.1-mini");
+    assert_eq!(body["instructions"], "You are concise.");
+    assert_eq!(body["input"][0]["role"], "user");
+    assert_eq!(body["input"][0]["content"][0]["type"], "input_text");
+    assert_eq!(body["input"][0]["content"][0]["text"], "ping");
+    assert_eq!(body["max_output_tokens"], 512);
+    assert_eq!(body["reasoning"]["effort"], "high");
+    assert!(body.get("messages").is_none());
+    assert!(body.get("max_completion_tokens").is_none());
+    assert!(body.get("reasoning_effort").is_none());
+}
+
+#[test]
 fn kimi_coding_completion_body_adds_extra_body_thinking() {
-    let mut config = LoongClawConfig {
-        provider: ProviderConfig {
-            kind: ProviderKind::KimiCoding,
-            ..ProviderConfig::default()
-        },
-        cli: crate::config::CliChannelConfig::default(),
-        telegram: crate::config::TelegramChannelConfig::default(),
-        feishu: FeishuChannelConfig::default(),
-        tools: ToolConfig::default(),
-        memory: MemoryConfig::default(),
-        conversation: crate::config::ConversationConfig::default(),
-        external_skills: crate::config::ExternalSkillsConfig::default(),
-        acp: crate::config::AcpConfig::default(),
-    };
+    let mut config = test_config(ProviderConfig {
+        kind: ProviderKind::KimiCoding,
+        ..ProviderConfig::default()
+    });
     config.provider.reasoning_effort = Some(ReasoningEffort::High);
 
     let body = build_completion_request_body(
@@ -663,21 +724,11 @@ fn kimi_coding_completion_body_adds_extra_body_thinking() {
 
 #[test]
 fn completion_body_model_hint_can_enable_reasoning_extra_body() {
-    let mut config = LoongClawConfig {
-        provider: ProviderConfig {
-            kind: ProviderKind::Openai,
-            reasoning_extra_body_kimi_model_hints: vec!["thinking-enabled".to_owned()],
-            ..ProviderConfig::default()
-        },
-        cli: crate::config::CliChannelConfig::default(),
-        telegram: crate::config::TelegramChannelConfig::default(),
-        feishu: FeishuChannelConfig::default(),
-        tools: ToolConfig::default(),
-        memory: MemoryConfig::default(),
-        conversation: crate::config::ConversationConfig::default(),
-        external_skills: crate::config::ExternalSkillsConfig::default(),
-        acp: crate::config::AcpConfig::default(),
-    };
+    let mut config = test_config(ProviderConfig {
+        kind: ProviderKind::Openai,
+        reasoning_extra_body_kimi_model_hints: vec!["thinking-enabled".to_owned()],
+        ..ProviderConfig::default()
+    });
     config.provider.reasoning_effort = Some(ReasoningEffort::High);
 
     let body = build_completion_request_body(
@@ -691,21 +742,11 @@ fn completion_body_model_hint_can_enable_reasoning_extra_body() {
 
 #[test]
 fn completion_body_model_hint_can_disable_reasoning_extra_body() {
-    let mut config = LoongClawConfig {
-        provider: ProviderConfig {
-            kind: ProviderKind::KimiCoding,
-            reasoning_extra_body_omit_model_hints: vec!["coding-lite".to_owned()],
-            ..ProviderConfig::default()
-        },
-        cli: crate::config::CliChannelConfig::default(),
-        telegram: crate::config::TelegramChannelConfig::default(),
-        feishu: FeishuChannelConfig::default(),
-        tools: ToolConfig::default(),
-        memory: MemoryConfig::default(),
-        conversation: crate::config::ConversationConfig::default(),
-        external_skills: crate::config::ExternalSkillsConfig::default(),
-        acp: crate::config::AcpConfig::default(),
-    };
+    let mut config = test_config(ProviderConfig {
+        kind: ProviderKind::KimiCoding,
+        reasoning_extra_body_omit_model_hints: vec!["coding-lite".to_owned()],
+        ..ProviderConfig::default()
+    });
     config.provider.reasoning_effort = Some(ReasoningEffort::High);
 
     let body = build_completion_request_body(
@@ -737,17 +778,7 @@ fn model_catalog_selection_prefers_user_preferences() {
 
 #[test]
 fn completion_body_omits_optional_fields_when_not_configured() {
-    let config = LoongClawConfig {
-        provider: ProviderConfig::default(),
-        cli: crate::config::CliChannelConfig::default(),
-        telegram: crate::config::TelegramChannelConfig::default(),
-        feishu: FeishuChannelConfig::default(),
-        tools: ToolConfig::default(),
-        memory: MemoryConfig::default(),
-        conversation: crate::config::ConversationConfig::default(),
-        external_skills: crate::config::ExternalSkillsConfig::default(),
-        acp: crate::config::AcpConfig::default(),
-    };
+    let config = test_config(ProviderConfig::default());
 
     let body = build_completion_request_body(
         &config,
@@ -759,6 +790,91 @@ fn completion_body_omits_optional_fields_when_not_configured() {
     assert!(body.get("max_completion_tokens").is_none());
     assert!(body.get("reasoning").is_none());
     assert!(body.get("reasoning_effort").is_none());
+}
+
+#[test]
+fn anthropic_completion_body_uses_native_messages_shape() {
+    let config = LoongClawConfig {
+        provider: ProviderConfig {
+            kind: ProviderKind::Anthropic,
+            max_tokens: Some(2_048),
+            ..ProviderConfig::default()
+        },
+        ..LoongClawConfig::default()
+    };
+    let messages = vec![
+        json!({"role": "system", "content": "sys"}),
+        json!({"role": "user", "content": "hello"}),
+    ];
+
+    let body = build_completion_request_body(
+        &config,
+        &messages,
+        "claude-test",
+        CompletionPayloadMode::default_for(&config.provider),
+    );
+    assert_eq!(body["system"], "sys");
+    assert_eq!(body["messages"][0]["role"], "user");
+    assert_eq!(body["messages"][0]["content"][0]["type"], "text");
+    assert_eq!(body["messages"][0]["content"][0]["text"], "hello");
+    assert_eq!(body["max_tokens"], 2_048);
+    assert!(body.get("reasoning_effort").is_none());
+    assert!(body.get("max_completion_tokens").is_none());
+}
+
+#[test]
+fn bedrock_completion_body_uses_converse_shape() {
+    let config = LoongClawConfig {
+        provider: ProviderConfig {
+            kind: ProviderKind::Bedrock,
+            max_tokens: Some(2_048),
+            ..ProviderConfig::default()
+        },
+        ..LoongClawConfig::default()
+    };
+    let messages = vec![
+        json!({"role": "system", "content": "sys"}),
+        json!({"role": "user", "content": "hello"}),
+    ];
+
+    let body = build_completion_request_body(
+        &config,
+        &messages,
+        "anthropic.claude-3-7-sonnet-20250219-v1:0",
+        CompletionPayloadMode::default_for(&config.provider),
+    );
+    assert!(body.get("model").is_none());
+    assert_eq!(body["system"][0]["text"], "sys");
+    assert_eq!(body["messages"][0]["role"], "user");
+    assert_eq!(body["messages"][0]["content"][0]["text"], "hello");
+    assert_eq!(body["inferenceConfig"]["maxTokens"], 2_048);
+    assert_eq!(body["inferenceConfig"]["temperature"], 0.2);
+}
+
+#[test]
+fn anthropic_headers_use_native_auth_and_version() {
+    let provider = ProviderConfig {
+        kind: ProviderKind::Anthropic,
+        api_key: Some("anthropic-test-key".to_owned()),
+        ..ProviderConfig::default()
+    };
+    let headers = transport::build_request_headers(&provider).expect("headers");
+    assert_eq!(
+        headers
+            .get("x-api-key")
+            .and_then(|value| value.to_str().ok()),
+        Some("anthropic-test-key")
+    );
+    assert_eq!(
+        headers
+            .get("anthropic-version")
+            .and_then(|value| value.to_str().ok()),
+        Some("2023-06-01")
+    );
+    assert!(
+        headers.get(reqwest::header::AUTHORIZATION).is_none(),
+        "anthropic should not fall back to bearer auth headers"
+    );
 }
 
 #[test]
@@ -797,17 +913,7 @@ fn kimi_coding_keeps_explicit_compatible_user_agent() {
 #[cfg(any(feature = "tool-file", feature = "tool-shell"))]
 #[test]
 fn turn_body_includes_tool_schema_and_auto_choice() {
-    let config = LoongClawConfig {
-        provider: ProviderConfig::default(),
-        cli: crate::config::CliChannelConfig::default(),
-        telegram: crate::config::TelegramChannelConfig::default(),
-        feishu: FeishuChannelConfig::default(),
-        tools: ToolConfig::default(),
-        memory: MemoryConfig::default(),
-        conversation: crate::config::ConversationConfig::default(),
-        external_skills: crate::config::ExternalSkillsConfig::default(),
-        acp: crate::config::AcpConfig::default(),
-    };
+    let config = test_config(ProviderConfig::default());
 
     let body = build_turn_request_body(
         &config,
@@ -847,6 +953,339 @@ fn turn_body_includes_tool_schema_and_auto_choice() {
         );
     }
     assert_eq!(body["tool_choice"], "auto");
+}
+
+#[cfg(any(feature = "tool-file", feature = "tool-shell"))]
+#[test]
+fn anthropic_turn_body_uses_native_messages_shape_and_tool_schema() {
+    let config = LoongClawConfig {
+        provider: ProviderConfig {
+            kind: ProviderKind::Anthropic,
+            ..ProviderConfig::default()
+        },
+        ..LoongClawConfig::default()
+    };
+    let messages = vec![
+        json!({
+            "role": "system",
+            "content": "system rules"
+        }),
+        json!({
+            "role": "user",
+            "content": "hello"
+        }),
+        json!({
+            "role": "assistant",
+            "content": "working"
+        }),
+        json!({
+            "role": "assistant",
+            "content": "[tool_result]\n{}"
+        }),
+        json!({
+            "role": "user",
+            "content": "continue"
+        }),
+    ];
+
+    let body = build_turn_request_body(
+        &config,
+        &messages,
+        "claude-3-7-sonnet-latest",
+        CompletionPayloadMode::default_for(&config.provider),
+        true,
+        &crate::tools::provider_tool_definitions(),
+    );
+
+    assert_eq!(body["system"], "system rules");
+    assert_eq!(body["max_tokens"], 4096);
+    let adapted_messages = body["messages"].as_array().expect("anthropic messages");
+    assert_eq!(adapted_messages.len(), 3);
+    assert_eq!(adapted_messages[0]["role"], "user");
+    assert_eq!(adapted_messages[1]["role"], "assistant");
+    assert_eq!(
+        adapted_messages[1]["content"].as_array().map(Vec::len),
+        Some(2)
+    );
+
+    let tools = body["tools"].as_array().expect("anthropic tools");
+    assert!(!tools.is_empty());
+    assert!(tools[0].get("function").is_none());
+    assert!(tools[0].get("input_schema").is_some());
+    assert_eq!(body["tool_choice"]["type"], "auto");
+}
+
+#[cfg(any(feature = "tool-file", feature = "tool-shell"))]
+#[test]
+fn anthropic_turn_body_converts_tool_schema_to_native_format() {
+    let config = LoongClawConfig {
+        provider: ProviderConfig {
+            kind: ProviderKind::Anthropic,
+            ..ProviderConfig::default()
+        },
+        ..LoongClawConfig::default()
+    };
+
+    let body = build_turn_request_body(
+        &config,
+        &[json!({"role": "user", "content": "inspect README"})],
+        "claude-test",
+        CompletionPayloadMode::default_for(&config.provider),
+        true,
+        &crate::tools::provider_tool_definitions(),
+    );
+    let tools = body
+        .get("tools")
+        .and_then(Value::as_array)
+        .expect("anthropic tools array");
+    assert!(!tools.is_empty());
+    let first = &tools[0];
+    assert!(first.get("function").is_none());
+    assert!(first.get("input_schema").is_some());
+    assert_eq!(body["tool_choice"]["type"], "auto");
+}
+
+#[test]
+fn anthropic_turn_body_preserves_native_tool_use_and_tool_result_blocks() {
+    let config = LoongClawConfig {
+        provider: ProviderConfig {
+            kind: ProviderKind::Anthropic,
+            ..ProviderConfig::default()
+        },
+        ..LoongClawConfig::default()
+    };
+
+    let body = build_turn_request_body(
+        &config,
+        &[
+            json!({
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "checking"
+                    },
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_1",
+                        "name": "file_read",
+                        "input": {
+                            "path": "README.md"
+                        }
+                    }
+                ]
+            }),
+            json!({
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_1",
+                        "content": "[ok] {\"path\":\"README.md\"}"
+                    },
+                    {
+                        "type": "text",
+                        "text": "Use the tool result above to answer."
+                    }
+                ]
+            }),
+        ],
+        "claude-test",
+        CompletionPayloadMode::default_for(&config.provider),
+        true,
+        &crate::tools::provider_tool_definitions(),
+    );
+
+    let adapted_messages = body["messages"].as_array().expect("anthropic messages");
+    assert_eq!(adapted_messages.len(), 2);
+    assert_eq!(adapted_messages[0]["role"], "assistant");
+    assert_eq!(adapted_messages[0]["content"][1]["type"], "tool_use");
+    assert_eq!(adapted_messages[0]["content"][1]["id"], "toolu_1");
+    assert_eq!(adapted_messages[1]["role"], "user");
+    assert_eq!(adapted_messages[1]["content"][0]["type"], "tool_result");
+    assert_eq!(adapted_messages[1]["content"][0]["tool_use_id"], "toolu_1");
+    assert_eq!(adapted_messages[1]["content"][1]["type"], "text");
+}
+
+#[cfg(any(feature = "tool-file", feature = "tool-shell"))]
+#[test]
+fn bedrock_turn_body_uses_native_tool_blocks_and_tool_config() {
+    let config = LoongClawConfig {
+        provider: ProviderConfig {
+            kind: ProviderKind::Bedrock,
+            ..ProviderConfig::default()
+        },
+        ..LoongClawConfig::default()
+    };
+
+    let body = build_turn_request_body(
+        &config,
+        &[
+            json!({
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "checking"
+                    },
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_1",
+                        "name": "file_read",
+                        "input": {
+                            "path": "README.md"
+                        }
+                    }
+                ]
+            }),
+            json!({
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_1",
+                        "content": "[ok] README contents"
+                    },
+                    {
+                        "type": "text",
+                        "text": "Use the tool result above to answer."
+                    }
+                ]
+            }),
+        ],
+        "anthropic.claude-3-7-sonnet-20250219-v1:0",
+        CompletionPayloadMode::default_for(&config.provider),
+        true,
+        &crate::tools::provider_tool_definitions(),
+    );
+
+    let adapted_messages = body["messages"].as_array().expect("bedrock messages");
+    assert_eq!(adapted_messages.len(), 2);
+    assert_eq!(adapted_messages[0]["role"], "assistant");
+    assert_eq!(
+        adapted_messages[0]["content"][1]["toolUse"]["toolUseId"],
+        "toolu_1"
+    );
+    assert_eq!(adapted_messages[1]["role"], "user");
+    assert_eq!(
+        adapted_messages[1]["content"][0]["toolResult"]["toolUseId"],
+        "toolu_1"
+    );
+    assert_eq!(
+        adapted_messages[1]["content"][1]["text"],
+        "Use the tool result above to answer."
+    );
+
+    let tools = body["toolConfig"]["tools"]
+        .as_array()
+        .expect("bedrock tools");
+    assert!(!tools.is_empty());
+    assert!(tools[0].get("toolSpec").is_some());
+    assert_eq!(body["toolConfig"]["toolChoice"]["auto"], json!({}));
+}
+
+#[test]
+fn bedrock_request_endpoint_encodes_model_id_in_path() {
+    let provider = ProviderConfig {
+        kind: ProviderKind::Bedrock,
+        ..ProviderConfig::default()
+    };
+    let endpoint = transport::resolve_request_endpoint(
+        &provider,
+        "https://bedrock-runtime.us-west-2.amazonaws.com/model/{modelId}/converse",
+        "anthropic.claude-3-7-sonnet-20250219-v1:0",
+    );
+    assert_eq!(
+        endpoint,
+        "https://bedrock-runtime.us-west-2.amazonaws.com/model/anthropic.claude-3-7-sonnet-20250219-v1%3A0/converse"
+    );
+}
+
+#[cfg(any(feature = "tool-file", feature = "tool-shell"))]
+#[test]
+fn responses_turn_body_keeps_tool_schema_with_responses_input_shape() {
+    let config = test_config(ProviderConfig {
+        wire_api: crate::config::ProviderWireApi::Responses,
+        ..ProviderConfig::default()
+    });
+
+    let body = build_turn_request_body(
+        &config,
+        &[json!({
+            "role": "user",
+            "content": "read README"
+        })],
+        "gpt-5.1-mini",
+        CompletionPayloadMode::default_for(&config.provider),
+        true,
+        &crate::tools::provider_tool_definitions(),
+    );
+
+    assert_eq!(body["input"][0]["role"], "user");
+    assert_eq!(body["input"][0]["content"][0]["text"], "read README");
+    assert!(body.get("messages").is_none());
+    assert_eq!(body["tool_choice"], "auto");
+    assert!(
+        body.get("tools")
+            .and_then(Value::as_array)
+            .is_some_and(|tools| !tools.is_empty()),
+        "responses requests should still carry tool definitions"
+    );
+}
+
+#[test]
+fn responses_turn_body_preserves_native_function_call_roundtrip_items() {
+    let config = test_config(ProviderConfig {
+        wire_api: crate::config::ProviderWireApi::Responses,
+        ..ProviderConfig::default()
+    });
+
+    let body = build_turn_request_body(
+        &config,
+        &[
+            json!({
+                "role": "assistant",
+                "content": "Reading the file now."
+            }),
+            json!({
+                "type": "function_call",
+                "name": "file_read",
+                "call_id": "call_resp_1",
+                "arguments": "{\"path\":\"README.md\"}"
+            }),
+            json!({
+                "type": "function_call_output",
+                "call_id": "call_resp_1",
+                "output": "[ok] {\"path\":\"README.md\"}"
+            }),
+            json!({
+                "role": "user",
+                "content": "Use the tool result above to answer the original request."
+            }),
+        ],
+        "gpt-5.1-mini",
+        CompletionPayloadMode::default_for(&config.provider),
+        true,
+        &crate::tools::provider_tool_definitions(),
+    );
+
+    let input = body["input"].as_array().expect("responses input array");
+    assert!(
+        input.iter().any(|item| {
+            item.get("type").and_then(Value::as_str) == Some("function_call")
+                && item.get("call_id").and_then(Value::as_str) == Some("call_resp_1")
+        }),
+        "responses input should preserve function_call items, got: {input:?}"
+    );
+    assert!(
+        input.iter().any(|item| {
+            item.get("type").and_then(Value::as_str) == Some("function_call_output")
+                && item.get("call_id").and_then(Value::as_str) == Some("call_resp_1")
+                && item.get("output").and_then(Value::as_str)
+                    == Some("[ok] {\"path\":\"README.md\"}")
+        }),
+        "responses input should preserve function_call_output items, got: {input:?}"
+    );
 }
 
 #[test]
@@ -925,6 +1364,7 @@ fn provider_runtime_contract_defaults_are_stable() {
             TokenLimitField::MaxCompletionTokens,
             TokenLimitField::MaxTokens,
             TokenLimitField::Omit,
+            TokenLimitField::Omit,
         ]
     );
     assert_eq!(
@@ -939,7 +1379,7 @@ fn provider_runtime_contract_defaults_are_stable() {
     );
     assert_eq!(
         openai_contract.payload_adaptation.token_error_parameters,
-        ["max_tokens", "max_completion_tokens"]
+        ["max_output_tokens", "max_tokens", "max_completion_tokens"]
     );
     assert_eq!(
         openai_contract
@@ -1020,6 +1460,40 @@ fn provider_runtime_contract_defaults_are_stable() {
     );
     assert!(!openai_contract.capability.include_reasoning_extra_body());
 
+    let anthropic_contract = provider_runtime_contract(&ProviderConfig {
+        kind: ProviderKind::Anthropic,
+        ..ProviderConfig::default()
+    });
+    assert_eq!(
+        anthropic_contract.feature_family,
+        ProviderFeatureFamily::Anthropic
+    );
+    assert_eq!(
+        anthropic_contract.transport_mode,
+        ProviderTransportMode::AnthropicMessages
+    );
+    assert_eq!(
+        anthropic_contract.default_reasoning_field,
+        ReasoningField::Omit
+    );
+
+    let bedrock_contract = provider_runtime_contract(&ProviderConfig {
+        kind: ProviderKind::Bedrock,
+        ..ProviderConfig::default()
+    });
+    assert_eq!(
+        bedrock_contract.feature_family,
+        ProviderFeatureFamily::Bedrock
+    );
+    assert_eq!(
+        bedrock_contract.transport_mode,
+        ProviderTransportMode::BedrockConverse
+    );
+    assert_eq!(
+        bedrock_contract.default_reasoning_field,
+        ReasoningField::Omit
+    );
+
     let kimi_coding_contract = provider_runtime_contract(&ProviderConfig {
         kind: ProviderKind::KimiCoding,
         ..ProviderConfig::default()
@@ -1039,6 +1513,7 @@ fn provider_runtime_contract_defaults_are_stable() {
         [
             TokenLimitField::MaxTokens,
             TokenLimitField::MaxCompletionTokens,
+            TokenLimitField::Omit,
             TokenLimitField::Omit,
         ]
     );
@@ -1123,20 +1598,10 @@ fn provider_runtime_contract_defaults_are_stable() {
 
 #[test]
 fn plain_kimi_completion_body_skips_kimi_extra_body() {
-    let mut config = LoongClawConfig {
-        provider: ProviderConfig {
-            kind: ProviderKind::Kimi,
-            ..ProviderConfig::default()
-        },
-        cli: crate::config::CliChannelConfig::default(),
-        telegram: crate::config::TelegramChannelConfig::default(),
-        feishu: FeishuChannelConfig::default(),
-        tools: ToolConfig::default(),
-        memory: MemoryConfig::default(),
-        conversation: crate::config::ConversationConfig::default(),
-        external_skills: crate::config::ExternalSkillsConfig::default(),
-        acp: crate::config::AcpConfig::default(),
-    };
+    let mut config = test_config(ProviderConfig {
+        kind: ProviderKind::Kimi,
+        ..ProviderConfig::default()
+    });
     config.provider.reasoning_effort = Some(ReasoningEffort::High);
 
     let body = build_completion_request_body(
@@ -1331,11 +1796,177 @@ fn model_error_parser_detects_endpoint_mismatch() {
     let runtime_contract = provider_runtime_contract(&ProviderConfig::default());
     let body = json!({
         "error": {
-            "message": "The model `gpt-5.4-pro` only supports /v1/responses and not this endpoint."
+            "message": "The model `gpt-5-pro` only supports /v1/responses and not this endpoint."
         }
     });
     let parsed = parse_provider_api_error(&body);
     assert!(should_try_next_model_on_error(&parsed, runtime_contract));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn responses_completion_falls_back_to_chat_completions_for_compatible_endpoints() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind local provider listener");
+    let addr = listener.local_addr().expect("local addr");
+    let server = std::thread::spawn(move || {
+        let mut requests = Vec::new();
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().expect("accept local provider request");
+            let mut request_buf = [0_u8; 8192];
+            let len = stream.read(&mut request_buf).expect("read request");
+            let request = String::from_utf8_lossy(&request_buf[..len]).to_string();
+            requests.push(request.clone());
+
+            let (status_line, body) = if request.starts_with("POST /v1/responses ") {
+                (
+                    "HTTP/1.1 400 Bad Request",
+                    r#"{"error":{"code":"unsupported_parameter","param":"input","message":"This compatibility endpoint expects `messages`; unknown parameter `input`. Retry with /v1/chat/completions."}}"#.to_owned(),
+                )
+            } else if request.starts_with("POST /v1/chat/completions ") {
+                (
+                    "HTTP/1.1 200 OK",
+                    r#"{"choices":[{"message":{"role":"assistant","content":"fallback ok"}}]}"#
+                        .to_owned(),
+                )
+            } else {
+                (
+                    "HTTP/1.1 404 Not Found",
+                    r#"{"error":{"message":"unexpected request"}}"#.to_owned(),
+                )
+            };
+
+            let response = format!(
+                "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write response");
+        }
+        requests
+    });
+
+    let config = test_config(ProviderConfig {
+        kind: ProviderKind::Deepseek,
+        base_url: format!("http://{addr}"),
+        model: "deepseek-chat".to_owned(),
+        wire_api: crate::config::ProviderWireApi::Responses,
+        api_key: Some("deepseek-test-key".to_owned()),
+        ..ProviderConfig::default()
+    });
+
+    let completion = request_completion(
+        &config,
+        &[json!({
+            "role": "user",
+            "content": "ping"
+        })],
+        ProviderRuntimeBinding::direct(),
+    )
+    .await
+    .expect("compatible responses transport should retry chat-completions automatically");
+    assert_eq!(completion, "fallback ok");
+
+    let requests = server.join().expect("join local provider server");
+    assert!(
+        requests.iter().any(|request| {
+            request.starts_with("POST /v1/responses ")
+                && request.contains("\"input\"")
+                && !request.contains("\"messages\"")
+        }),
+        "first attempt should use Responses input shape: {requests:#?}"
+    );
+    assert!(
+        requests.iter().any(|request| {
+            request.starts_with("POST /v1/chat/completions ")
+                && request.contains("\"messages\"")
+                && !request.contains("\"input\"")
+        }),
+        "fallback attempt should switch to chat-completions payload shape: {requests:#?}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn responses_turn_falls_back_to_chat_completions_for_compatible_endpoints() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind local provider listener");
+    let addr = listener.local_addr().expect("local addr");
+    let server = std::thread::spawn(move || {
+        let mut requests = Vec::new();
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().expect("accept local provider request");
+            let mut request_buf = [0_u8; 8192];
+            let len = stream.read(&mut request_buf).expect("read request");
+            let request = String::from_utf8_lossy(&request_buf[..len]).to_string();
+            requests.push(request.clone());
+
+            let (status_line, body) = if request.starts_with("POST /v1/responses ") {
+                (
+                    "HTTP/1.1 422 Unprocessable Entity",
+                    r#"{"error":{"code":"invalid_request_error","param":"input","message":"Missing required parameter: `messages`. This provider expects /v1/chat/completions instead of Responses input."}}"#.to_owned(),
+                )
+            } else if request.starts_with("POST /v1/chat/completions ") {
+                (
+                    "HTTP/1.1 200 OK",
+                    r#"{"choices":[{"message":{"role":"assistant","content":"turn fallback ok"}}]}"#
+                        .to_owned(),
+                )
+            } else {
+                (
+                    "HTTP/1.1 404 Not Found",
+                    r#"{"error":{"message":"unexpected request"}}"#.to_owned(),
+                )
+            };
+
+            let response = format!(
+                "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write response");
+        }
+        requests
+    });
+
+    let config = test_config(ProviderConfig {
+        kind: ProviderKind::Deepseek,
+        base_url: format!("http://{addr}"),
+        model: "deepseek-chat".to_owned(),
+        wire_api: crate::config::ProviderWireApi::Responses,
+        api_key: Some("deepseek-test-key".to_owned()),
+        ..ProviderConfig::default()
+    });
+
+    let turn = request_turn(
+        &config,
+        &[json!({
+            "role": "user",
+            "content": "turn ping"
+        })],
+        ProviderRuntimeBinding::direct(),
+    )
+    .await
+    .expect("turn requests should retry chat-completions when Responses is rejected");
+    assert_eq!(turn.assistant_text, "turn fallback ok");
+
+    let requests = server.join().expect("join local provider server");
+    assert!(
+        requests.iter().any(|request| {
+            request.starts_with("POST /v1/responses ")
+                && request.contains("\"input\"")
+                && request.contains("\"tools\"")
+        }),
+        "turn flow should first attempt Responses with tool schema: {requests:#?}"
+    );
+    assert!(
+        requests.iter().any(|request| {
+            request.starts_with("POST /v1/chat/completions ")
+                && request.contains("\"messages\"")
+                && request.contains("\"tools\"")
+        }),
+        "turn flow fallback should preserve tool schema on chat-completions: {requests:#?}"
+    );
 }
 
 #[test]
@@ -1349,6 +1980,7 @@ fn model_request_error_includes_parseable_failover_snapshot_payload() {
         2,
         3,
         Some(429),
+        None,
     );
     assert_eq!(error.reason, ProviderFailoverReason::RateLimited);
     assert_eq!(error.snapshot.stage, ProviderFailoverStage::StatusFailure);
@@ -1377,6 +2009,7 @@ fn model_request_error_omits_status_code_for_transport_failures() {
         "model-a",
         1,
         3,
+        None,
         None,
     );
     let (_, payload) = error
@@ -1407,7 +2040,7 @@ fn provider_failover_audit_event_records_structured_payload() {
     };
 
     record_provider_failover_audit_event(
-        Some(&kernel_ctx),
+        ProviderRuntimeBinding::kernel(&kernel_ctx),
         &provider,
         &snapshot,
         true,
@@ -1484,7 +2117,16 @@ fn provider_failover_audit_event_is_noop_without_kernel_context() {
     let provider = ProviderConfig::default();
     let before = audit.snapshot().len();
 
-    record_provider_failover_audit_event(None, &provider, &snapshot, false, false, 0, 1, true);
+    record_provider_failover_audit_event(
+        ProviderRuntimeBinding::direct(),
+        &provider,
+        &snapshot,
+        false,
+        false,
+        0,
+        1,
+        true,
+    );
 
     let after = audit.snapshot().len();
     assert_eq!(after, before);
@@ -1503,7 +2145,16 @@ fn provider_failover_metrics_record_even_without_kernel_context() {
     };
     let provider = ProviderConfig::default();
 
-    record_provider_failover_audit_event(None, &provider, &snapshot, false, false, 0, 1, true);
+    record_provider_failover_audit_event(
+        ProviderRuntimeBinding::direct(),
+        &provider,
+        &snapshot,
+        false,
+        false,
+        0,
+        1,
+        true,
+    );
 
     let after = provider_failover_metrics_snapshot();
     let reason_before = before
@@ -1552,7 +2203,16 @@ fn provider_failover_metrics_track_continue_path() {
         ..ProviderConfig::default()
     };
 
-    record_provider_failover_audit_event(None, &provider, &snapshot, true, true, 1, 4, false);
+    record_provider_failover_audit_event(
+        ProviderRuntimeBinding::direct(),
+        &provider,
+        &snapshot,
+        true,
+        true,
+        1,
+        4,
+        false,
+    );
 
     let after = provider_failover_metrics_snapshot();
     let reason_before = before.by_reason.get("rate_limited").copied().unwrap_or(0);

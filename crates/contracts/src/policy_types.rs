@@ -21,9 +21,9 @@ pub struct PolicyRequest {
     pub context: PolicyContext,
 }
 
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PolicyDecision {
     Allow,
     Deny(String),
-    RequireApproval(String),
 }

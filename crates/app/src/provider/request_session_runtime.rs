@@ -3,8 +3,6 @@ use std::time::Duration;
 use crate::{CliResult, config::LoongClawConfig};
 
 use super::auth_profile_runtime::{ProviderAuthProfile, resolve_provider_auth_profiles};
-use super::capability_profile_runtime::ProviderCapabilityProfile;
-use super::contracts::{ProviderRuntimeContract, provider_runtime_contract};
 use super::http_client_runtime::build_http_client;
 use super::model_candidate_cooldown_runtime::ModelCandidateCooldownPolicy;
 use super::model_candidate_resolver_runtime::resolve_request_models;
@@ -21,8 +19,6 @@ use super::provider_validation_runtime::{
 };
 
 pub(super) struct ProviderRequestSession {
-    pub(super) runtime_contract: ProviderRuntimeContract,
-    pub(super) capability_profile: ProviderCapabilityProfile,
     pub(super) endpoint: String,
     pub(super) headers: reqwest::header::HeaderMap,
     pub(super) request_policy: policy::ProviderRequestPolicy,
@@ -32,6 +28,7 @@ pub(super) struct ProviderRequestSession {
     pub(super) model_candidates: Vec<String>,
     pub(super) auto_model_mode: bool,
     pub(super) model_candidate_cooldown_policy: Option<ModelCandidateCooldownPolicy>,
+    pub(super) auth_context: super::transport::RequestAuthContext,
 }
 
 pub(super) async fn prepare_provider_request_session(
@@ -41,11 +38,9 @@ pub(super) async fn prepare_provider_request_session(
     validate_provider_feature_gate(config)?;
     ensure_provider_profile_state_backend(config);
 
-    let runtime_contract = provider_runtime_contract(&config.provider);
-    let capability_profile =
-        ProviderCapabilityProfile::from_provider(&config.provider, runtime_contract);
     let endpoint = config.provider.endpoint();
-    let headers = super::transport::build_request_headers(&config.provider)?;
+    let auth_context = super::transport::resolve_request_auth_context(&config.provider).await?;
+    let headers = super::transport::build_request_headers_without_provider_auth(&config.provider)?;
     let request_policy = policy::ProviderRequestPolicy::from_config(&config.provider);
     let client = build_http_client(&request_policy)?;
     let profile_state_policy =
@@ -54,14 +49,14 @@ pub(super) async fn prepare_provider_request_session(
         &resolve_provider_auth_profiles(&config.provider),
         profile_state_policy.as_ref(),
     );
-    let primary_authorization = auth_profiles
+    let primary_auth_cache_key = auth_profiles
         .first()
-        .and_then(|profile| profile.authorization_header.as_deref());
+        .and_then(|profile| profile.auth_cache_key.as_deref());
     let model_candidate_cooldown_policy = build_model_candidate_cooldown_policy(
         &config.provider,
         &endpoint,
         &headers,
-        primary_authorization,
+        primary_auth_cache_key,
     );
     let auto_model_mode = config.provider.model_selection_requires_fetch();
     let model_candidates = if auto_model_mode {
@@ -73,7 +68,8 @@ pub(super) async fn prepare_provider_request_session(
                 &headers,
                 &request_policy,
                 model_candidate_cooldown_policy.as_ref(),
-                profile.authorization_header.as_deref(),
+                Some(profile),
+                &auth_context,
             )
             .await
             {
@@ -104,14 +100,13 @@ pub(super) async fn prepare_provider_request_session(
             &headers,
             &request_policy,
             model_candidate_cooldown_policy.as_ref(),
-            primary_authorization,
+            auth_profiles.first(),
+            &auth_context,
         )
         .await?
     };
 
     Ok(ProviderRequestSession {
-        runtime_contract,
-        capability_profile,
         endpoint,
         headers,
         request_policy,
@@ -121,6 +116,7 @@ pub(super) async fn prepare_provider_request_session(
         model_candidates,
         auto_model_mode,
         model_candidate_cooldown_policy,
+        auth_context,
     })
 }
 
@@ -128,7 +124,7 @@ fn build_model_candidate_cooldown_policy(
     provider: &crate::config::ProviderConfig,
     endpoint: &str,
     headers: &reqwest::header::HeaderMap,
-    auth_header: Option<&str>,
+    auth_cache_key: Option<&str>,
 ) -> Option<ModelCandidateCooldownPolicy> {
     if !provider.model_selection_requires_fetch() {
         return None;
@@ -141,7 +137,7 @@ fn build_model_candidate_cooldown_policy(
     let cooldown_max_ms = provider.resolved_model_candidate_cooldown_max_ms();
 
     Some(ModelCandidateCooldownPolicy {
-        namespace: build_model_candidate_cooldown_namespace(endpoint, headers, auth_header),
+        namespace: build_model_candidate_cooldown_namespace(endpoint, headers, auth_cache_key),
         cooldown: Duration::from_millis(cooldown_ms),
         max_cooldown: Duration::from_millis(cooldown_max_ms),
         max_entries: provider.resolved_model_candidate_cooldown_max_entries(),
