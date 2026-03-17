@@ -66,14 +66,7 @@ We want the community around LoongClaw to carry the same feeling: less noise, le
 more cooperation around real problems. If contributors, users, and partners can trust one another
 and build useful things together, that matters more to us.
 
-<a id="product-positioning"></a>
-## Product Positioning
-
-<p align="center">
-  <img src="assets/readme/loongclaw-positioning-map.svg" alt="LoongClaw positioning map" width="100%" />
-</p>
-
-### Sponsors
+## Sponsors
 
 <p align="center">
   <a href="https://www.byteplus.com/en/activity/codingplan?utm_campaign=loongclaw&utm_content=loongclaw&utm_medium=devrel&utm_source=OWO&utm_term=loongclaw">
@@ -89,6 +82,13 @@ and build useful things together, that matters more to us.
       <img src="assets/sponsors_logo/feishu/feishu-logo-light-en.png" alt="Feishu" height="44"/>
     </picture>
   </a>
+</p>
+
+<a id="product-positioning"></a>
+## Product Positioning
+
+<p align="center">
+  <img src="assets/readme/loongclaw-positioning-map.svg" alt="LoongClaw positioning map" width="100%" />
 </p>
 
 ### What LoongClaw Is Today

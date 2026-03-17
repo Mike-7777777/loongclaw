@@ -59,15 +59,7 @@ LoongClaw 不想只是做一个“更会聊天的通用 Claw”。我们更希�
 
 我们希望围绕 LoongClaw 形成的社区也能保有这样的气质：少一点喧哗和姿态，多一点围绕真实问题的合作；让贡献者、用户和伙伴能够彼此信任、一起共创，把事情一件件做好。
 
-<a id="product-positioning"></a>
-
-## 产品定位
-
-<p align="center">
-  <img src="assets/readme/loongclaw-positioning-map.svg" alt="LoongClaw 定位图" width="100%" />
-</p>
-
-### 赞助商
+## 赞助商
 
 <p align="center">
   <a href="https://www.volcengine.com/activity/codingplan?utm_campaign=loongclaw&utm_content=loongclaw&utm_medium=devrel&utm_source=OWO&utm_term=loongclaw">
@@ -83,6 +75,14 @@ LoongClaw 不想只是做一个“更会聊天的通用 Claw”。我们更希�
       <img src="assets/sponsors_logo/feishu/feishu-logo-light-zh.png" alt="飞书" height="44"/>
     </picture>
   </a>
+</p>
+
+<a id="product-positioning"></a>
+
+## 产品定位
+
+<p align="center">
+  <img src="assets/readme/loongclaw-positioning-map.svg" alt="LoongClaw 定位图" width="100%" />
 </p>
 
 ### LoongClaw 今天是什么
