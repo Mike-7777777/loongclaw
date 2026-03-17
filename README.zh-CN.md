@@ -82,7 +82,7 @@ LoongClaw 不想只是做一个“更会聊天的通用 Claw”。我们更希�
 ## 产品定位
 
 <p align="center">
-  <img src="assets/readme/loongclaw-positioning-map.svg" alt="LoongClaw 定位图" width="100%" />
+  <img src="assets/readme/loongclaw-positioning-map-zh.svg" alt="LoongClaw 定位图" width="100%" />
 </p>
 
 ### LoongClaw 今天是什么
@@ -127,7 +127,7 @@ LoongClaw 的目标不只是个人助手。
 | 长线方向 | 以软件助手为主 | 以 orchestration 为主 | 同时为硬件、机器人与具身智能预留延展空间 |
 
 <p align="center">
-  <img src="assets/readme/loongclaw-foundation-diagram.svg" alt="LoongClaw 基座图" width="100%" />
+  <img src="assets/readme/loongclaw-foundation-diagram-zh.svg" alt="LoongClaw 基座图" width="100%" />
 </p>
 
 <a id="quick-start"></a>
