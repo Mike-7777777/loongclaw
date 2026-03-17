@@ -10,7 +10,7 @@
 <h3 align="center"><em>“发轫于东，以会群友”</em></h3>
 
 <p align="center">
-  <strong>LoongClaw 是一套基于 Rust 构建的安全、可扩展、可持续演进的 Claw 基线。</strong><br/>
+  <strong>LoongClaw 是一套基于 Rust 构建的安全、可扩展、可持续演进的 Claw 基座。</strong><br/>
   它以助手能力为起点，但目标并不停留于通用助手，而是逐步成长为面向团队的垂域智能体基础层，让人与 AI 能在真实场景中持续协作、共同进化。
 </p>
 
@@ -19,9 +19,7 @@
   <a href="LICENSE-MIT"><img src="https://img.shields.io/badge/license-MIT-blue.svg?style=flat-square" alt="License: MIT" /></a>
   <img src="https://img.shields.io/badge/rust-edition%202024-orange.svg?style=flat-square" alt="Rust Edition 2024" />
   <a href="https://github.com/loongclaw-ai/loongclaw/releases"><img src="https://img.shields.io/github/v/release/loongclaw-ai/loongclaw?label=version&color=yellow&include_prereleases&style=flat-square" alt="Version" /></a>
-</p>
-
-<p align="center">
+  </br>
   <a href="https://x.com/loongclawai"><img src="https://img.shields.io/badge/Follow-loongclawai-000000?logo=x&logoColor=white&style=flat-square" alt="X" /></a>
   <a href="https://t.me/loongclaw"><img src="https://img.shields.io/badge/Telegram-loongclaw-26A5E4?logo=telegram&logoColor=white&style=flat-square" alt="Telegram" /></a>
   <a href="https://discord.gg/7kSTX9mca"><img src="https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white&style=flat-square" alt="Discord" /></a>
@@ -57,9 +55,9 @@
 
 Loong 指向的是中文语境里的“龙”。在我们的理解里，它不是一个强调征服和对抗的形象，更像是一种温和但有力量的存在：有生命力，也有分寸；有想象力，也懂得协同；愿意向上生长，也愿意与万物共处。这种气质，和我们想做的 LoongClaw 很接近。
 
-LoongClaw 不想只是做一个“更会聊天的通用 Claw”。我们更希望它能陪着人、团队和具体场景一起成长，慢慢成为一个真正可靠、可塑、可持续演进的智能体基座。对我们来说，Loong 不只是一个名字，也对应着一种我们希望长期坚持的做事方式：尊重差异、保持开放、平等互惠、看重长期、脚踏实地。
+LoongClaw 不想只是做一个“更会聊天的通用 Claw”。我们更希望它能陪着个体和团队在具体场景中一起成长，慢慢成为一个真正可靠、可塑、可持续演进的智能体基座。对我们来说，Loong 不只是一个名字，也对应着一种我们希望长期坚持的做事方式：尊重差异、保持开放、平等互惠、看重长期、脚踏实地。
 
-我们也希望围绕 LoongClaw 形成的社区，保有这样的气质：少一点喧哗和姿态，多一点围绕真实问题的合作；让贡献者、用户和伙伴能够彼此信任、一起共创，把事情一件件做好。
+我们希望围绕 LoongClaw 形成的社区也能保有这样的气质：少一点喧哗和姿态，多一点围绕真实问题的合作；让贡献者、用户和伙伴能够彼此信任、一起共创，把事情一件件做好。
 
 <a id="product-positioning"></a>
 
@@ -89,42 +87,42 @@ LoongClaw 不想只是做一个“更会聊天的通用 Claw”。我们更希�
 
 ### LoongClaw 今天是什么
 
-今天的 LoongClaw，已经不是一个“把模型接进 CLI”的薄壳，而是一套**基于 Rust 构建、边界清晰、可继续塑形的 Claw 基线**。如果只看 `onboard`、`ask`、`chat` 这些入口命令，很容易低估它；但从代码结构看，LoongClaw 已经把团队真正关心的几层基础能力做进来了。
+今天的 LoongClaw，已经不是一个“把模型接进 CLI”的薄壳，而是一套**基于 Rust 构建、边界清晰、可继续塑形的 Claw 基础底座**。如果只看 `onboard`、`ask`、`chat` 这些入口命令，很容易低估它；但从代码结构看，LoongClaw 已经具备了团队真正关心的多项基础能力。
 
-| 核心能力 | 今天已经坐实 | 为什么这件事重要 |
+| 核心能力 | 当前已具备 | 为什么这件事重要 |
 |----------|--------------|------------------|
 | 治理内建 | 能力令牌、策略判定、审批请求和审计事件已经进入关键执行路径 | 更适合进入真实团队流程，而不只是单机 demo |
-| 显式执行平面 | `connector`、`runtime`、`tool`、`memory` 在 kernel 内分成独立 plane，并保持 core / extension 对称注册 | 做垂域能力时可以替换执行面，而不是反复改内核 |
-| 控制面分离 | ACP 已经是独立控制面，覆盖 backend、binding、registry、runtime、analytics、store 等模块 | 更适合承接后续路由、协作和更复杂的智能体生命周期 |
-| 上下文可塑形 | context engine 已具备 `bootstrap`、`ingest`、`after_turn`、`compact_context` 和 subagent hooks | 上下文与记忆不是写死在一段 prompt 拼装里 |
-| 工具面与运行时一致 | tool catalog 自带风险等级、审批模式和 `Runtime / Planned` 可见性 | 用户看到的能力，更接近系统此刻真的能做什么 |
-| 迁移感知启动 | `onboard` 会探测 current setup、Codex config、environment 和 workspace guidance；公开迁移入口已统一为 `loongclaw migrate` | 团队不必从零开始重搭配置与长期偏好 |
-| 多通道交付 | CLI、Telegram、飞书 / Lark 都已经有类型化配置、路由和安全校验 | 它更像一个正在成型的团队产品，而不是只存在于本地终端的实验 |
+| 独立执行层 | `connector`、`runtime`、`tool`、`memory` 在 kernel 内分成独立执行层，核心与扩展适配器采用统一的注册方式 | 做垂直领域能力时可以替换单个执行层，而不是反复改内核 |
+| 控制层分离 | ACP 已经是独立控制层，覆盖 backend、binding、registry、runtime、analytics、store 等模块 | 更适合承接后续路由、协作和更复杂的智能体生命周期 |
+| 上下文可定制 | context engine 已具备 `bootstrap`、`ingest`、`after_turn`、`compact_context` 和 subagent hooks | 上下文与记忆不是写死在一段段拼装的 prompt 中 |
+| 工具能力与运行时状态一致 | tool catalog 自带风险等级、审批模式和 `Runtime / Planned` 可见性 | 用户看到的能力，更接近系统此刻真的能做什么 |
+| 启动时自动探测迁移 | `onboard` 会探测 current setup、Codex config、environment 和 workspace guidance；公开迁移入口已统一为 `loongclaw migrate` | 团队不必从零开始重搭配置与长期偏好 |
+| 多通道交付 | CLI、Telegram、飞书 / Lark 都已经有类型化配置、路由和安全校验 | 它更像一个正在成型的团队产品，而不是只存在于本地终端的实验品 |
 
-这也是我们更愿意把 LoongClaw 看成“垂域智能体基础层雏形”的原因。它今天就已经有治理边界、扩展边界和交付边界，而不是等愿景成熟之后再回头补系统骨架。
+这也是我们更愿意把 LoongClaw 看成“垂域智能体基础层雏形”的原因。它不是等愿景成熟之后再回头补系统骨架的临时产物，而是自诞生之日起就已经有治理边界、扩展边界和交付边界的完整产品。
 
 ### 我们的愿景
 
 LoongClaw 的目标不只是个人助手。
 
-我们的愿景，是把 LoongClaw 塑造成一个**面向垂域智能体的基础层**：比通用助手更聚焦、更可控，也更适合进入真实场景和具体流程。我们希望团队能够基于稳定内核与清晰扩展缝，通过低代码 / 零代码的方式，更快构建并持续演进自己的垂域智能体，而不是每次都从头搭系统。
+我们的愿景，是把 LoongClaw 塑造成一个**面向垂域智能体的基础层**：比通用助手更聚焦、更可控，也更适合进入真实场景和具体流程。我们希望团队能够基于稳定内核与清晰的扩展接口，通过低代码 / 零代码的方式，更快构建并持续演进自己的垂域智能体，而不是每次都从头搭系统。
 
-这个方向也不只停留在软件工作流里。再往后看，我们也关心硬件、机器人以及具身智能相关的延展空间。对我们来说，LoongClaw 的价值不只是把模型接进聊天界面，而是逐步长成一个能够连接数字世界与真实行动的基础层。
+这个方向也不只停留在软件工作流里。再往后看，我们也关心硬件、机器人以及具身智能相关的延展空间。对我们来说，LoongClaw 的价值不单单是把模型接进聊天界面，而是逐步长成一个能够连接数字世界与真实行动的基础层。
 
 <a id="why-teams-build-on-loongclaw"></a>
 
 ## 为什么团队会选择 LoongClaw
 
-如果把 LoongClaw 放到几类常见 AI agent 产品取向里看，它更像是在“可运行助手基线”和“可治理的垂域基座”之间，提前把团队真正会遇到的问题做进系统，而不是等后面再补。
+如果把 LoongClaw 放到常见的 AI agent 产品中来看，它兼顾了”开箱即用的助手基座”和”可治理的垂直领域底座”两种优势，并从一开始就将两者发展过程供真正会遇到的问题提前纳入系统设计。
 
 ### 设计取向横向对比
 
 | 设计取向 | 助手型产品常见做法 | 框架型产品常见做法 | LoongClaw 的选择 |
 |----------|--------------------|--------------------|------------------|
-| 起点 | 先优化单人对话体验 | 先提供高度灵活但偏空的搭建框架 | 先给出可运行 baseline，同时把团队化需要的边界提前放进来 |
+| 起点 | 先优化单人对话体验 | 先提供高度灵活但偏空的搭建框架 | 先给出可运行的基础版本，同时提前引入团队协作所需的治理边界 |
 | 治理 | 往往依赖外围系统补策略、审批、审计 | 可以做，但通常需要二次集成 | 把 policy、approval、audit 放进关键执行路径 |
 | 扩展方式 | 常靠插件或脚本后补 | 自由度高，但容易每个团队重搭一套 | 用 plane、adapter、pack 和 channel 去做有边界的扩展 |
-| 交付表面 | 多停留在 CLI 或单一聊天入口 | 更像底层框架，本身交付面较薄 | CLI、Telegram、飞书 / Lark 已是现实交付面 |
+| 接入方式 | 多停留在 CLI 或单一聊天入口 | 更像底层框架，本身接入方式较少 | CLI、Telegram、飞书 / Lark 已是实际可用的接入方式 |
 | 垂域演进 | 容易停在“更会聊天” | 容易停在“能搭，但要自己补很多” | 目标是在稳定 Rust 底座上持续塑造垂域智能体 |
 | 长线方向 | 以软件助手为主 | 以 orchestration 为主 | 同时为硬件、机器人与具身智能预留延展空间 |
 
@@ -261,7 +259,7 @@ loongclaw feishu-serve --config ~/.loongclaw/config.toml
 
 默认会读取 `FEISHU_APP_ID`、`FEISHU_APP_SECRET`、`FEISHU_VERIFICATION_TOKEN` 和 `FEISHU_ENCRYPT_KEY`。如果你接的是 Lark，可以再加上 `domain = "lark"`。
 
-工具策略保持显式：
+工具策略需要明确配置：
 
 ```toml
 [tools]
@@ -288,7 +286,7 @@ blocked_domains = ["*.internal.example"]
 
 ## 从其他 Claws 或 Agents 迁移已有设置
 
-LoongClaw 不要求团队从零开始重新配置。
+LoongClaw 不要求用户从零开始重新配置。
 
 当前实现里，迁移有两条路径：
 
@@ -323,7 +321,7 @@ loongclaw migrate --mode rollback_last_apply --output ~/.loongclaw/config.toml
 - 工具目录自带风险等级、审批模式和运行时可见性，高风险动作可以进入审批流
 - `browser` 与 `web` 工具复用同一套受控网络边界，外部技能也默认走显式策略
 
-### 执行平面与扩展缝
+### 执行层与扩展接口
 
 - kernel 明确拆分 `connector`、`runtime`、`tool`、`memory` 四个 execution planes
 - 各 plane 都提供 core / extension adapter 组织方式，扩展走正门，而不是直接侵入内核
@@ -335,9 +333,9 @@ loongclaw migrate --mode rollback_last_apply --output ~/.loongclaw/config.toml
 - ACP 作为独立控制面承担 backend、binding、registry、runtime 等协同职责
 - profiles、summaries、migration 与 canonical history 一起承接长期上下文
 
-### 交付表面
+### 接入方式
 
-- CLI 是当前一等入口，但它并不是唯一表面
+- CLI 是当前的主要入口，但并不是唯一的接入方式
 - Telegram 轮询与飞书 / Lark webhook 已有实际通道实现与安全校验
 - `browser`、`file`、`shell`、`web` 等工具通过运行时策略暴露，而不是散在外围脚本里
 
@@ -367,17 +365,17 @@ contracts (leaf -- zero internal deps)
 
 最重要的三条原则：
 
-- **治理优先**：策略、审批与审计从架构上被放进关键执行路径，而不是事后补丁
-- **加法式演进**：公开契约以加法方式演进，尽量不破坏已有集成
-- **小内核，强扩展缝**：垂直化应该发生在 adapters、packs 和产品层，而不是每次都直接改 kernel
+- **治理优先**：策略、审批与审计原本就是架构设计的一部分，位于关键执行路径中
+- **加法式演进**：公开契约只做增量演进，保持已有集成的兼容性
+- **小内核，丰富且清晰的扩展接口**：垂直化应该发生在 adapters、packs 和产品层，而不是每次都直接改 kernel
 
 ### 可插拔设计与当前落地
 
 - **小内核、强边界**：`contracts`、`kernel`、`protocol`、`app` 分层，让传输、策略、运行时和产品层逻辑各自演进，而不是彼此缠死。
 - **Core / Extension 思路**：运行时、工具、记忆、连接器都按“核心适配器 + 扩展适配器”的方向组织，扩展走正门，而不是绕过内核。
-- **控制面与执行面分离**：模型轮次、上下文组装、通道路由与 ACP 控制面分开建模，后续做更复杂的协作、路由和调度时，不必推倒对话核心重写。
+- **控制层与执行层分离**：模型轮次、上下文组装、通道路由与 ACP 控制层分开建模，后续做更复杂的协作、路由和调度时，不必推倒对话核心重写。
 - **治理不是后补丁**：能力、策略、审批与审计从一开始就被放进关键调用路径里，而不是等接近上线时再补外围约束。
-- **今天已经可用的产品层**：`onboard`、`ask`、`chat`、`doctor`、CLI 主入口、Telegram / 飞书通道、`browser` / `file` / `shell` / `web` 工具，以及可配置的模型提供方、记忆与工具策略基线。
+- **今天已经可用的产品层**：`onboard`、`ask`、`chat`、`doctor`、CLI 主入口、Telegram / 飞书通道、`browser` / `file` / `shell` / `web` 工具，以及可配置的模型提供方、记忆与工具策略默认配置。
 
 更长线的插件生态与集成控制能力，确实是我们关心的方向；但在 README 里，我们更愿意把它表述成正在展开的架构能力，而不是已经完全成熟的产品现实。
 
