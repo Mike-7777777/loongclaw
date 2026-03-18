@@ -400,6 +400,7 @@ contracts (leaf -- zero internal deps)
 欢迎贡献。完整工作流请见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
 - [贡献指南](CONTRIBUTING.md)
+- [贡献重点方向](docs/references/contribution-areas.zh-CN.md)
 - [行为准则](CODE_OF_CONDUCT.md)
 - [安全政策](SECURITY.md)
 

@@ -392,6 +392,47 @@ pub struct ConversationEventRecord {
     pub payload: Value,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiscoveryFirstEventSummary {
+    pub search_round_events: u32,
+    pub followup_requested_events: u32,
+    pub followup_result_events: u32,
+    pub raw_output_followup_events: u32,
+    pub search_to_invoke_hits: u32,
+    pub aggregate_added_estimated_tokens: u64,
+    pub added_estimated_token_samples: u32,
+    pub average_added_estimated_tokens: Option<u32>,
+    pub latest_followup_outcome: Option<String>,
+    pub latest_followup_tool_name: Option<String>,
+    pub latest_followup_target_tool_id: Option<String>,
+    pub latest_initial_estimated_tokens: Option<u32>,
+    pub latest_followup_estimated_tokens: Option<u32>,
+    pub latest_added_estimated_tokens: Option<u32>,
+    pub outcome_counts: BTreeMap<String, u32>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FastLaneToolBatchSegmentSnapshot {
+    pub segment_index: u32,
+    pub scheduling_class: String,
+    pub execution_mode: String,
+    pub intent_count: u32,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FastLaneToolBatchEventSummary {
+    pub batch_events: u32,
+    pub latest_schema_version: Option<u32>,
+    pub latest_total_intents: Option<u32>,
+    pub latest_parallel_execution_enabled: Option<bool>,
+    pub latest_parallel_execution_max_in_flight: Option<u32>,
+    pub latest_parallel_safe_intents: Option<u32>,
+    pub latest_serial_only_intents: Option<u32>,
+    pub latest_parallel_segments: Option<u32>,
+    pub latest_sequential_segments: Option<u32>,
+    pub latest_segments: Vec<FastLaneToolBatchSegmentSnapshot>,
+}
+
 pub fn parse_conversation_event(content: &str) -> Option<ConversationEventRecord> {
     let parsed = serde_json::from_str::<Value>(content).ok()?;
     if parsed.get("type")?.as_str()? != "conversation_event" {
@@ -428,6 +469,38 @@ where
     I: IntoIterator<Item = &'a str>,
 {
     summarize_safe_lane_history(contents).summary
+}
+
+pub fn summarize_discovery_first_events<'a, I>(contents: I) -> DiscoveryFirstEventSummary
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let mut summary = DiscoveryFirstEventSummary::default();
+
+    for content in contents {
+        let Some(record) = parse_conversation_event(content) else {
+            continue;
+        };
+        fold_discovery_first_event_record(&record, &mut summary);
+    }
+
+    summary
+}
+
+pub fn summarize_fast_lane_tool_batch_events<'a, I>(contents: I) -> FastLaneToolBatchEventSummary
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let mut summary = FastLaneToolBatchEventSummary::default();
+
+    for content in contents {
+        let Some(record) = parse_conversation_event(content) else {
+            continue;
+        };
+        fold_fast_lane_tool_batch_event_record(&record, &mut summary);
+    }
+
+    summary
 }
 
 fn fold_safe_lane_event_record(
@@ -609,6 +682,138 @@ fn fold_safe_lane_event_record(
     }
 
     final_status_sample
+}
+
+fn fold_discovery_first_event_record(
+    record: &ConversationEventRecord,
+    summary: &mut DiscoveryFirstEventSummary,
+) {
+    if !is_discovery_first_event_name(record.event.as_str()) {
+        return;
+    }
+
+    match record.event.as_str() {
+        "discovery_first_search_round" => {
+            if record
+                .payload
+                .get("search_tool_calls")
+                .and_then(Value::as_u64)
+                .is_some()
+            {
+                summary.search_round_events = summary.search_round_events.saturating_add(1);
+            }
+            if let Some(initial_estimated_tokens) = record
+                .payload
+                .get("initial_estimated_tokens")
+                .and_then(Value::as_u64)
+                .map(|value| value.min(u32::MAX as u64) as u32)
+            {
+                summary.latest_initial_estimated_tokens = Some(initial_estimated_tokens);
+            }
+        }
+        "discovery_first_followup_requested" => {
+            summary.followup_requested_events = summary.followup_requested_events.saturating_add(1);
+            if let Some(initial_estimated_tokens) = record
+                .payload
+                .get("initial_estimated_tokens")
+                .and_then(Value::as_u64)
+                .map(|value| value.min(u32::MAX as u64) as u32)
+            {
+                summary.latest_initial_estimated_tokens = Some(initial_estimated_tokens);
+            }
+            if let Some(followup_estimated_tokens) = record
+                .payload
+                .get("followup_estimated_tokens")
+                .and_then(Value::as_u64)
+                .map(|value| value.min(u32::MAX as u64) as u32)
+            {
+                summary.latest_followup_estimated_tokens = Some(followup_estimated_tokens);
+            }
+            if let Some(added_estimated_tokens) = record
+                .payload
+                .get("followup_added_estimated_tokens")
+                .and_then(Value::as_u64)
+                .map(|value| value.min(u32::MAX as u64) as u32)
+            {
+                summary.latest_added_estimated_tokens = Some(added_estimated_tokens);
+                summary.aggregate_added_estimated_tokens = summary
+                    .aggregate_added_estimated_tokens
+                    .saturating_add(u64::from(added_estimated_tokens));
+                summary.added_estimated_token_samples =
+                    summary.added_estimated_token_samples.saturating_add(1);
+                summary.average_added_estimated_tokens = Some(
+                    summary
+                        .aggregate_added_estimated_tokens
+                        .saturating_div(u64::from(summary.added_estimated_token_samples))
+                        .min(u32::MAX as u64) as u32,
+                );
+            }
+        }
+        "discovery_first_followup_result" => {
+            let outcome = record.payload.get("outcome").and_then(Value::as_str);
+            if outcome.is_some() {
+                summary.followup_result_events = summary.followup_result_events.saturating_add(1);
+            }
+
+            if record
+                .payload
+                .get("raw_tool_output_requested")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                summary.raw_output_followup_events =
+                    summary.raw_output_followup_events.saturating_add(1);
+            }
+            if record
+                .payload
+                .get("resolved_to_tool_invoke")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                summary.search_to_invoke_hits = summary.search_to_invoke_hits.saturating_add(1);
+            }
+
+            if let Some(outcome) = outcome {
+                summary.latest_followup_outcome = Some(outcome.to_owned());
+                bump_count(&mut summary.outcome_counts, outcome);
+            }
+            summary.latest_followup_tool_name = record
+                .payload
+                .get("followup_tool_name")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+            summary.latest_followup_target_tool_id = record
+                .payload
+                .get("followup_target_tool_id")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+        }
+        _ => {}
+    }
+}
+
+fn fold_fast_lane_tool_batch_event_record(
+    record: &ConversationEventRecord,
+    summary: &mut FastLaneToolBatchEventSummary,
+) {
+    if record.event != "fast_lane_tool_batch" {
+        return;
+    }
+
+    summary.batch_events = summary.batch_events.saturating_add(1);
+    summary.latest_schema_version = read_u32_opt(&record.payload, "schema_version");
+    summary.latest_total_intents = read_u32_opt(&record.payload, "total_intents");
+    summary.latest_parallel_execution_enabled = record
+        .payload
+        .get("parallel_execution_enabled")
+        .and_then(Value::as_bool);
+    summary.latest_parallel_execution_max_in_flight =
+        read_u32_opt(&record.payload, "parallel_execution_max_in_flight");
+    summary.latest_parallel_safe_intents = read_u32_opt(&record.payload, "parallel_safe_intents");
+    summary.latest_serial_only_intents = read_u32_opt(&record.payload, "serial_only_intents");
+    summary.latest_parallel_segments = read_u32_opt(&record.payload, "parallel_segments");
+    summary.latest_sequential_segments = read_u32_opt(&record.payload, "sequential_segments");
+    summary.latest_segments = parse_fast_lane_tool_batch_segments(record.payload.get("segments"));
 }
 
 pub(crate) fn summarize_turn_checkpoint_history<'a, I>(
@@ -1067,6 +1272,15 @@ fn is_safe_lane_event_name(event_name: &str) -> bool {
     )
 }
 
+fn is_discovery_first_event_name(event_name: &str) -> bool {
+    matches!(
+        event_name,
+        "discovery_first_search_round"
+            | "discovery_first_followup_requested"
+            | "discovery_first_followup_result"
+    )
+}
+
 fn read_u32(value: &Value, key: &str) -> u32 {
     value
         .get(key)
@@ -1157,6 +1371,33 @@ fn fold_session_governor_summary(
         read_u32_opt(governor, "recovery_success_streak_threshold");
 }
 
+fn parse_fast_lane_tool_batch_segments(
+    value: Option<&Value>,
+) -> Vec<FastLaneToolBatchSegmentSnapshot> {
+    value
+        .and_then(Value::as_array)
+        .map(|segments| {
+            segments
+                .iter()
+                .filter_map(|segment| {
+                    Some(FastLaneToolBatchSegmentSnapshot {
+                        segment_index: read_u32_opt(segment, "segment_index")?,
+                        scheduling_class: segment
+                            .get("scheduling_class")
+                            .and_then(Value::as_str)?
+                            .to_owned(),
+                        execution_mode: segment
+                            .get("execution_mode")
+                            .and_then(Value::as_str)?
+                            .to_owned(),
+                        intent_count: read_u32_opt(segment, "intent_count")?,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn read_u32_opt(value: &Value, key: &str) -> Option<u32> {
     value
         .get(key)
@@ -1185,6 +1426,137 @@ mod tests {
     fn parse_conversation_event_rejects_non_event_payloads() {
         assert!(parse_conversation_event("not-json").is_none());
         assert!(parse_conversation_event(r#"{"type":"tool_outcome"}"#).is_none());
+    }
+
+    #[test]
+    fn summarize_fast_lane_tool_batch_events_tracks_latest_batch_snapshot() {
+        let payloads = [
+            json!({
+                "type": "conversation_event",
+                "event": "fast_lane_tool_batch",
+                "payload": {
+                    "schema_version": 1,
+                    "total_intents": 2,
+                    "parallel_execution_enabled": true,
+                    "parallel_execution_max_in_flight": 2,
+                    "parallel_safe_intents": 2,
+                    "serial_only_intents": 0,
+                    "parallel_segments": 1,
+                    "sequential_segments": 0,
+                    "segments": [
+                        {
+                            "segment_index": 0,
+                            "scheduling_class": "parallel_safe",
+                            "execution_mode": "parallel",
+                            "intent_count": 2
+                        }
+                    ]
+                }
+            })
+            .to_string(),
+            json!({
+                "type": "conversation_event",
+                "event": "fast_lane_tool_batch",
+                "payload": {
+                    "schema_version": 1,
+                    "total_intents": 3,
+                    "parallel_execution_enabled": true,
+                    "parallel_execution_max_in_flight": 3,
+                    "parallel_safe_intents": 2,
+                    "serial_only_intents": 1,
+                    "parallel_segments": 1,
+                    "sequential_segments": 1,
+                    "segments": [
+                        {
+                            "segment_index": 0,
+                            "scheduling_class": "parallel_safe",
+                            "execution_mode": "parallel",
+                            "intent_count": 2
+                        },
+                        {
+                            "segment_index": 1,
+                            "scheduling_class": "serial_only",
+                            "execution_mode": "sequential",
+                            "intent_count": 1
+                        }
+                    ]
+                }
+            })
+            .to_string(),
+        ];
+
+        let summary = summarize_fast_lane_tool_batch_events(payloads.iter().map(String::as_str));
+
+        assert_eq!(summary.batch_events, 2);
+        assert_eq!(summary.latest_schema_version, Some(1));
+        assert_eq!(summary.latest_total_intents, Some(3));
+        assert_eq!(summary.latest_parallel_execution_enabled, Some(true));
+        assert_eq!(summary.latest_parallel_execution_max_in_flight, Some(3));
+        assert_eq!(summary.latest_parallel_safe_intents, Some(2));
+        assert_eq!(summary.latest_serial_only_intents, Some(1));
+        assert_eq!(summary.latest_parallel_segments, Some(1));
+        assert_eq!(summary.latest_sequential_segments, Some(1));
+        assert_eq!(
+            summary.latest_segments,
+            vec![
+                FastLaneToolBatchSegmentSnapshot {
+                    segment_index: 0,
+                    scheduling_class: "parallel_safe".to_owned(),
+                    execution_mode: "parallel".to_owned(),
+                    intent_count: 2,
+                },
+                FastLaneToolBatchSegmentSnapshot {
+                    segment_index: 1,
+                    scheduling_class: "serial_only".to_owned(),
+                    execution_mode: "sequential".to_owned(),
+                    intent_count: 1,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn summarize_fast_lane_tool_batch_events_ignores_malformed_segments() {
+        let payloads = [json!({
+            "type": "conversation_event",
+            "event": "fast_lane_tool_batch",
+            "payload": {
+                "schema_version": 1,
+                "total_intents": 2,
+                "parallel_execution_enabled": true,
+                "parallel_execution_max_in_flight": 2,
+                "parallel_safe_intents": 2,
+                "serial_only_intents": 0,
+                "parallel_segments": 1,
+                "sequential_segments": 0,
+                "segments": [
+                    null,
+                    [],
+                    {
+                        "segment_index": 99
+                    },
+                    {
+                        "segment_index": 1,
+                        "scheduling_class": "parallel_safe",
+                        "execution_mode": "parallel",
+                        "intent_count": 2
+                    }
+                ]
+            }
+        })
+        .to_string()];
+
+        let summary = summarize_fast_lane_tool_batch_events(payloads.iter().map(String::as_str));
+
+        assert_eq!(
+            summary.latest_segments,
+            vec![FastLaneToolBatchSegmentSnapshot {
+                segment_index: 1,
+                scheduling_class: "parallel_safe".to_owned(),
+                execution_mode: "parallel".to_owned(),
+                intent_count: 2,
+            }]
+        );
     }
 
     #[test]
@@ -2279,5 +2651,151 @@ mod tests {
             summary.latest_safe_lane_route_labels_or_default(),
             ("terminal", "session_governor_no_replan", "session_governor")
         );
+    }
+
+    #[test]
+    fn summarize_discovery_first_events_counts_followup_and_tokens() {
+        let payloads = [
+            json!({
+                "type": "conversation_event",
+                "event": "discovery_first_search_round",
+                "payload": {
+                    "provider_round": 0,
+                    "search_tool_calls": 1,
+                    "raw_tool_output_requested": false,
+                    "initial_estimated_tokens": 12
+                }
+            })
+            .to_string(),
+            json!({
+                "type": "conversation_event",
+                "event": "discovery_first_followup_requested",
+                "payload": {
+                    "provider_round": 1,
+                    "raw_tool_output_requested": true,
+                    "initial_estimated_tokens": 12,
+                    "followup_estimated_tokens": 21,
+                    "followup_added_estimated_tokens": 9
+                }
+            })
+            .to_string(),
+            json!({
+                "type": "conversation_event",
+                "event": "discovery_first_followup_result",
+                "payload": {
+                    "provider_round": 1,
+                    "outcome": "tool.invoke",
+                    "followup_tool_name": "tool.invoke",
+                    "followup_target_tool_id": "file.read",
+                    "resolved_to_tool_invoke": true,
+                    "raw_tool_output_requested": true
+                }
+            })
+            .to_string(),
+        ];
+
+        let summary = summarize_discovery_first_events(payloads.iter().map(String::as_str));
+        assert_eq!(summary.search_round_events, 1);
+        assert_eq!(summary.followup_requested_events, 1);
+        assert_eq!(summary.followup_result_events, 1);
+        assert_eq!(summary.raw_output_followup_events, 1);
+        assert_eq!(summary.search_to_invoke_hits, 1);
+        assert_eq!(summary.aggregate_added_estimated_tokens, 9);
+        assert_eq!(summary.average_added_estimated_tokens, Some(9));
+        assert_eq!(
+            summary.latest_followup_outcome.as_deref(),
+            Some("tool.invoke")
+        );
+        assert_eq!(
+            summary.latest_followup_tool_name.as_deref(),
+            Some("tool.invoke")
+        );
+        assert_eq!(
+            summary.latest_followup_target_tool_id.as_deref(),
+            Some("file.read")
+        );
+        assert_eq!(summary.latest_initial_estimated_tokens, Some(12));
+        assert_eq!(summary.latest_followup_estimated_tokens, Some(21));
+        assert_eq!(summary.latest_added_estimated_tokens, Some(9));
+        assert_eq!(summary.outcome_counts.get("tool.invoke").copied(), Some(1));
+    }
+
+    #[test]
+    fn summarize_discovery_first_events_ignores_lookalikes_and_tracks_latest_request_snapshot() {
+        let payloads = [
+            r#"{"type":"conversation_event","event":"discovery_first_search_round","payload":{"provider_round":0,"search_tool_calls":1}}"#,
+            r#"{"type":"conversation_event","event":"discovery_first_followup_requested","payload":{"provider_round":1,"initial_estimated_tokens":20,"followup_estimated_tokens":32,"followup_added_estimated_tokens":12}}"#,
+            r#"{"type":"conversation_event","event":"discovery_first_followup_result","payload":{"provider_round":1,"outcome":"final_reply","resolved_to_tool_invoke":false}}"#,
+            r#"{"type":"conversation_event","event":"discovery_first_followup_noise","payload":{"outcome":"tool.invoke","resolved_to_tool_invoke":true,"followup_added_estimated_tokens":999}}"#,
+            r#"{"type":"tool_outcome","event":"discovery_first_followup_result","payload":{"outcome":"tool.invoke"}}"#,
+        ];
+
+        let summary = summarize_discovery_first_events(payloads.iter().copied());
+        assert_eq!(summary.search_round_events, 1);
+        assert_eq!(summary.followup_requested_events, 1);
+        assert_eq!(summary.followup_result_events, 1);
+        assert_eq!(summary.raw_output_followup_events, 0);
+        assert_eq!(summary.search_to_invoke_hits, 0);
+        assert_eq!(summary.aggregate_added_estimated_tokens, 12);
+        assert_eq!(summary.average_added_estimated_tokens, Some(12));
+        assert_eq!(
+            summary.latest_followup_outcome.as_deref(),
+            Some("final_reply")
+        );
+        assert_eq!(summary.latest_followup_tool_name, None);
+        assert_eq!(summary.latest_followup_target_tool_id, None);
+        assert_eq!(summary.latest_initial_estimated_tokens, Some(20));
+        assert_eq!(summary.latest_followup_estimated_tokens, Some(32));
+        assert_eq!(summary.latest_added_estimated_tokens, Some(12));
+        assert_eq!(summary.outcome_counts.get("final_reply").copied(), Some(1));
+        assert_eq!(summary.outcome_counts.get("tool.invoke").copied(), None);
+    }
+
+    #[test]
+    fn summarize_discovery_first_events_preserves_initial_tokens_when_call_count_is_missing() {
+        let payloads = [json!({
+            "type": "conversation_event",
+            "event": "discovery_first_search_round",
+            "payload": {
+                "initial_estimated_tokens": 21
+            }
+        })
+        .to_string()];
+
+        let summary = summarize_discovery_first_events(payloads.iter().map(String::as_str));
+
+        assert_eq!(summary.search_round_events, 0);
+        assert_eq!(summary.latest_initial_estimated_tokens, Some(21));
+    }
+
+    #[test]
+    fn summarize_discovery_first_events_preserves_followup_flags_when_outcome_is_missing() {
+        let payloads = [json!({
+            "type": "conversation_event",
+            "event": "discovery_first_followup_result",
+            "payload": {
+                "raw_tool_output_requested": true,
+                "resolved_to_tool_invoke": true,
+                "followup_tool_name": "tool.invoke",
+                "followup_target_tool_id": "file.read"
+            }
+        })
+        .to_string()];
+
+        let summary = summarize_discovery_first_events(payloads.iter().map(String::as_str));
+
+        assert_eq!(summary.followup_result_events, 0);
+        assert_eq!(summary.raw_output_followup_events, 1);
+        assert_eq!(summary.search_to_invoke_hits, 1);
+        assert_eq!(
+            summary.latest_followup_tool_name.as_deref(),
+            Some("tool.invoke")
+        );
+        assert_eq!(
+            summary.latest_followup_target_tool_id.as_deref(),
+            Some("file.read")
+        );
+        assert_eq!(summary.latest_followup_outcome, None);
+        assert!(summary.outcome_counts.is_empty());
     }
 }

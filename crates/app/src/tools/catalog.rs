@@ -1,23 +1,39 @@
 use std::collections::BTreeSet;
 
+use serde::Serialize;
 use serde_json::{Value, json};
 
 use super::runtime_config::ToolRuntimeConfig;
 use crate::config::ToolConfig;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum ToolExecutionKind {
     Core,
     App,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum ToolAvailability {
     Runtime,
     Planned,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum ToolSchedulingClass {
+    SerialOnly,
+    ParallelSafe,
+}
+
+impl ToolSchedulingClass {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SerialOnly => "serial_only",
+            Self::ParallelSafe => "parallel_safe",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum ToolGovernanceScope {
     Routine,
     TopologyMutation,
@@ -32,7 +48,7 @@ impl ToolGovernanceScope {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum ToolRiskClass {
     Low,
     Elevated,
@@ -49,7 +65,7 @@ impl ToolRiskClass {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum ToolApprovalMode {
     Never,
     PolicyDriven,
@@ -64,7 +80,7 @@ impl ToolApprovalMode {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct ToolGovernanceProfile {
     pub scope: ToolGovernanceScope,
     pub risk_class: ToolRiskClass,
@@ -75,6 +91,11 @@ pub fn governance_profile_for_tool_name(tool_name: &str) -> ToolGovernanceProfil
     match tool_name {
         "delegate" | "delegate_async" => ToolGovernanceProfile {
             scope: ToolGovernanceScope::TopologyMutation,
+            risk_class: ToolRiskClass::High,
+            approval_mode: ToolApprovalMode::PolicyDriven,
+        },
+        "browser.companion.click" | "browser.companion.type" => ToolGovernanceProfile {
+            scope: ToolGovernanceScope::Routine,
             risk_class: ToolRiskClass::High,
             approval_mode: ToolApprovalMode::PolicyDriven,
         },
@@ -97,6 +118,33 @@ pub fn governance_profile_for_descriptor(descriptor: &ToolDescriptor) -> ToolGov
     governance_profile_for_tool_name(descriptor.name)
 }
 
+pub fn scheduling_class_for_tool_name(tool_name: &str) -> ToolSchedulingClass {
+    match tool_name {
+        "tool.search" | "file.read" | "web.fetch" | "sessions_list" => {
+            ToolSchedulingClass::ParallelSafe
+        }
+        _ => ToolSchedulingClass::SerialOnly,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum ToolExposureClass {
+    ProviderCore,
+    Discoverable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum ToolVisibilityGate {
+    Always,
+    Sessions,
+    Messages,
+    Delegate,
+    Browser,
+    BrowserCompanion,
+    ExternalSkills,
+    WebFetch,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct ToolDescriptor {
     pub name: &'static str,
@@ -105,6 +153,8 @@ pub struct ToolDescriptor {
     pub description: &'static str,
     pub execution_kind: ToolExecutionKind,
     pub availability: ToolAvailability,
+    pub exposure: ToolExposureClass,
+    pub visibility_gate: ToolVisibilityGate,
     provider_definition_builder: fn(&ToolDescriptor) -> Value,
 }
 
@@ -115,6 +165,59 @@ impl ToolDescriptor {
 
     pub fn provider_definition(&self) -> Value {
         (self.provider_definition_builder)(self)
+    }
+
+    pub fn argument_hint(&self) -> &'static str {
+        tool_argument_hint(self.name)
+    }
+
+    pub fn parameter_types(&self) -> &'static [(&'static str, &'static str)] {
+        tool_parameter_types(self.name)
+    }
+
+    pub fn required_fields(&self) -> &'static [&'static str] {
+        tool_required_fields(self.name)
+    }
+
+    pub fn tags(&self) -> &'static [&'static str] {
+        tool_tags(self.name)
+    }
+
+    pub fn is_provider_core(&self) -> bool {
+        self.exposure == ToolExposureClass::ProviderCore
+    }
+
+    pub fn is_discoverable(&self) -> bool {
+        self.exposure == ToolExposureClass::Discoverable
+    }
+
+    pub fn scheduling_class(&self) -> ToolSchedulingClass {
+        scheduling_class_for_tool_name(self.name)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ToolCatalogEntry {
+    pub canonical_name: &'static str,
+    pub provider_function_name: &'static str,
+    pub summary: &'static str,
+    pub argument_hint: &'static str,
+    pub parameter_types: &'static [(&'static str, &'static str)],
+    pub required_fields: &'static [&'static str],
+    pub tags: &'static [&'static str],
+    pub exposure: ToolExposureClass,
+    pub execution_kind: ToolExecutionKind,
+    pub availability: ToolAvailability,
+    pub scheduling_class: ToolSchedulingClass,
+}
+
+impl ToolCatalogEntry {
+    pub fn is_provider_core(&self) -> bool {
+        self.exposure == ToolExposureClass::ProviderCore
+    }
+
+    pub fn is_discoverable(&self) -> bool {
+        self.exposure == ToolExposureClass::Discoverable
     }
 }
 
@@ -139,6 +242,21 @@ impl ToolView {
 
     pub fn contains(&self, tool_name: &str) -> bool {
         self.allowed_names.contains(tool_name)
+    }
+
+    pub fn tool_names(&self) -> impl Iterator<Item = &str> {
+        self.allowed_names.iter().map(String::as_str)
+    }
+
+    pub fn intersect(&self, other: &ToolView) -> ToolView {
+        let names: BTreeSet<String> = self
+            .allowed_names
+            .intersection(&other.allowed_names)
+            .cloned()
+            .collect();
+        ToolView {
+            allowed_names: names,
+        }
     }
 
     pub fn iter<'a>(
@@ -204,13 +322,37 @@ impl ToolCatalog {
 pub fn tool_catalog() -> ToolCatalog {
     let mut descriptors = vec![
         ToolDescriptor {
-            name: "claw.import",
-            provider_name: "claw_import",
-            aliases: &["import_claw"],
-            description: "Import legacy Claw configs into native LoongClaw settings",
+            name: "tool.search",
+            provider_name: "tool_search",
+            aliases: &[],
+            description: "Discover non-core tools",
             execution_kind: ToolExecutionKind::Core,
             availability: ToolAvailability::Runtime,
-            provider_definition_builder: claw_import_definition,
+            exposure: ToolExposureClass::ProviderCore,
+            visibility_gate: ToolVisibilityGate::Always,
+            provider_definition_builder: tool_search_definition,
+        },
+        ToolDescriptor {
+            name: "tool.invoke",
+            provider_name: "tool_invoke",
+            aliases: &[],
+            description: "Invoke a discovered non-core tool",
+            execution_kind: ToolExecutionKind::Core,
+            availability: ToolAvailability::Runtime,
+            exposure: ToolExposureClass::ProviderCore,
+            visibility_gate: ToolVisibilityGate::Always,
+            provider_definition_builder: tool_invoke_definition,
+        },
+        ToolDescriptor {
+            name: "claw.migrate",
+            provider_name: "claw_migrate",
+            aliases: &[],
+            description: "Migrate legacy Claw configs into native LoongClaw settings",
+            execution_kind: ToolExecutionKind::Core,
+            availability: ToolAvailability::Runtime,
+            exposure: ToolExposureClass::Discoverable,
+            visibility_gate: ToolVisibilityGate::Always,
+            provider_definition_builder: claw_migrate_definition,
         },
         ToolDescriptor {
             name: "external_skills.fetch",
@@ -219,15 +361,19 @@ pub fn tool_catalog() -> ToolCatalog {
             description: "Download external skills artifacts with domain policy and approval guards",
             execution_kind: ToolExecutionKind::Core,
             availability: ToolAvailability::Runtime,
+            exposure: ToolExposureClass::Discoverable,
+            visibility_gate: ToolVisibilityGate::ExternalSkills,
             provider_definition_builder: external_skills_fetch_definition,
         },
         ToolDescriptor {
             name: "external_skills.inspect",
             provider_name: "external_skills_inspect",
             aliases: &[],
-            description: "Read metadata for an installed external skill",
+            description: "Read metadata for a resolved external skill across managed, user, and project scopes",
             execution_kind: ToolExecutionKind::Core,
             availability: ToolAvailability::Runtime,
+            exposure: ToolExposureClass::Discoverable,
+            visibility_gate: ToolVisibilityGate::ExternalSkills,
             provider_definition_builder: external_skills_inspect_definition,
         },
         ToolDescriptor {
@@ -237,24 +383,30 @@ pub fn tool_catalog() -> ToolCatalog {
             description: "Install a managed external skill from a local directory or archive",
             execution_kind: ToolExecutionKind::Core,
             availability: ToolAvailability::Runtime,
+            exposure: ToolExposureClass::Discoverable,
+            visibility_gate: ToolVisibilityGate::ExternalSkills,
             provider_definition_builder: external_skills_install_definition,
         },
         ToolDescriptor {
             name: "external_skills.invoke",
             provider_name: "external_skills_invoke",
             aliases: &[],
-            description: "Load an installed external skill into the conversation loop",
+            description: "Load a resolved external skill into the conversation loop",
             execution_kind: ToolExecutionKind::Core,
             availability: ToolAvailability::Runtime,
+            exposure: ToolExposureClass::Discoverable,
+            visibility_gate: ToolVisibilityGate::ExternalSkills,
             provider_definition_builder: external_skills_invoke_definition,
         },
         ToolDescriptor {
             name: "external_skills.list",
             provider_name: "external_skills_list",
             aliases: &[],
-            description: "List managed external skills available for invocation",
+            description: "List resolved external skills across managed, user, and project scopes",
             execution_kind: ToolExecutionKind::Core,
             availability: ToolAvailability::Runtime,
+            exposure: ToolExposureClass::Discoverable,
+            visibility_gate: ToolVisibilityGate::ExternalSkills,
             provider_definition_builder: external_skills_list_definition,
         },
         ToolDescriptor {
@@ -264,6 +416,8 @@ pub fn tool_catalog() -> ToolCatalog {
             description: "Read/update external skills domain allow/block policy at runtime",
             execution_kind: ToolExecutionKind::Core,
             availability: ToolAvailability::Runtime,
+            exposure: ToolExposureClass::Discoverable,
+            visibility_gate: ToolVisibilityGate::Always,
             provider_definition_builder: external_skills_policy_definition,
         },
         ToolDescriptor {
@@ -273,6 +427,8 @@ pub fn tool_catalog() -> ToolCatalog {
             description: "Remove an installed external skill from the managed runtime",
             execution_kind: ToolExecutionKind::Core,
             availability: ToolAvailability::Runtime,
+            exposure: ToolExposureClass::Discoverable,
+            visibility_gate: ToolVisibilityGate::ExternalSkills,
             provider_definition_builder: external_skills_remove_definition,
         },
         ToolDescriptor {
@@ -282,6 +438,8 @@ pub fn tool_catalog() -> ToolCatalog {
             description: "Inspect current provider state or switch the default provider profile for subsequent turns",
             execution_kind: ToolExecutionKind::Core,
             availability: ToolAvailability::Runtime,
+            exposure: ToolExposureClass::Discoverable,
+            visibility_gate: ToolVisibilityGate::Always,
             provider_definition_builder: provider_switch_definition,
         },
         ToolDescriptor {
@@ -291,6 +449,8 @@ pub fn tool_catalog() -> ToolCatalog {
             description: "Resolve one visible governed tool approval request",
             execution_kind: ToolExecutionKind::App,
             availability: runtime_session_tool_availability(),
+            exposure: ToolExposureClass::Discoverable,
+            visibility_gate: ToolVisibilityGate::Sessions,
             provider_definition_builder: approval_request_resolve_definition,
         },
         ToolDescriptor {
@@ -300,6 +460,8 @@ pub fn tool_catalog() -> ToolCatalog {
             description: "Inspect full detail for a visible governed tool approval request",
             execution_kind: ToolExecutionKind::App,
             availability: runtime_session_tool_availability(),
+            exposure: ToolExposureClass::Discoverable,
+            visibility_gate: ToolVisibilityGate::Sessions,
             provider_definition_builder: approval_request_status_definition,
         },
         ToolDescriptor {
@@ -309,6 +471,8 @@ pub fn tool_catalog() -> ToolCatalog {
             description: "List visible governed tool approval requests across the current session scope",
             execution_kind: ToolExecutionKind::App,
             availability: runtime_session_tool_availability(),
+            exposure: ToolExposureClass::Discoverable,
+            visibility_gate: ToolVisibilityGate::Sessions,
             provider_definition_builder: approval_requests_list_definition,
         },
         ToolDescriptor {
@@ -318,6 +482,8 @@ pub fn tool_catalog() -> ToolCatalog {
             description: "Delegate a focused subtask into a child session",
             execution_kind: ToolExecutionKind::App,
             availability: runtime_session_tool_availability(),
+            exposure: ToolExposureClass::Discoverable,
+            visibility_gate: ToolVisibilityGate::Delegate,
             provider_definition_builder: delegate_definition,
         },
         ToolDescriptor {
@@ -327,6 +493,8 @@ pub fn tool_catalog() -> ToolCatalog {
             description: "Delegate a focused subtask into a background child session",
             execution_kind: ToolExecutionKind::App,
             availability: runtime_session_tool_availability(),
+            exposure: ToolExposureClass::Discoverable,
+            visibility_gate: ToolVisibilityGate::Delegate,
             provider_definition_builder: delegate_async_definition,
         },
         ToolDescriptor {
@@ -336,6 +504,8 @@ pub fn tool_catalog() -> ToolCatalog {
             description: "Archive a visible terminal session from default session listings",
             execution_kind: ToolExecutionKind::App,
             availability: runtime_session_tool_availability(),
+            exposure: ToolExposureClass::Discoverable,
+            visibility_gate: ToolVisibilityGate::Sessions,
             provider_definition_builder: session_archive_definition,
         },
         ToolDescriptor {
@@ -345,6 +515,8 @@ pub fn tool_catalog() -> ToolCatalog {
             description: "Cancel a visible async delegate child session",
             execution_kind: ToolExecutionKind::App,
             availability: runtime_session_tool_availability(),
+            exposure: ToolExposureClass::Discoverable,
+            visibility_gate: ToolVisibilityGate::Sessions,
             provider_definition_builder: session_cancel_definition,
         },
         ToolDescriptor {
@@ -354,6 +526,8 @@ pub fn tool_catalog() -> ToolCatalog {
             description: "Fetch session events for a visible session",
             execution_kind: ToolExecutionKind::App,
             availability: runtime_session_tool_availability(),
+            exposure: ToolExposureClass::Discoverable,
+            visibility_gate: ToolVisibilityGate::Sessions,
             provider_definition_builder: session_events_definition,
         },
         ToolDescriptor {
@@ -363,6 +537,8 @@ pub fn tool_catalog() -> ToolCatalog {
             description: "Recover an overdue queued async delegate child session by marking it failed",
             execution_kind: ToolExecutionKind::App,
             availability: runtime_session_tool_availability(),
+            exposure: ToolExposureClass::Discoverable,
+            visibility_gate: ToolVisibilityGate::Sessions,
             provider_definition_builder: session_recover_definition,
         },
         ToolDescriptor {
@@ -372,6 +548,8 @@ pub fn tool_catalog() -> ToolCatalog {
             description: "Inspect the current status of a visible session",
             execution_kind: ToolExecutionKind::App,
             availability: runtime_session_tool_availability(),
+            exposure: ToolExposureClass::Discoverable,
+            visibility_gate: ToolVisibilityGate::Sessions,
             provider_definition_builder: session_status_definition,
         },
         ToolDescriptor {
@@ -381,6 +559,8 @@ pub fn tool_catalog() -> ToolCatalog {
             description: "Wait for a visible session to reach a terminal state",
             execution_kind: ToolExecutionKind::App,
             availability: runtime_session_tool_availability(),
+            exposure: ToolExposureClass::Discoverable,
+            visibility_gate: ToolVisibilityGate::Sessions,
             provider_definition_builder: session_wait_definition,
         },
         ToolDescriptor {
@@ -390,6 +570,8 @@ pub fn tool_catalog() -> ToolCatalog {
             description: "Fetch transcript history for a visible session",
             execution_kind: ToolExecutionKind::App,
             availability: runtime_session_tool_availability(),
+            exposure: ToolExposureClass::Discoverable,
+            visibility_gate: ToolVisibilityGate::Sessions,
             provider_definition_builder: sessions_history_definition,
         },
         ToolDescriptor {
@@ -399,6 +581,8 @@ pub fn tool_catalog() -> ToolCatalog {
             description: "List visible sessions and their high-level state",
             execution_kind: ToolExecutionKind::App,
             availability: runtime_session_tool_availability(),
+            exposure: ToolExposureClass::Discoverable,
+            visibility_gate: ToolVisibilityGate::Sessions,
             provider_definition_builder: sessions_list_definition,
         },
         ToolDescriptor {
@@ -408,6 +592,8 @@ pub fn tool_catalog() -> ToolCatalog {
             description: "Send an outbound text message to a known channel-backed root session",
             execution_kind: ToolExecutionKind::App,
             availability: runtime_messaging_tool_availability(),
+            exposure: ToolExposureClass::Discoverable,
+            visibility_gate: ToolVisibilityGate::Messages,
             provider_definition_builder: sessions_send_definition,
         },
     ];
@@ -421,6 +607,8 @@ pub fn tool_catalog() -> ToolCatalog {
             description: "Read file contents",
             execution_kind: ToolExecutionKind::Core,
             availability: ToolAvailability::Runtime,
+            exposure: ToolExposureClass::Discoverable,
+            visibility_gate: ToolVisibilityGate::Always,
             provider_definition_builder: file_read_definition,
         });
         descriptors.push(ToolDescriptor {
@@ -430,6 +618,8 @@ pub fn tool_catalog() -> ToolCatalog {
             description: "Write file contents",
             execution_kind: ToolExecutionKind::Core,
             availability: ToolAvailability::Runtime,
+            exposure: ToolExposureClass::Discoverable,
+            visibility_gate: ToolVisibilityGate::Always,
             provider_definition_builder: file_write_definition,
         });
     }
@@ -443,6 +633,8 @@ pub fn tool_catalog() -> ToolCatalog {
             description: "Execute shell commands",
             execution_kind: ToolExecutionKind::Core,
             availability: ToolAvailability::Runtime,
+            exposure: ToolExposureClass::Discoverable,
+            visibility_gate: ToolVisibilityGate::Always,
             provider_definition_builder: shell_exec_definition,
         });
     }
@@ -456,7 +648,86 @@ pub fn tool_catalog() -> ToolCatalog {
             description: "Follow one previously discovered page link within a bounded browser session",
             execution_kind: ToolExecutionKind::Core,
             availability: ToolAvailability::Runtime,
+            exposure: ToolExposureClass::Discoverable,
+            visibility_gate: ToolVisibilityGate::Browser,
             provider_definition_builder: browser_click_definition,
+        });
+        descriptors.push(ToolDescriptor {
+            name: "browser.companion.click",
+            provider_name: "browser_companion_click",
+            aliases: &["browser_companion_click"],
+            description: "Click a page element inside a governed browser companion session after policy review",
+            execution_kind: ToolExecutionKind::App,
+            availability: ToolAvailability::Runtime,
+            exposure: ToolExposureClass::Discoverable,
+            visibility_gate: ToolVisibilityGate::BrowserCompanion,
+            provider_definition_builder: browser_companion_click_definition,
+        });
+        descriptors.push(ToolDescriptor {
+            name: "browser.companion.navigate",
+            provider_name: "browser_companion_navigate",
+            aliases: &["browser_companion_navigate"],
+            description: "Navigate a governed browser companion session to a target URL",
+            execution_kind: ToolExecutionKind::Core,
+            availability: ToolAvailability::Runtime,
+            exposure: ToolExposureClass::Discoverable,
+            visibility_gate: ToolVisibilityGate::BrowserCompanion,
+            provider_definition_builder: browser_companion_navigate_definition,
+        });
+        descriptors.push(ToolDescriptor {
+            name: "browser.companion.session.start",
+            provider_name: "browser_companion_session_start",
+            aliases: &["browser_companion_session_start"],
+            description: "Start a governed browser companion session at a target URL",
+            execution_kind: ToolExecutionKind::Core,
+            availability: ToolAvailability::Runtime,
+            exposure: ToolExposureClass::Discoverable,
+            visibility_gate: ToolVisibilityGate::BrowserCompanion,
+            provider_definition_builder: browser_companion_session_start_definition,
+        });
+        descriptors.push(ToolDescriptor {
+            name: "browser.companion.session.stop",
+            provider_name: "browser_companion_session_stop",
+            aliases: &["browser_companion_session_stop"],
+            description: "Stop a governed browser companion session and release companion-side state",
+            execution_kind: ToolExecutionKind::Core,
+            availability: ToolAvailability::Runtime,
+            exposure: ToolExposureClass::Discoverable,
+            visibility_gate: ToolVisibilityGate::BrowserCompanion,
+            provider_definition_builder: browser_companion_session_stop_definition,
+        });
+        descriptors.push(ToolDescriptor {
+            name: "browser.companion.snapshot",
+            provider_name: "browser_companion_snapshot",
+            aliases: &["browser_companion_snapshot"],
+            description: "Capture a readable snapshot of the current browser companion page",
+            execution_kind: ToolExecutionKind::Core,
+            availability: ToolAvailability::Runtime,
+            exposure: ToolExposureClass::Discoverable,
+            visibility_gate: ToolVisibilityGate::BrowserCompanion,
+            provider_definition_builder: browser_companion_snapshot_definition,
+        });
+        descriptors.push(ToolDescriptor {
+            name: "browser.companion.type",
+            provider_name: "browser_companion_type",
+            aliases: &["browser_companion_type"],
+            description: "Type text into a page element inside a governed browser companion session after policy review",
+            execution_kind: ToolExecutionKind::App,
+            availability: ToolAvailability::Runtime,
+            exposure: ToolExposureClass::Discoverable,
+            visibility_gate: ToolVisibilityGate::BrowserCompanion,
+            provider_definition_builder: browser_companion_type_definition,
+        });
+        descriptors.push(ToolDescriptor {
+            name: "browser.companion.wait",
+            provider_name: "browser_companion_wait",
+            aliases: &["browser_companion_wait"],
+            description: "Wait inside a governed browser companion session for a condition or timeout window",
+            execution_kind: ToolExecutionKind::Core,
+            availability: ToolAvailability::Runtime,
+            exposure: ToolExposureClass::Discoverable,
+            visibility_gate: ToolVisibilityGate::BrowserCompanion,
+            provider_definition_builder: browser_companion_wait_definition,
         });
         descriptors.push(ToolDescriptor {
             name: "browser.extract",
@@ -465,6 +736,8 @@ pub fn tool_catalog() -> ToolCatalog {
             description: "Extract structured text or links from the current browser session page",
             execution_kind: ToolExecutionKind::Core,
             availability: ToolAvailability::Runtime,
+            exposure: ToolExposureClass::Discoverable,
+            visibility_gate: ToolVisibilityGate::Browser,
             provider_definition_builder: browser_extract_definition,
         });
         descriptors.push(ToolDescriptor {
@@ -475,6 +748,8 @@ pub fn tool_catalog() -> ToolCatalog {
                 "Open a public web page into a bounded browser session with safe link discovery",
             execution_kind: ToolExecutionKind::Core,
             availability: ToolAvailability::Runtime,
+            exposure: ToolExposureClass::Discoverable,
+            visibility_gate: ToolVisibilityGate::Browser,
             provider_definition_builder: browser_open_definition,
         });
     }
@@ -488,6 +763,8 @@ pub fn tool_catalog() -> ToolCatalog {
             description: "Fetch a public web page with SSRF-safe guards and readable extraction",
             execution_kind: ToolExecutionKind::Core,
             availability: ToolAvailability::Runtime,
+            exposure: ToolExposureClass::Discoverable,
+            visibility_gate: ToolVisibilityGate::WebFetch,
             provider_definition_builder: web_fetch_definition,
         });
     }
@@ -515,7 +792,11 @@ pub fn runtime_tool_view_for_config_with_external_skills(
             .iter()
             .filter(|descriptor| descriptor.availability == ToolAvailability::Runtime)
             .filter(|descriptor| {
-                tool_is_enabled_for_runtime_view(descriptor.name, config, external_skills_enabled)
+                tool_visibility_gate_enabled_for_runtime_view(
+                    descriptor.visibility_gate,
+                    config,
+                    external_skills_enabled,
+                )
             })
             .map(|descriptor| descriptor.name),
     )
@@ -528,7 +809,9 @@ pub fn runtime_tool_view_for_runtime_config(config: &ToolRuntimeConfig) -> ToolV
             .descriptors()
             .iter()
             .filter(|descriptor| descriptor.availability == ToolAvailability::Runtime)
-            .filter(|descriptor| tool_is_enabled_for_runtime_policy(descriptor.name, config))
+            .filter(|descriptor| {
+                tool_visibility_gate_enabled_for_runtime_policy(descriptor.visibility_gate, config)
+            })
             .map(|descriptor| descriptor.name),
     )
 }
@@ -577,7 +860,15 @@ pub fn delegate_child_tool_view_for_config_with_delegate(
                     names.push(descriptor.name);
                 }
             }
-            name if allowlist.contains(name) => names.push(name),
+            name if allowlist.contains(name)
+                && tool_visibility_gate_enabled_for_runtime_view(
+                    descriptor.visibility_gate,
+                    config,
+                    false,
+                ) =>
+            {
+                names.push(name);
+            }
             _ => {}
         }
     }
@@ -602,62 +893,108 @@ pub fn delegate_child_tool_view_for_config_with_delegate(
     ToolView::from_tool_names(names)
 }
 
-fn tool_is_enabled_for_runtime_view(
-    tool_name: &str,
-    config: &ToolConfig,
-    external_skills_enabled: bool,
-) -> bool {
-    match tool_name {
-        "approval_request_resolve"
-        | "approval_request_status"
-        | "approval_requests_list"
-        | "sessions_list"
-        | "sessions_history"
-        | "session_status"
-        | "session_events"
-        | "session_archive"
-        | "session_cancel"
-        | "session_recover"
-        | "session_wait" => config.sessions.enabled,
-        "sessions_send" => config.messages.enabled,
-        "delegate" | "delegate_async" => config.delegate.enabled,
-        "browser.open" | "browser.extract" | "browser.click" => config.browser.enabled,
-        "external_skills.fetch"
-        | "external_skills.inspect"
-        | "external_skills.install"
-        | "external_skills.invoke"
-        | "external_skills.list"
-        | "external_skills.remove" => external_skills_enabled,
-        "web.fetch" => config.web.enabled,
-        _ => true,
+pub fn provider_core_tool_catalog() -> Vec<ToolCatalogEntry> {
+    tool_catalog()
+        .descriptors()
+        .iter()
+        .filter(|descriptor| descriptor.is_provider_core())
+        .map(descriptor_to_entry)
+        .collect()
+}
+
+pub fn discoverable_tool_catalog() -> Vec<ToolCatalogEntry> {
+    tool_catalog()
+        .descriptors()
+        .iter()
+        .filter(|descriptor| descriptor.is_discoverable())
+        .map(descriptor_to_entry)
+        .collect()
+}
+
+pub fn all_tool_catalog() -> Vec<ToolCatalogEntry> {
+    tool_catalog()
+        .descriptors()
+        .iter()
+        .map(descriptor_to_entry)
+        .collect()
+}
+
+pub fn find_tool_catalog_entry(name: &str) -> Option<ToolCatalogEntry> {
+    tool_catalog().resolve(name).map(descriptor_to_entry)
+}
+
+fn descriptor_to_entry(descriptor: &ToolDescriptor) -> ToolCatalogEntry {
+    ToolCatalogEntry {
+        canonical_name: descriptor.name,
+        provider_function_name: descriptor.provider_name,
+        summary: descriptor.description,
+        argument_hint: descriptor.argument_hint(),
+        parameter_types: descriptor.parameter_types(),
+        required_fields: descriptor.required_fields(),
+        tags: descriptor.tags(),
+        exposure: descriptor.exposure,
+        execution_kind: descriptor.execution_kind,
+        availability: descriptor.availability,
+        scheduling_class: descriptor.scheduling_class(),
     }
 }
 
-fn tool_is_enabled_for_runtime_policy(tool_name: &str, config: &ToolRuntimeConfig) -> bool {
-    match tool_name {
-        "approval_request_resolve"
-        | "approval_request_status"
-        | "approval_requests_list"
-        | "sessions_list"
-        | "sessions_history"
-        | "session_status"
-        | "session_events"
-        | "session_archive"
-        | "session_cancel"
-        | "session_recover"
-        | "session_wait" => config.sessions_enabled,
-        "sessions_send" => config.messages_enabled,
-        "delegate" | "delegate_async" => config.delegate_enabled,
-        "browser.open" | "browser.extract" | "browser.click" => config.browser.enabled,
-        "external_skills.fetch"
-        | "external_skills.inspect"
-        | "external_skills.install"
-        | "external_skills.invoke"
-        | "external_skills.list"
-        | "external_skills.remove" => config.external_skills.enabled,
-        "web.fetch" => config.web_fetch.enabled,
-        _ => true,
+fn tool_visibility_gate_enabled_for_runtime_view(
+    gate: ToolVisibilityGate,
+    config: &ToolConfig,
+    external_skills_enabled: bool,
+) -> bool {
+    match gate {
+        ToolVisibilityGate::Always => true,
+        ToolVisibilityGate::Sessions => config.sessions.enabled,
+        ToolVisibilityGate::Messages => config.messages.enabled,
+        ToolVisibilityGate::Delegate => config.delegate.enabled,
+        ToolVisibilityGate::Browser => config.browser.enabled,
+        ToolVisibilityGate::BrowserCompanion => false,
+        ToolVisibilityGate::ExternalSkills => external_skills_enabled,
+        ToolVisibilityGate::WebFetch => config.web.enabled,
     }
+}
+
+fn tool_visibility_gate_enabled_for_runtime_policy(
+    gate: ToolVisibilityGate,
+    config: &ToolRuntimeConfig,
+) -> bool {
+    match gate {
+        ToolVisibilityGate::Always => true,
+        ToolVisibilityGate::Sessions => config.sessions_enabled,
+        ToolVisibilityGate::Messages => config.messages_enabled,
+        ToolVisibilityGate::Delegate => config.delegate_enabled,
+        ToolVisibilityGate::Browser => config.browser.enabled,
+        ToolVisibilityGate::BrowserCompanion => config.browser_companion.is_runtime_ready(),
+        ToolVisibilityGate::ExternalSkills => config.external_skills.enabled,
+        ToolVisibilityGate::WebFetch => config.web_fetch.enabled,
+    }
+}
+
+fn tool_search_definition(descriptor: &ToolDescriptor) -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": descriptor.provider_name,
+            "description": "Discover non-core tools relevant to the current task.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Natural-language description of the tool capability you need."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Optional maximum number of search results to return."
+                    }
+                },
+                "required": ["query"],
+                "additionalProperties": false
+            }
+        }
+    })
 }
 
 fn browser_open_definition(descriptor: &ToolDescriptor) -> Value {
@@ -750,7 +1087,214 @@ fn browser_click_definition(descriptor: &ToolDescriptor) -> Value {
     })
 }
 
-fn claw_import_definition(descriptor: &ToolDescriptor) -> Value {
+fn browser_companion_session_start_definition(descriptor: &ToolDescriptor) -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": descriptor.provider_name,
+            "description": descriptor.description,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "HTTP or HTTPS URL to open in the managed browser companion session."
+                    }
+                },
+                "required": ["url"],
+                "additionalProperties": false
+            }
+        }
+    })
+}
+
+fn browser_companion_navigate_definition(descriptor: &ToolDescriptor) -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": descriptor.provider_name,
+            "description": descriptor.description,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "session_id": {
+                        "type": "string",
+                        "description": "Browser companion session identifier returned by browser.companion.session.start."
+                    },
+                    "url": {
+                        "type": "string",
+                        "description": "HTTP or HTTPS URL to load next."
+                    }
+                },
+                "required": ["session_id", "url"],
+                "additionalProperties": false
+            }
+        }
+    })
+}
+
+fn browser_companion_snapshot_definition(descriptor: &ToolDescriptor) -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": descriptor.provider_name,
+            "description": descriptor.description,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "session_id": {
+                        "type": "string",
+                        "description": "Browser companion session identifier returned by browser.companion.session.start."
+                    },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["summary", "html", "links"],
+                        "description": "Optional snapshot mode. Defaults to `summary`."
+                    }
+                },
+                "required": ["session_id"],
+                "additionalProperties": false
+            }
+        }
+    })
+}
+
+fn browser_companion_wait_definition(descriptor: &ToolDescriptor) -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": descriptor.provider_name,
+            "description": descriptor.description,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "session_id": {
+                        "type": "string",
+                        "description": "Browser companion session identifier returned by browser.companion.session.start."
+                    },
+                    "condition": {
+                        "type": "string",
+                        "description": "Optional companion-side wait condition."
+                    },
+                    "timeout_ms": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 30000,
+                        "description": "Optional maximum wait in milliseconds."
+                    }
+                },
+                "required": ["session_id"],
+                "additionalProperties": false
+            }
+        }
+    })
+}
+
+fn browser_companion_session_stop_definition(descriptor: &ToolDescriptor) -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": descriptor.provider_name,
+            "description": descriptor.description,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "session_id": {
+                        "type": "string",
+                        "description": "Browser companion session identifier returned by browser.companion.session.start."
+                    }
+                },
+                "required": ["session_id"],
+                "additionalProperties": false
+            }
+        }
+    })
+}
+
+fn browser_companion_click_definition(descriptor: &ToolDescriptor) -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": descriptor.provider_name,
+            "description": descriptor.description,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "session_id": {
+                        "type": "string",
+                        "description": "Browser companion session identifier returned by browser.companion.session.start."
+                    },
+                    "selector": {
+                        "type": "string",
+                        "description": "Selector for the element to click."
+                    }
+                },
+                "required": ["session_id", "selector"],
+                "additionalProperties": false
+            }
+        }
+    })
+}
+
+fn browser_companion_type_definition(descriptor: &ToolDescriptor) -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": descriptor.provider_name,
+            "description": descriptor.description,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "session_id": {
+                        "type": "string",
+                        "description": "Browser companion session identifier returned by browser.companion.session.start."
+                    },
+                    "selector": {
+                        "type": "string",
+                        "description": "Selector for the element to type into."
+                    },
+                    "text": {
+                        "type": "string",
+                        "description": "Text to enter."
+                    }
+                },
+                "required": ["session_id", "selector", "text"],
+                "additionalProperties": false
+            }
+        }
+    })
+}
+
+fn tool_invoke_definition(descriptor: &ToolDescriptor) -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": descriptor.provider_name,
+            "description": "Invoke a discovered non-core tool using a valid lease from tool_search.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "tool_id": {
+                        "type": "string",
+                        "description": "Canonical id of the discovered tool."
+                    },
+                    "lease": {
+                        "type": "string",
+                        "description": "Short-lived lease returned by tool_search."
+                    },
+                    "arguments": {
+                        "type": "object",
+                        "description": "Arguments for the discovered tool payload."
+                    }
+                },
+                "required": ["tool_id", "lease", "arguments"],
+                "additionalProperties": false
+            }
+        }
+    })
+}
+
+fn claw_migrate_definition(descriptor: &ToolDescriptor) -> Value {
     json!({
         "type": "function",
         "function": {
@@ -761,7 +1305,7 @@ fn claw_import_definition(descriptor: &ToolDescriptor) -> Value {
                 "properties": {
                     "input_path": {
                         "type": "string",
-                        "description": "Path to the legacy Claw workspace, config root, or portable import file. Required for all modes except rollback_last_apply."
+                        "description": "Path to the legacy Claw workspace, config root, or portable migration file. Required for all modes except rollback_last_apply."
                     },
                     "mode": {
                         "type": "string",
@@ -930,13 +1474,13 @@ fn external_skills_inspect_definition(descriptor: &ToolDescriptor) -> Value {
         "type": "function",
         "function": {
             "name": descriptor.provider_name,
-            "description": "Read metadata and a short preview for an installed external skill.",
+            "description": "Read metadata and a short preview for a resolved external skill across managed, user, and project scopes.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "skill_id": {
                         "type": "string",
-                        "description": "Managed external skill identifier."
+                        "description": "Resolved external skill identifier."
                     }
                 },
                 "required": ["skill_id"],
@@ -951,13 +1495,17 @@ fn external_skills_install_definition(descriptor: &ToolDescriptor) -> Value {
         "type": "function",
         "function": {
             "name": descriptor.provider_name,
-            "description": "Install a managed external skill from a local directory or local .tgz/.tar.gz archive under the configured file root.",
+            "description": "Install a managed external skill from a local directory, local .tgz/.tar.gz archive, or a first-party bundled skill id.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
                         "description": "Path to a local directory containing SKILL.md or a local .tgz/.tar.gz archive."
+                    },
+                    "bundled_skill_id": {
+                        "type": "string",
+                        "description": "Optional first-party bundled skill identifier, for example `browser-companion-preview`."
                     },
                     "skill_id": {
                         "type": "string",
@@ -968,7 +1516,10 @@ fn external_skills_install_definition(descriptor: &ToolDescriptor) -> Value {
                         "description": "Replace an existing installed skill with the same id. Defaults to false."
                     }
                 },
-                "required": ["path"],
+                "anyOf": [
+                    { "required": ["path"] },
+                    { "required": ["bundled_skill_id"] }
+                ],
                 "additionalProperties": false
             }
         }
@@ -980,13 +1531,13 @@ fn external_skills_invoke_definition(descriptor: &ToolDescriptor) -> Value {
         "type": "function",
         "function": {
             "name": descriptor.provider_name,
-            "description": "Load an installed external skill's SKILL.md instructions into the conversation loop.",
+            "description": "Load a resolved external skill's SKILL.md instructions into the conversation loop across managed, user, and project scopes.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "skill_id": {
                         "type": "string",
-                        "description": "Managed external skill identifier."
+                        "description": "Resolved external skill identifier."
                     }
                 },
                 "required": ["skill_id"],
@@ -1001,7 +1552,7 @@ fn external_skills_list_definition(descriptor: &ToolDescriptor) -> Value {
         "type": "function",
         "function": {
             "name": descriptor.provider_name,
-            "description": "List managed external skills available for invocation.",
+            "description": "List resolved external skills available for invocation across managed, user, and project scopes.",
             "parameters": {
                 "type": "object",
                 "properties": {},
@@ -1603,4 +2154,335 @@ fn delegate_async_definition(descriptor: &ToolDescriptor) -> Value {
             }
         }
     })
+}
+
+fn tool_argument_hint(name: &str) -> &'static str {
+    match name {
+        "tool.search" => "query:string,limit?:integer",
+        "tool.invoke" => "tool_id:string,lease:string,arguments:object",
+        "claw.migrate" => "input_path?:string,mode?:string,source?:string",
+        "external_skills.fetch" => {
+            "url:string,approval_granted?:boolean,save_as?:string,max_bytes?:integer"
+        }
+        "external_skills.inspect" => "skill_id:string",
+        "external_skills.install" => {
+            "path?:string,bundled_skill_id?:string,skill_id?:string,replace?:boolean"
+        }
+        "external_skills.invoke" => "skill_id:string",
+        "external_skills.list" => "",
+        "external_skills.policy" => {
+            "action?:string,enabled?:boolean,allowed_domains?:string[],blocked_domains?:string[]"
+        }
+        "external_skills.remove" => "skill_id:string",
+        "browser.companion.session.start" => "url:string",
+        "browser.companion.navigate" => "session_id:string,url:string",
+        "browser.companion.snapshot" => "session_id:string,mode?:string",
+        "browser.companion.wait" => "session_id:string,condition?:string,timeout_ms?:integer",
+        "browser.companion.session.stop" => "session_id:string",
+        "browser.companion.click" => "session_id:string,selector:string",
+        "browser.companion.type" => "session_id:string,selector:string,text:string",
+        "file.read" => "path:string,max_bytes?:integer",
+        "file.write" => "path:string,content:string,create_dirs?:boolean",
+        "shell.exec" => "command:string,args?:string[]",
+        "provider.switch" => "selector?:string",
+        "delegate" | "delegate_async" => "task:string,label?:string,timeout_seconds?:integer",
+        "session_archive" | "session_cancel" | "session_events" | "session_recover"
+        | "session_status" | "session_wait" | "sessions_history" => "session_id:string",
+        "sessions_list" => "limit?:integer,state?:string",
+        "sessions_send" => "session_id:string,text:string",
+        _ => "",
+    }
+}
+
+fn tool_parameter_types(name: &str) -> &'static [(&'static str, &'static str)] {
+    match name {
+        "tool.search" => &[("query", "string"), ("limit", "integer")],
+        "tool.invoke" => &[
+            ("tool_id", "string"),
+            ("lease", "string"),
+            ("arguments", "object"),
+        ],
+        "claw.migrate" => &[
+            ("input_path", "string"),
+            ("mode", "string"),
+            ("source", "string"),
+        ],
+        "external_skills.fetch" => &[
+            ("url", "string"),
+            ("approval_granted", "boolean"),
+            ("save_as", "string"),
+            ("max_bytes", "integer"),
+        ],
+        "external_skills.inspect" | "external_skills.invoke" | "external_skills.remove" => {
+            &[("skill_id", "string")]
+        }
+        "external_skills.install" => &[
+            ("path", "string"),
+            ("bundled_skill_id", "string"),
+            ("skill_id", "string"),
+            ("replace", "boolean"),
+        ],
+        "external_skills.list" => &[],
+        "browser.companion.session.start" => &[("url", "string")],
+        "browser.companion.navigate" => &[("session_id", "string"), ("url", "string")],
+        "browser.companion.snapshot" => &[("session_id", "string"), ("mode", "string")],
+        "browser.companion.wait" => &[
+            ("session_id", "string"),
+            ("condition", "string"),
+            ("timeout_ms", "integer"),
+        ],
+        "browser.companion.session.stop" => &[("session_id", "string")],
+        "browser.companion.click" => &[("session_id", "string"), ("selector", "string")],
+        "browser.companion.type" => &[
+            ("session_id", "string"),
+            ("selector", "string"),
+            ("text", "string"),
+        ],
+        "external_skills.policy" => &[
+            ("action", "string"),
+            ("enabled", "boolean"),
+            ("allowed_domains", "array"),
+            ("blocked_domains", "array"),
+        ],
+        "file.read" => &[("path", "string"), ("max_bytes", "integer")],
+        "file.write" => &[
+            ("path", "string"),
+            ("content", "string"),
+            ("create_dirs", "boolean"),
+        ],
+        "shell.exec" => &[("command", "string"), ("args", "array")],
+        "provider.switch" => &[("selector", "string")],
+        "delegate" | "delegate_async" => &[
+            ("task", "string"),
+            ("label", "string"),
+            ("timeout_seconds", "integer"),
+        ],
+        "session_archive" | "session_cancel" | "session_events" | "session_recover"
+        | "session_status" | "session_wait" | "sessions_history" => &[("session_id", "string")],
+        "sessions_list" => &[("limit", "integer"), ("state", "string")],
+        "sessions_send" => &[("session_id", "string"), ("text", "string")],
+        _ => &[],
+    }
+}
+
+const EMPTY_REQUIRED_FIELD_GROUPS: &[&[&str]] = &[];
+const EXTERNAL_SKILLS_INSTALL_REQUIRED_FIELD_GROUPS: &[&[&str]] =
+    &[&["path"], &["bundled_skill_id"]];
+
+fn tool_required_fields(name: &str) -> &'static [&'static str] {
+    match name {
+        "tool.search" => &["query"],
+        "tool.invoke" => &["tool_id", "lease", "arguments"],
+        "external_skills.fetch" => &["url"],
+        "external_skills.inspect" | "external_skills.invoke" | "external_skills.remove" => {
+            &["skill_id"]
+        }
+        // Grouped requirements are the source of truth for this tool's anyOf shape.
+        "external_skills.install" => &[],
+        "browser.companion.session.start" => &["url"],
+        "browser.companion.navigate" => &["session_id", "url"],
+        "browser.companion.snapshot"
+        | "browser.companion.wait"
+        | "browser.companion.session.stop" => &["session_id"],
+        "browser.companion.click" => &["session_id", "selector"],
+        "browser.companion.type" => &["session_id", "selector", "text"],
+        "file.read" => &["path"],
+        "file.write" => &["path", "content"],
+        "shell.exec" => &["command"],
+        "delegate" | "delegate_async" => &["task"],
+        "session_archive" | "session_cancel" | "session_events" | "session_recover"
+        | "session_status" | "session_wait" | "sessions_history" => &["session_id"],
+        "sessions_send" => &["session_id", "text"],
+        _ => &[],
+    }
+}
+
+pub(crate) fn tool_required_field_groups(name: &str) -> &'static [&'static [&'static str]] {
+    match name {
+        "external_skills.install" => EXTERNAL_SKILLS_INSTALL_REQUIRED_FIELD_GROUPS,
+        _ => EMPTY_REQUIRED_FIELD_GROUPS,
+    }
+}
+
+fn tool_tags(name: &str) -> &'static [&'static str] {
+    match name {
+        "tool.search" => &["core", "discover", "search"],
+        "tool.invoke" => &["core", "dispatch", "invoke"],
+        "claw.migrate" => &["migration", "migrate", "config", "legacy"],
+        "external_skills.fetch" => &["skills", "download", "external", "fetch"],
+        "external_skills.inspect" => &["skills", "inspect", "metadata"],
+        "external_skills.install" => &["skills", "install", "package"],
+        "external_skills.invoke" => &["skills", "invoke", "instructions"],
+        "external_skills.list" => &["skills", "list", "discover"],
+        "external_skills.policy" => &["skills", "policy", "security"],
+        "external_skills.remove" => &["skills", "remove", "uninstall"],
+        "browser.companion.session.start"
+        | "browser.companion.navigate"
+        | "browser.companion.snapshot"
+        | "browser.companion.wait"
+        | "browser.companion.session.stop" => &["browser", "companion", "session", "read"],
+        "browser.companion.click" | "browser.companion.type" => {
+            &["browser", "companion", "write", "approval"]
+        }
+        "file.read" => &["file", "read", "filesystem", "repo"],
+        "file.write" => &["file", "write", "filesystem"],
+        "shell.exec" => &["shell", "command", "process", "exec"],
+        "provider.switch" => &["provider", "switch", "model", "runtime"],
+        "delegate" | "delegate_async" => &["session", "delegate", "child"],
+        "session_archive" | "session_cancel" | "session_events" | "session_recover"
+        | "session_status" | "session_wait" | "sessions_history" | "sessions_list" => {
+            &["session", "history", "runtime"]
+        }
+        "sessions_send" => &["session", "message", "channel"],
+        _ => &[],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(feature = "tool-browser")]
+    #[test]
+    fn browser_companion_visibility_surface_requires_runtime_readiness_for_all_companion_tools() {
+        let catalog = tool_catalog();
+        let expected = [
+            ("browser.companion.session.start", ToolExecutionKind::Core),
+            ("browser.companion.navigate", ToolExecutionKind::Core),
+            ("browser.companion.snapshot", ToolExecutionKind::Core),
+            ("browser.companion.wait", ToolExecutionKind::Core),
+            ("browser.companion.session.stop", ToolExecutionKind::Core),
+            ("browser.companion.click", ToolExecutionKind::App),
+            ("browser.companion.type", ToolExecutionKind::App),
+        ];
+
+        let mut hidden = ToolRuntimeConfig::default();
+        hidden.browser_companion.enabled = true;
+        hidden.browser_companion.ready = false;
+        hidden.browser_companion.command = Some("browser-companion".to_owned());
+        let hidden_view = runtime_tool_view_for_runtime_config(&hidden);
+
+        let mut visible = ToolRuntimeConfig::default();
+        visible.browser_companion.enabled = true;
+        visible.browser_companion.ready = true;
+        visible.browser_companion.command = Some("browser-companion".to_owned());
+        let visible_view = runtime_tool_view_for_runtime_config(&visible);
+
+        for (tool_name, execution_kind) in expected {
+            let descriptor = catalog
+                .resolve(tool_name)
+                .unwrap_or_else(|| panic!("missing browser companion descriptor `{tool_name}`"));
+            assert_eq!(
+                descriptor.visibility_gate,
+                ToolVisibilityGate::BrowserCompanion
+            );
+            assert_eq!(descriptor.execution_kind, execution_kind);
+            assert!(
+                !hidden_view.contains(tool_name),
+                "tool should stay hidden until runtime-ready: {tool_name}"
+            );
+            assert!(
+                visible_view.contains(tool_name),
+                "tool should appear once runtime-ready: {tool_name}"
+            );
+        }
+    }
+
+    #[test]
+    fn browser_companion_visibility_gate_requires_runtime_readiness() {
+        let mut config = ToolRuntimeConfig::default();
+        config.browser_companion.enabled = true;
+        config.browser_companion.ready = false;
+        config.browser_companion.command = Some("browser-companion".to_owned());
+
+        assert!(!tool_visibility_gate_enabled_for_runtime_policy(
+            ToolVisibilityGate::BrowserCompanion,
+            &config
+        ));
+
+        config.browser_companion.ready = true;
+
+        assert!(tool_visibility_gate_enabled_for_runtime_policy(
+            ToolVisibilityGate::BrowserCompanion,
+            &config
+        ));
+    }
+
+    #[test]
+    fn browser_companion_visibility_gate_stays_hidden_for_config_only_views() {
+        let mut config = ToolConfig::default();
+        config.browser_companion.enabled = true;
+
+        assert!(!tool_visibility_gate_enabled_for_runtime_view(
+            ToolVisibilityGate::BrowserCompanion,
+            &config,
+            false
+        ));
+    }
+
+    #[test]
+    fn browser_visibility_gate_is_independent_from_companion_settings() {
+        let mut config = ToolRuntimeConfig::default();
+        config.browser.enabled = true;
+        config.browser_companion.enabled = false;
+        config.browser_companion.ready = false;
+
+        assert!(tool_visibility_gate_enabled_for_runtime_policy(
+            ToolVisibilityGate::Browser,
+            &config
+        ));
+    }
+
+    #[test]
+    fn delegate_child_tool_view_respects_visibility_gates() {
+        let mut config = ToolConfig::default();
+        config.web.enabled = false;
+        config.delegate.child_tool_allowlist = vec!["web.fetch".to_owned()];
+
+        let child_view = delegate_child_tool_view_for_config(&config);
+
+        assert!(!child_view.contains("web.fetch"));
+    }
+
+    #[test]
+    fn scheduling_class_marks_parallel_safe_subset() {
+        let catalog = tool_catalog();
+        assert_eq!(
+            catalog
+                .descriptor("tool.search")
+                .expect("tool.search descriptor")
+                .scheduling_class(),
+            ToolSchedulingClass::ParallelSafe
+        );
+        #[cfg(feature = "tool-file")]
+        assert_eq!(
+            catalog
+                .descriptor("file.read")
+                .expect("file.read descriptor")
+                .scheduling_class(),
+            ToolSchedulingClass::ParallelSafe
+        );
+        #[cfg(feature = "tool-webfetch")]
+        assert_eq!(
+            catalog
+                .descriptor("web.fetch")
+                .expect("web.fetch descriptor")
+                .scheduling_class(),
+            ToolSchedulingClass::ParallelSafe
+        );
+        assert_eq!(
+            catalog
+                .descriptor("sessions_list")
+                .expect("sessions_list descriptor")
+                .scheduling_class(),
+            ToolSchedulingClass::ParallelSafe
+        );
+        assert_eq!(
+            catalog
+                .descriptor("delegate_async")
+                .expect("delegate_async descriptor")
+                .scheduling_class(),
+            ToolSchedulingClass::SerialOnly
+        );
+    }
 }

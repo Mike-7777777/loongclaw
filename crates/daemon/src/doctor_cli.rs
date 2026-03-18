@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::env;
+use std::ffi::OsStr;
 use std::fs;
 use std::path::Path;
 
@@ -7,8 +8,10 @@ use loongclaw_app as mvp;
 use loongclaw_spec::CliResult;
 use serde_json::json;
 
+const MODEL_CATALOG_PROBE_FAILED_MARKER: &str = "model catalog probe failed";
+
 #[derive(Debug, Clone)]
-pub(crate) struct DoctorCommandOptions {
+pub struct DoctorCommandOptions {
     pub config: Option<String>,
     pub fix: bool,
     pub json: bool,
@@ -16,17 +19,17 @@ pub(crate) struct DoctorCommandOptions {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DoctorCheckLevel {
+pub enum DoctorCheckLevel {
     Pass,
     Warn,
     Fail,
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct DoctorCheck {
-    pub(crate) name: String,
-    pub(crate) level: DoctorCheckLevel,
-    pub(crate) detail: String,
+pub struct DoctorCheck {
+    pub name: String,
+    pub level: DoctorCheckLevel,
+    pub detail: String,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -42,7 +45,7 @@ struct DoctorChannelCheckSpec {
     runtime_name: Option<&'static str>,
 }
 
-pub(crate) async fn run_doctor_cli(options: DoctorCommandOptions) -> CliResult<()> {
+pub async fn run_doctor_cli(options: DoctorCommandOptions) -> CliResult<()> {
     let (config_path, mut config) = mvp::config::load(options.config.as_deref())?;
     let mut checks = Vec::new();
     let mut fixes = Vec::new();
@@ -52,28 +55,10 @@ pub(crate) async fn run_doctor_cli(options: DoctorCommandOptions) -> CliResult<(
     config_mutated |= maybe_apply_channel_env_fix(&mut config, options.fix, &mut fixes);
 
     let has_provider_credentials = mvp::provider::provider_auth_ready(&config).await;
-    if has_provider_credentials {
-        checks.push(DoctorCheck {
-            name: "provider credentials".to_owned(),
-            level: DoctorCheckLevel::Pass,
-            detail: "provider credentials are available".to_owned(),
-        });
-    } else {
-        let hints = crate::onboard_cli::provider_credential_env_hints(&config.provider);
-        let detail = if hints.is_empty() {
-            "provider credentials are missing".to_owned()
-        } else {
-            format!(
-                "provider credentials are missing (try env: {})",
-                hints.join(", ")
-            )
-        };
-        checks.push(DoctorCheck {
-            name: "provider credentials".to_owned(),
-            level: DoctorCheckLevel::Warn,
-            detail,
-        });
-    }
+    checks.push(provider_credentials_doctor_check(
+        &config,
+        has_provider_credentials,
+    ));
 
     checks.push(provider_transport_doctor_check(&config.provider));
 
@@ -96,11 +81,7 @@ pub(crate) async fn run_doctor_cli(options: DoctorCommandOptions) -> CliResult<(
                 level: DoctorCheckLevel::Pass,
                 detail: format!("{} model(s) available", models.len()),
             }),
-            Err(error) => checks.push(DoctorCheck {
-                name: "provider model probe".to_owned(),
-                level: DoctorCheckLevel::Fail,
-                detail: error,
-            }),
+            Err(error) => checks.push(provider_model_probe_failure_check(&config, error)),
         }
     }
 
@@ -151,9 +132,15 @@ pub(crate) async fn run_doctor_cli(options: DoctorCommandOptions) -> CliResult<(
         &mut fixes,
         "create tool file root",
     ));
+    checks.extend(collect_browser_companion_doctor_checks(&config).await);
 
     checks.extend(check_feishu_integration(&config, options.fix, &mut fixes));
     checks.extend(check_channel_surfaces(&config));
+    let path_env = env::var_os("PATH");
+    checks.extend(crate::browser_preview::browser_preview_check(
+        &config,
+        path_env.as_deref(),
+    ));
 
     if options.fix && config_mutated {
         let path = config_path
@@ -273,7 +260,7 @@ fn check_channel_surfaces(config: &mvp::config::LoongClawConfig) -> Vec<DoctorCh
     build_channel_surface_checks(&snapshots)
 }
 
-pub(crate) fn check_feishu_integration(
+pub fn check_feishu_integration(
     config: &mvp::config::LoongClawConfig,
     fix: bool,
     fixes: &mut Vec<String>,
@@ -970,7 +957,101 @@ fn provider_transport_doctor_check(provider: &mvp::config::ProviderConfig) -> Do
     }
 }
 
-#[cfg(test)]
+fn provider_credentials_doctor_check(
+    config: &mvp::config::LoongClawConfig,
+    has_provider_credentials: bool,
+) -> DoctorCheck {
+    let provider_label = crate::provider_presentation::active_provider_detail_label(config);
+    if has_provider_credentials {
+        return DoctorCheck {
+            name: "provider credentials".to_owned(),
+            level: DoctorCheckLevel::Pass,
+            detail: format!("{provider_label}: provider credentials are available"),
+        };
+    }
+
+    let hints = crate::onboard_cli::provider_credential_env_hints(&config.provider);
+    let detail = if hints.is_empty() {
+        "provider credentials are missing".to_owned()
+    } else {
+        format!(
+            "provider credentials are missing (try env: {})",
+            hints.join(", ")
+        )
+    };
+    DoctorCheck {
+        name: "provider credentials".to_owned(),
+        level: DoctorCheckLevel::Warn,
+        detail: format!("{provider_label}: {detail}"),
+    }
+}
+
+fn provider_model_probe_failure_check(
+    config: &mvp::config::LoongClawConfig,
+    error: String,
+) -> DoctorCheck {
+    let provider_prefix = crate::provider_presentation::active_provider_detail_label(config);
+    let auth_style_failure = mvp::provider::is_auth_style_failure_message(error.as_str());
+    let append_region_hint = |mut detail: String| {
+        if auth_style_failure && let Some(hint) = config.provider.region_endpoint_failure_hint() {
+            detail.push(' ');
+            detail.push_str(hint.as_str());
+        }
+        detail
+    };
+    let (level, detail) = match config.provider.model_catalog_probe_recovery() {
+        mvp::config::ModelCatalogProbeRecovery::ExplicitModel(model) => (
+            DoctorCheckLevel::Warn,
+            append_region_hint(format!(
+                "{provider_prefix}: {MODEL_CATALOG_PROBE_FAILED_MARKER} ({error}); chat may still work because model `{model}` is explicitly configured"
+            )),
+        ),
+        mvp::config::ModelCatalogProbeRecovery::ConfiguredPreferredModels(fallback_models) => (
+            DoctorCheckLevel::Warn,
+            append_region_hint(format!(
+                "{provider_prefix}: {MODEL_CATALOG_PROBE_FAILED_MARKER} ({error}); runtime will try configured preferred model fallback(s): {}",
+                fallback_models
+                    .iter()
+                    .map(|model| format!("`{model}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+        ),
+        mvp::config::ModelCatalogProbeRecovery::RequiresExplicitModel {
+            recommended_onboarding_model,
+        } => (
+            DoctorCheckLevel::Fail,
+            append_region_hint(provider_model_probe_requires_explicit_model_detail(
+                provider_prefix.as_str(),
+                error.as_str(),
+                recommended_onboarding_model,
+            )),
+        ),
+    };
+
+    DoctorCheck {
+        name: "provider model probe".to_owned(),
+        level,
+        detail,
+    }
+}
+
+fn provider_model_probe_requires_explicit_model_detail(
+    provider_prefix: &str,
+    error: &str,
+    recommended_onboarding_model: Option<&str>,
+) -> String {
+    match recommended_onboarding_model {
+        Some(model) => format!(
+            "{provider_prefix}: {MODEL_CATALOG_PROBE_FAILED_MARKER} ({error}); current config still uses `model = auto`; rerun onboarding and accept reviewed model `{model}`, or set `provider.model` / `preferred_models` explicitly"
+        ),
+        None => format!(
+            "{provider_prefix}: {MODEL_CATALOG_PROBE_FAILED_MARKER} ({error}); current config still uses `model = auto`; set `provider.model` explicitly or configure `preferred_models` before retrying"
+        ),
+    }
+}
+
+#[allow(dead_code)]
 fn collect_channel_doctor_checks(config: &mvp::config::LoongClawConfig) -> Vec<DoctorCheck> {
     crate::migration::channels::collect_channel_doctor_checks(config)
         .into_iter()
@@ -986,7 +1067,43 @@ fn collect_channel_doctor_checks(config: &mvp::config::LoongClawConfig) -> Vec<D
         .collect()
 }
 
-pub(crate) fn resolve_secret_value(inline: Option<&str>, env_key: Option<&str>) -> Option<String> {
+async fn collect_browser_companion_doctor_checks(
+    config: &mvp::config::LoongClawConfig,
+) -> Vec<DoctorCheck> {
+    let Some(diagnostics) =
+        crate::browser_companion_diagnostics::collect_browser_companion_diagnostics(config).await
+    else {
+        return Vec::new();
+    };
+
+    let install_level = if diagnostics.install_ready() {
+        DoctorCheckLevel::Pass
+    } else {
+        DoctorCheckLevel::Warn
+    };
+    let mut checks = vec![DoctorCheck {
+        name: crate::browser_companion_diagnostics::BROWSER_COMPANION_INSTALL_CHECK_NAME.to_owned(),
+        level: install_level,
+        detail: diagnostics.install_detail(),
+    }];
+
+    if let Some(detail) = diagnostics.runtime_gate_detail() {
+        checks.push(DoctorCheck {
+            name: crate::browser_companion_diagnostics::BROWSER_COMPANION_RUNTIME_GATE_CHECK_NAME
+                .to_owned(),
+            level: if diagnostics.runtime_ready {
+                DoctorCheckLevel::Pass
+            } else {
+                DoctorCheckLevel::Warn
+            },
+            detail,
+        });
+    }
+
+    checks
+}
+
+pub fn resolve_secret_value(inline: Option<&str>, env_key: Option<&str>) -> Option<String> {
     if let Some(value) = inline.map(str::trim).filter(|value| !value.is_empty()) {
         return Some(value.to_owned());
     }
@@ -1053,13 +1170,29 @@ fn build_doctor_next_steps(
     config: &mvp::config::LoongClawConfig,
     fix_requested: bool,
 ) -> Vec<String> {
+    let path_env = env::var_os("PATH");
+    build_doctor_next_steps_with_path_env(
+        checks,
+        config_path,
+        config,
+        fix_requested,
+        path_env.as_deref(),
+    )
+}
+
+fn build_doctor_next_steps_with_path_env(
+    checks: &[DoctorCheck],
+    config_path: &Path,
+    config: &mvp::config::LoongClawConfig,
+    fix_requested: bool,
+    path_env: Option<&OsStr>,
+) -> Vec<String> {
     let mut steps = Vec::new();
     let config_path_display = config_path.display().to_string();
-    let rerun_command = format!(
-        "{} doctor --config '{}'",
-        mvp::config::CLI_COMMAND_NAME,
-        config_path_display
-    );
+    let rerun_command =
+        crate::cli_handoff::format_subcommand_with_config("doctor", &config_path_display);
+    let rerun_onboard_command =
+        crate::cli_handoff::format_subcommand_with_config("onboard", &config_path_display);
 
     if !fix_requested
         && checks.iter().any(|check| {
@@ -1090,18 +1223,98 @@ fn build_doctor_next_steps(
         }
     }
 
-    if checks
-        .iter()
-        .any(|check| check.name == "provider model probe" && check.level == DoctorCheckLevel::Fail)
-    {
-        push_unique_step(
-            &mut steps,
-            format!("Retry provider probe only after credentials are ready: {rerun_command}"),
-        );
+    if checks.iter().any(|check| {
+        check.name == "provider model probe"
+            && check.level != DoctorCheckLevel::Pass
+            && check.detail.contains(MODEL_CATALOG_PROBE_FAILED_MARKER)
+    }) {
+        let provider_model_probe_auth_failure = checks.iter().any(|check| {
+            check.name == "provider model probe"
+                && check.level != DoctorCheckLevel::Pass
+                && check.detail.contains(MODEL_CATALOG_PROBE_FAILED_MARKER)
+                && mvp::provider::is_auth_style_failure_message(check.detail.as_str())
+        });
+        match config.provider.model_catalog_probe_recovery() {
+            mvp::config::ModelCatalogProbeRecovery::RequiresExplicitModel {
+                recommended_onboarding_model: Some(model),
+            } => {
+                push_unique_step(
+                    &mut steps,
+                    format!(
+                        "Rerun onboarding and accept reviewed model `{model}`: {rerun_onboard_command}"
+                    ),
+                );
+                push_unique_step(
+                    &mut steps,
+                    format!(
+                        "Or set `provider.model` / `preferred_models` explicitly, then re-run diagnostics: {rerun_command}"
+                    ),
+                );
+            }
+            mvp::config::ModelCatalogProbeRecovery::RequiresExplicitModel {
+                recommended_onboarding_model: None,
+            } => {
+                push_unique_step(
+                    &mut steps,
+                    format!(
+                        "Set `provider.model` / `preferred_models` explicitly, then re-run diagnostics: {rerun_command}"
+                    ),
+                );
+            }
+            mvp::config::ModelCatalogProbeRecovery::ExplicitModel(_)
+            | mvp::config::ModelCatalogProbeRecovery::ConfiguredPreferredModels(_) => {
+                push_unique_step(
+                    &mut steps,
+                    format!(
+                        "Retry provider probe only after credentials are ready: {rerun_command}"
+                    ),
+                );
+                push_unique_step(
+                    &mut steps,
+                    format!(
+                        "If your provider blocks model listing during setup, retry with: {rerun_command} --skip-model-probe"
+                    ),
+                );
+            }
+        }
+        if provider_model_probe_auth_failure
+            && let Some(hint) = config.provider.region_endpoint_failure_hint()
+        {
+            push_unique_step(&mut steps, hint);
+        }
+    }
+
+    if checks.iter().any(|check| {
+        check.name == crate::browser_companion_diagnostics::BROWSER_COMPANION_INSTALL_CHECK_NAME
+            && check.level != DoctorCheckLevel::Pass
+    }) {
         push_unique_step(
             &mut steps,
             format!(
-                "If your provider blocks model listing during setup, retry with: {rerun_command} --skip-model-probe"
+                "Install or expose the browser companion command on PATH, then re-run: {rerun_command}"
+            ),
+        );
+        if checks.iter().any(|check| {
+            check.name == crate::browser_companion_diagnostics::BROWSER_COMPANION_INSTALL_CHECK_NAME
+                && check.detail.contains("expected_version=")
+        }) {
+            push_unique_step(
+                &mut steps,
+                "Align `tools.browser_companion.expected_version` with the installed companion build before retrying."
+                    .to_owned(),
+            );
+        }
+    }
+
+    if checks.iter().any(|check| {
+        check.name
+            == crate::browser_companion_diagnostics::BROWSER_COMPANION_RUNTIME_GATE_CHECK_NAME
+            && check.level != DoctorCheckLevel::Pass
+    }) {
+        push_unique_step(
+            &mut steps,
+            format!(
+                "Keep using the built-in browser lane, or disable `tools.browser_companion.enabled` until the managed companion runtime is ready, then re-run: {rerun_command}"
             ),
         );
     }
@@ -1125,17 +1338,49 @@ fn build_doctor_next_steps(
     }
 
     if doctor_ready_for_first_turn(checks) {
-        for action in crate::next_actions::collect_setup_next_actions(config, &config_path_display)
-            .into_iter()
-            .take(2)
-        {
+        let mut browser_preview_needs_runtime_verify = false;
+        for action in select_doctor_first_turn_actions(
+            crate::next_actions::collect_setup_next_actions_with_path_env(
+                config,
+                &config_path_display,
+                path_env,
+            ),
+        ) {
             let prefix = match action.kind {
-                crate::next_actions::SetupNextActionKind::Ask => "Try a one-shot task",
-                crate::next_actions::SetupNextActionKind::Chat => "Open interactive chat",
+                crate::next_actions::SetupNextActionKind::Ask => "Get a first answer",
+                crate::next_actions::SetupNextActionKind::Chat => "Continue in chat",
                 crate::next_actions::SetupNextActionKind::Channel => "Open a channel",
+                crate::next_actions::SetupNextActionKind::BrowserPreview => {
+                    match action.browser_preview_phase {
+                        Some(crate::next_actions::BrowserPreviewActionPhase::Enable) => {
+                            "Optional browser preview"
+                        }
+                        Some(crate::next_actions::BrowserPreviewActionPhase::Unblock) => {
+                            "Unblock browser preview"
+                        }
+                        Some(crate::next_actions::BrowserPreviewActionPhase::InstallRuntime) => {
+                            "Install browser preview runtime"
+                        }
+                        Some(crate::next_actions::BrowserPreviewActionPhase::Ready) | None => {
+                            "Try browser companion preview"
+                        }
+                    }
+                }
                 crate::next_actions::SetupNextActionKind::Doctor => "Run diagnostics",
             };
+            if action.kind == crate::next_actions::SetupNextActionKind::BrowserPreview
+                && action.browser_preview_phase
+                    == Some(crate::next_actions::BrowserPreviewActionPhase::InstallRuntime)
+            {
+                browser_preview_needs_runtime_verify = true;
+            }
             push_unique_step(&mut steps, format!("{prefix}: {}", action.command));
+        }
+        if browser_preview_needs_runtime_verify {
+            push_unique_step(
+                &mut steps,
+                crate::browser_preview::browser_preview_verify_step(),
+            );
         }
     }
 
@@ -1159,6 +1404,63 @@ fn doctor_ready_for_first_turn(checks: &[DoctorCheck]) -> bool {
         })
 }
 
+fn select_doctor_first_turn_actions(
+    actions: Vec<crate::next_actions::SetupNextAction>,
+) -> Vec<crate::next_actions::SetupNextAction> {
+    let mut prioritized = Vec::new();
+
+    push_first_matching_action(&mut prioritized, &actions, |action| {
+        action.kind == crate::next_actions::SetupNextActionKind::Ask
+    });
+    push_first_matching_action(&mut prioritized, &actions, |action| {
+        action.kind == crate::next_actions::SetupNextActionKind::Chat
+    });
+    push_first_matching_action(&mut prioritized, &actions, |action| {
+        action.kind == crate::next_actions::SetupNextActionKind::BrowserPreview
+            && matches!(
+                action.browser_preview_phase,
+                Some(crate::next_actions::BrowserPreviewActionPhase::Ready)
+                    | Some(crate::next_actions::BrowserPreviewActionPhase::Unblock)
+                    | Some(crate::next_actions::BrowserPreviewActionPhase::Enable)
+                    | Some(crate::next_actions::BrowserPreviewActionPhase::InstallRuntime)
+            )
+    });
+
+    for action in actions {
+        push_unique_action(&mut prioritized, action);
+        if prioritized.len() == 3 {
+            break;
+        }
+    }
+
+    prioritized.truncate(3);
+    prioritized
+}
+
+fn push_first_matching_action<F>(
+    prioritized: &mut Vec<crate::next_actions::SetupNextAction>,
+    actions: &[crate::next_actions::SetupNextAction],
+    predicate: F,
+) where
+    F: Fn(&crate::next_actions::SetupNextAction) -> bool,
+{
+    if let Some(action) = actions.iter().find(|action| predicate(action)) {
+        push_unique_action(prioritized, action.clone());
+    }
+}
+
+fn push_unique_action(
+    prioritized: &mut Vec<crate::next_actions::SetupNextAction>,
+    action: crate::next_actions::SetupNextAction,
+) {
+    if prioritized
+        .iter()
+        .all(|existing| existing.command != action.command)
+    {
+        prioritized.push(action);
+    }
+}
+
 fn push_unique_step(steps: &mut Vec<String>, step: String) {
     if !steps.iter().any(|existing| existing == &step) {
         steps.push(step);
@@ -1167,6 +1469,16 @@ fn push_unique_step(steps: &mut Vec<String>, step: String) {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use std::ffi::OsString;
+    #[cfg(unix)]
+    use std::io::Write;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    #[cfg(unix)]
+    use std::path::{Path, PathBuf};
+    #[cfg(unix)]
+    use std::sync::MutexGuard;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1177,6 +1489,91 @@ mod tests {
         ChannelOperationHealth, ChannelOperationRuntime, ChannelOperationStatus,
         ChannelStatusSnapshot,
     };
+
+    fn browser_companion_temp_dir(label: &str) -> PathBuf {
+        static NEXT_TEMP_DIR_SEED: AtomicU64 = AtomicU64::new(1);
+        let seed = NEXT_TEMP_DIR_SEED.fetch_add(1, Ordering::Relaxed);
+        let temp_dir = std::env::temp_dir().join(format!(
+            "loongclaw-browser-companion-doctor-{label}-{}-{seed}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&temp_dir).expect("create browser companion temp dir");
+        temp_dir
+    }
+
+    #[cfg(unix)]
+    fn write_browser_companion_script(script_path: &Path, body: &str) {
+        let mut file = std::fs::File::create(script_path).expect("create browser companion script");
+        file.write_all(body.as_bytes())
+            .expect("write browser companion script");
+        let mut permissions = file.metadata().expect("script metadata").permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(script_path, permissions).expect("chmod browser companion script");
+    }
+
+    #[cfg(unix)]
+    struct BrowserCompanionEnvGuard {
+        _lock: MutexGuard<'static, ()>,
+        saved_ready: Option<OsString>,
+    }
+
+    #[cfg(unix)]
+    fn set_browser_companion_env_var(key: &str, value: &str) {
+        // SAFETY: daemon tests serialize process env mutations behind
+        // `lock_daemon_test_environment`, so no concurrent env readers/writers
+        // observe racy updates while these tests run.
+        #[allow(unsafe_code, clippy::disallowed_methods)]
+        unsafe {
+            std::env::set_var(key, value);
+        }
+    }
+
+    #[cfg(unix)]
+    fn remove_browser_companion_env_var(key: &str) {
+        // SAFETY: daemon tests serialize process env mutations behind
+        // `lock_daemon_test_environment`, so removing the variable here is
+        // coordinated with all other env-mutating daemon tests.
+        #[allow(unsafe_code, clippy::disallowed_methods)]
+        unsafe {
+            std::env::remove_var(key);
+        }
+    }
+
+    #[cfg(unix)]
+    impl BrowserCompanionEnvGuard {
+        fn runtime_gate_closed() -> Self {
+            Self::set_ready(None)
+        }
+
+        fn runtime_gate_open() -> Self {
+            Self::set_ready(Some("true"))
+        }
+
+        fn set_ready(value: Option<&str>) -> Self {
+            let lock = crate::test_support::lock_daemon_test_environment();
+            let key = "LOONGCLAW_BROWSER_COMPANION_READY";
+            let saved_ready = std::env::var_os(key);
+            match value {
+                Some(value) => set_browser_companion_env_var(key, value),
+                None => remove_browser_companion_env_var(key),
+            }
+            Self {
+                _lock: lock,
+                saved_ready,
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for BrowserCompanionEnvGuard {
+        fn drop(&mut self) {
+            let key = "LOONGCLAW_BROWSER_COMPANION_READY";
+            match self.saved_ready.take() {
+                Some(value) => set_browser_companion_env_var(key, &value.to_string_lossy()),
+                None => remove_browser_companion_env_var(key),
+            }
+        }
+    }
 
     #[test]
     fn resolve_secret_prefers_inline_value() {
@@ -1329,6 +1726,207 @@ mod tests {
                 .detail
                 .contains("retry chat_completions automatically"),
             "doctor should surface the automatic transport fallback in review mode: {check:#?}"
+        );
+    }
+
+    #[test]
+    fn provider_model_probe_failure_warns_for_explicit_model() {
+        let mut config = mvp::config::LoongClawConfig::default();
+        config.provider.model = "openai/gpt-5.1-codex".to_owned();
+
+        let check = provider_model_probe_failure_check(
+            &config,
+            "provider rejected the model list".to_owned(),
+        );
+
+        assert_eq!(check.name, "provider model probe");
+        assert_eq!(check.level, DoctorCheckLevel::Warn);
+        assert!(
+            check.detail.contains("explicitly configured"),
+            "doctor should explain that explicit-model runtime may still work when catalog probing fails: {check:#?}"
+        );
+    }
+
+    #[test]
+    fn provider_model_probe_failure_fails_for_auto_model() {
+        let mut config = mvp::config::LoongClawConfig::default();
+        config.provider.model = "auto".to_owned();
+
+        let check = provider_model_probe_failure_check(
+            &config,
+            "provider rejected the model list".to_owned(),
+        );
+
+        assert_eq!(check.name, "provider model probe");
+        assert_eq!(check.level, DoctorCheckLevel::Fail);
+        assert!(
+            check.detail.contains("OpenAI [openai]"),
+            "doctor failures should still identify the active provider context: {check:#?}"
+        );
+        assert!(
+            check.detail.contains("model = auto"),
+            "doctor failures should explain why runtime cannot rely on an unresolved automatic model: {check:#?}"
+        );
+        assert!(
+            check.detail.contains("provider.model"),
+            "doctor failures should point users to an explicit provider.model remediation path: {check:#?}"
+        );
+        assert!(
+            check.detail.contains("preferred_models"),
+            "doctor failures should point users to preferred_models when catalog probing is unavailable: {check:#?}"
+        );
+    }
+
+    #[test]
+    fn provider_model_probe_failure_warns_for_preferred_model_fallbacks() {
+        let mut config = mvp::config::LoongClawConfig::default();
+        config.provider.kind = mvp::config::ProviderKind::Minimax;
+        config.provider.model = "auto".to_owned();
+        config.provider.preferred_models = vec!["MiniMax-M1".to_owned()];
+
+        let check = provider_model_probe_failure_check(
+            &config,
+            "provider rejected the model list".to_owned(),
+        );
+
+        assert_eq!(check.name, "provider model probe");
+        assert_eq!(check.level, DoctorCheckLevel::Warn);
+        assert!(
+            check.detail.contains("configured preferred"),
+            "doctor should only advertise fallback continuation for explicitly configured preferred models: {check:#?}"
+        );
+        assert!(
+            check.detail.contains("MiniMax-M1"),
+            "doctor warning should surface the fallback candidate to keep remediation concrete: {check:#?}"
+        );
+    }
+
+    #[test]
+    fn provider_model_probe_failure_guides_reviewed_default_for_auto_model() {
+        let mut config = mvp::config::LoongClawConfig::default();
+        config.provider.kind = mvp::config::ProviderKind::Deepseek;
+        config.provider.model = "auto".to_owned();
+
+        let check = provider_model_probe_failure_check(
+            &config,
+            "provider rejected the model list".to_owned(),
+        );
+
+        assert_eq!(check.name, "provider model probe");
+        assert_eq!(check.level, DoctorCheckLevel::Fail);
+        assert!(
+            check.detail.contains("deepseek-chat"),
+            "reviewed providers should point users to the reviewed onboarding default when doctor cannot list models: {check:#?}"
+        );
+        assert!(
+            check.detail.contains("rerun onboarding"),
+            "doctor should suggest rerunning onboarding to accept the reviewed model instead of leaving recovery implicit: {check:#?}"
+        );
+    }
+
+    #[test]
+    fn provider_model_probe_failure_includes_region_hint_for_zhipu() {
+        let mut config = mvp::config::LoongClawConfig::default();
+        config.provider.kind = mvp::config::ProviderKind::Zhipu;
+        config.provider.model = "auto".to_owned();
+
+        let check =
+            provider_model_probe_failure_check(&config, "provider returned status 401".to_owned());
+
+        assert_eq!(check.name, "provider model probe");
+        assert_eq!(check.level, DoctorCheckLevel::Fail);
+        assert!(
+            check.detail.contains("https://api.z.ai"),
+            "doctor probe failures should surface the alternate regional endpoint when auth can be region-bound: {check:#?}"
+        );
+    }
+
+    #[test]
+    fn provider_model_probe_failure_skips_region_hint_for_non_auth_errors() {
+        let mut config = mvp::config::LoongClawConfig::default();
+        config.provider.kind = mvp::config::ProviderKind::Zhipu;
+        config.provider.model = "auto".to_owned();
+
+        let check =
+            provider_model_probe_failure_check(&config, "provider returned status 503".to_owned());
+
+        assert_eq!(check.name, "provider model probe");
+        assert_eq!(check.level, DoctorCheckLevel::Fail);
+        assert!(
+            !check.detail.contains("provider.base_url"),
+            "non-auth doctor probe failures should not steer operators toward region endpoint changes: {check:#?}"
+        );
+    }
+
+    #[test]
+    fn build_doctor_next_steps_includes_region_endpoint_step_for_minimax_probe_failures() {
+        let mut config = mvp::config::LoongClawConfig::default();
+        config.provider.kind = mvp::config::ProviderKind::Minimax;
+        let checks = vec![
+            DoctorCheck {
+                name: "provider credentials".to_owned(),
+                level: DoctorCheckLevel::Pass,
+                detail: "provider credentials are available".to_owned(),
+            },
+            DoctorCheck {
+                name: "provider model probe".to_owned(),
+                level: DoctorCheckLevel::Fail,
+                detail:
+                    "MiniMax [minimax]: model catalog probe failed (provider returned status 401)"
+                        .to_owned(),
+            },
+        ];
+
+        let next_steps = build_doctor_next_steps_with_path_env(
+            &checks,
+            Path::new("/tmp/loongclaw.toml"),
+            &config,
+            false,
+            Some(std::ffi::OsStr::new("")),
+        );
+
+        assert!(
+            next_steps.iter().any(|step| {
+                step.contains("provider.base_url")
+                    && step.contains("https://api.minimax.io")
+                    && step.contains("https://api.minimaxi.com")
+            }),
+            "doctor next steps should include a concrete region endpoint adjustment for MiniMax auth/probe failures: {next_steps:#?}"
+        );
+    }
+
+    #[test]
+    fn build_doctor_next_steps_skips_region_endpoint_step_for_non_auth_probe_failures() {
+        let mut config = mvp::config::LoongClawConfig::default();
+        config.provider.kind = mvp::config::ProviderKind::Minimax;
+        let checks = vec![
+            DoctorCheck {
+                name: "provider credentials".to_owned(),
+                level: DoctorCheckLevel::Pass,
+                detail: "provider credentials are available".to_owned(),
+            },
+            DoctorCheck {
+                name: "provider model probe".to_owned(),
+                level: DoctorCheckLevel::Fail,
+                detail:
+                    "MiniMax [minimax]: model catalog probe failed (provider returned status 503)"
+                        .to_owned(),
+            },
+        ];
+
+        let next_steps = build_doctor_next_steps_with_path_env(
+            &checks,
+            Path::new("/tmp/loongclaw.toml"),
+            &config,
+            false,
+            Some(std::ffi::OsStr::new("")),
+        );
+
+        assert!(
+            !next_steps
+                .iter()
+                .any(|step| step.contains("provider.base_url")),
+            "doctor next steps should not include a region endpoint adjustment for non-auth probe failures: {next_steps:#?}"
         );
     }
 
@@ -1834,11 +2432,12 @@ mod tests {
                 detail: "/tmp/loongclaw-memory is missing".to_owned(),
             },
         ];
-        let next_steps = build_doctor_next_steps(
+        let next_steps = build_doctor_next_steps_with_path_env(
             &checks,
             Path::new("/tmp/loongclaw.toml"),
             &mvp::config::LoongClawConfig::default(),
             false,
+            Some(std::ffi::OsStr::new("")),
         );
 
         assert_eq!(
@@ -1859,6 +2458,291 @@ mod tests {
     }
 
     #[test]
+    fn build_doctor_next_steps_shell_quotes_config_paths_with_single_quotes() {
+        let checks = vec![DoctorCheck {
+            name: "memory path".to_owned(),
+            level: DoctorCheckLevel::Fail,
+            detail: "/tmp/loongclaw-memory is missing".to_owned(),
+        }];
+        let next_steps = build_doctor_next_steps(
+            &checks,
+            Path::new("/tmp/loongclaw's config.toml"),
+            &mvp::config::LoongClawConfig::default(),
+            false,
+        );
+
+        assert!(
+            next_steps.iter().any(|step| {
+                step == "Apply safe local repairs: loongclaw doctor --config '/tmp/loongclaw'\"'\"'s config.toml' --fix"
+            }),
+            "doctor should shell-quote config paths with single quotes in fix commands: {next_steps:#?}"
+        );
+        assert!(
+            next_steps.iter().any(|step| {
+                step == "Re-run diagnostics: loongclaw doctor --config '/tmp/loongclaw'\"'\"'s config.toml'"
+            }),
+            "doctor should shell-quote config paths with single quotes in rerun commands: {next_steps:#?}"
+        );
+    }
+
+    #[test]
+    fn build_doctor_next_steps_guides_browser_companion_repair() {
+        let checks = vec![DoctorCheck {
+            name: "browser companion install".to_owned(),
+            level: DoctorCheckLevel::Warn,
+            detail: "command `loongclaw-browser-companion` was not found on PATH".to_owned(),
+        }];
+        let next_steps = build_doctor_next_steps_with_path_env(
+            &checks,
+            Path::new("/tmp/loongclaw.toml"),
+            &mvp::config::LoongClawConfig::default(),
+            false,
+            Some(std::ffi::OsStr::new("")),
+        );
+
+        assert!(
+            next_steps.iter().any(|step| {
+                step == "Install or expose the browser companion command on PATH, then re-run: loongclaw doctor --config '/tmp/loongclaw.toml'"
+            }),
+            "doctor should turn browser companion warnings into a concrete repair path: {next_steps:#?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn browser_companion_doctor_checks_warn_when_command_is_missing() {
+        let _env_guard = BrowserCompanionEnvGuard::runtime_gate_closed();
+        let mut config = mvp::config::LoongClawConfig::default();
+        config.tools.browser_companion.enabled = true;
+
+        let checks = collect_browser_companion_doctor_checks(&config).await;
+
+        assert!(
+            checks.iter().any(|check| {
+                check.name == "browser companion install"
+                    && check.level == DoctorCheckLevel::Warn
+                    && check.detail.contains("no command is configured")
+            }),
+            "doctor should warn when browser companion is enabled without a command: {checks:#?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn browser_companion_doctor_checks_warn_when_expected_version_mismatches() {
+        let _env_guard = BrowserCompanionEnvGuard::runtime_gate_closed();
+        let temp_dir = browser_companion_temp_dir("version-mismatch");
+        let script_path = temp_dir.join("browser-companion");
+        write_browser_companion_script(
+            &script_path,
+            "#!/bin/sh\necho 'loongclaw-browser-companion 1.4.0'\n",
+        );
+
+        let mut config = mvp::config::LoongClawConfig::default();
+        config.tools.browser_companion.enabled = true;
+        config.tools.browser_companion.command = Some(script_path.display().to_string());
+        config.tools.browser_companion.expected_version = Some("1.5.0".to_owned());
+
+        let checks = collect_browser_companion_doctor_checks(&config).await;
+
+        assert!(
+            checks.iter().any(|check| {
+                check.name == "browser companion install"
+                    && check.level == DoctorCheckLevel::Warn
+                    && check.detail.contains("expected_version=1.5.0")
+                    && check
+                        .detail
+                        .contains("observed_version=loongclaw-browser-companion 1.4.0")
+            }),
+            "doctor should surface version mismatches for the managed companion lane: {checks:#?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn browser_companion_doctor_checks_warn_when_runtime_gate_is_closed() {
+        let _env_guard = BrowserCompanionEnvGuard::runtime_gate_closed();
+        let temp_dir = browser_companion_temp_dir("runtime-gate");
+        let script_path = temp_dir.join("browser-companion");
+        write_browser_companion_script(
+            &script_path,
+            "#!/bin/sh\necho 'loongclaw-browser-companion 1.5.0'\n",
+        );
+
+        let mut config = mvp::config::LoongClawConfig::default();
+        config.tools.browser_companion.enabled = true;
+        config.tools.browser_companion.command = Some(script_path.display().to_string());
+        config.tools.browser_companion.expected_version = Some("1.5.0".to_owned());
+
+        let checks = collect_browser_companion_doctor_checks(&config).await;
+
+        assert!(
+            checks.iter().any(|check| {
+                check.name == "browser companion runtime gate"
+                    && check.level == DoctorCheckLevel::Warn
+                    && check.detail.contains("install looks healthy")
+            }),
+            "doctor should distinguish healthy companion installs from a still-closed runtime gate: {checks:#?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn browser_companion_doctor_checks_pass_when_runtime_gate_is_open() {
+        let _env_guard = BrowserCompanionEnvGuard::runtime_gate_open();
+        let temp_dir = browser_companion_temp_dir("runtime-ready");
+        let script_path = temp_dir.join("browser-companion");
+        write_browser_companion_script(
+            &script_path,
+            "#!/bin/sh\necho 'loongclaw-browser-companion 1.5.0'\n",
+        );
+
+        let mut config = mvp::config::LoongClawConfig::default();
+        config.tools.browser_companion.enabled = true;
+        config.tools.browser_companion.command = Some(script_path.display().to_string());
+        config.tools.browser_companion.expected_version = Some("1.5.0".to_owned());
+
+        let checks = collect_browser_companion_doctor_checks(&config).await;
+
+        assert!(
+            checks.iter().any(|check| {
+                check.name == "browser companion install"
+                    && check.level == DoctorCheckLevel::Pass
+                    && check.detail.contains("responded with")
+            }),
+            "doctor should mark the companion install healthy when the version probe matches: {checks:#?}"
+        );
+        assert!(
+            checks.iter().any(|check| {
+                check.name == "browser companion runtime gate"
+                    && check.level == DoctorCheckLevel::Pass
+                    && check.detail.contains("runtime is ready")
+            }),
+            "doctor should mark the runtime gate healthy when the companion lane is opened: {checks:#?}"
+        );
+    }
+
+    #[test]
+    fn build_doctor_next_steps_guides_reviewed_onboarding_default_for_auto_model_probe_failures() {
+        let checks = vec![DoctorCheck {
+            name: "provider model probe".to_owned(),
+            level: DoctorCheckLevel::Fail,
+            detail: "DeepSeek [deepseek]: model catalog probe failed (401 Unauthorized); current config still uses `model = auto`; rerun onboarding and accept reviewed model `deepseek-chat`, or set `provider.model` / `preferred_models` explicitly".to_owned(),
+        }];
+        let mut config = mvp::config::LoongClawConfig::default();
+        config.provider.kind = mvp::config::ProviderKind::Deepseek;
+        config.provider.model = "auto".to_owned();
+
+        let next_steps =
+            build_doctor_next_steps(&checks, Path::new("/tmp/loongclaw.toml"), &config, false);
+
+        assert!(
+            next_steps.iter().any(|step| {
+                step == "Rerun onboarding and accept reviewed model `deepseek-chat`: loongclaw onboard --config '/tmp/loongclaw.toml'"
+            }),
+            "doctor should point reviewed providers back to onboarding when auto-model recovery needs an explicit reviewed default: {next_steps:#?}"
+        );
+        assert!(
+            next_steps.iter().any(|step| {
+                step == "Or set `provider.model` / `preferred_models` explicitly, then re-run diagnostics: loongclaw doctor --config '/tmp/loongclaw.toml'"
+            }),
+            "doctor should also keep the manual remediation path explicit for operators who do not want to rerun onboarding: {next_steps:#?}"
+        );
+        assert!(
+            next_steps
+                .iter()
+                .all(|step| !step.contains("--skip-model-probe")),
+            "doctor should not suggest --skip-model-probe when the real blocker is still `model = auto` without explicit recovery candidates: {next_steps:#?}"
+        );
+    }
+
+    #[test]
+    fn build_doctor_next_steps_guides_warn_level_explicit_model_probe_recovery() {
+        let checks = vec![DoctorCheck {
+            name: "provider model probe".to_owned(),
+            level: DoctorCheckLevel::Warn,
+            detail: "DeepSeek [deepseek]: model catalog probe failed (401 Unauthorized); chat may still work because model `deepseek-chat` is explicitly configured".to_owned(),
+        }];
+        let mut config = mvp::config::LoongClawConfig::default();
+        config.provider.kind = mvp::config::ProviderKind::Deepseek;
+        config.provider.model = "deepseek-chat".to_owned();
+
+        let next_steps =
+            build_doctor_next_steps(&checks, Path::new("/tmp/loongclaw.toml"), &config, false);
+
+        assert!(
+            next_steps.iter().any(|step| {
+                step == "Retry provider probe only after credentials are ready: loongclaw doctor --config '/tmp/loongclaw.toml'"
+            }),
+            "warn-level explicit model recovery should still tell operators how to retry diagnostics: {next_steps:#?}"
+        );
+        assert!(
+            next_steps.iter().any(|step| {
+                step == "If your provider blocks model listing during setup, retry with: loongclaw doctor --config '/tmp/loongclaw.toml' --skip-model-probe"
+            }),
+            "warn-level explicit model recovery should still keep the skip-model-probe escape hatch visible: {next_steps:#?}"
+        );
+    }
+
+    #[test]
+    fn build_doctor_next_steps_guides_warn_level_preferred_model_probe_recovery() {
+        let checks = vec![DoctorCheck {
+            name: "provider model probe".to_owned(),
+            level: DoctorCheckLevel::Warn,
+            detail: "DeepSeek [deepseek]: model catalog probe failed (401 Unauthorized); runtime will try configured preferred model fallback(s): `deepseek-chat`, `deepseek-reasoner`".to_owned(),
+        }];
+        let mut config = mvp::config::LoongClawConfig::default();
+        config.provider.kind = mvp::config::ProviderKind::Deepseek;
+        config.provider.model = "auto".to_owned();
+        config.provider.preferred_models =
+            vec!["deepseek-chat".to_owned(), "deepseek-reasoner".to_owned()];
+
+        let next_steps =
+            build_doctor_next_steps(&checks, Path::new("/tmp/loongclaw.toml"), &config, false);
+
+        assert!(
+            next_steps.iter().any(|step| {
+                step == "Retry provider probe only after credentials are ready: loongclaw doctor --config '/tmp/loongclaw.toml'"
+            }),
+            "warn-level preferred-model recovery should still tell operators how to retry diagnostics: {next_steps:#?}"
+        );
+        assert!(
+            next_steps.iter().any(|step| {
+                step == "If your provider blocks model listing during setup, retry with: loongclaw doctor --config '/tmp/loongclaw.toml' --skip-model-probe"
+            }),
+            "warn-level preferred-model recovery should still keep the skip-model-probe escape hatch visible: {next_steps:#?}"
+        );
+    }
+
+    #[test]
+    fn build_doctor_next_steps_ignores_non_failure_model_probe_warnings() {
+        let checks = vec![DoctorCheck {
+            name: "provider model probe".to_owned(),
+            level: DoctorCheckLevel::Warn,
+            detail: "skipped because credentials are missing".to_owned(),
+        }];
+        let mut config = mvp::config::LoongClawConfig::default();
+        config.provider.kind = mvp::config::ProviderKind::Deepseek;
+        config.provider.model = "deepseek-chat".to_owned();
+
+        let next_steps =
+            build_doctor_next_steps(&checks, Path::new("/tmp/loongclaw.toml"), &config, false);
+
+        assert!(
+            next_steps
+                .iter()
+                .all(|step| !step.contains("Retry provider probe only after credentials are ready")),
+            "skipped probe warnings should not look like real model catalog failures: {next_steps:#?}"
+        );
+        assert!(
+            next_steps
+                .iter()
+                .all(|step| !step.contains("--skip-model-probe")),
+            "skipped probe warnings should not advertise the skip-model-probe recovery branch: {next_steps:#?}"
+        );
+    }
+
+    #[test]
     fn build_doctor_next_steps_promotes_ask_and_chat_when_green() {
         let checks = vec![
             DoctorCheck {
@@ -1872,24 +2756,124 @@ mod tests {
                 detail: "responses api".to_owned(),
             },
         ];
-        let next_steps = build_doctor_next_steps(
+        let next_steps = build_doctor_next_steps_with_path_env(
             &checks,
             Path::new("/tmp/loongclaw.toml"),
             &mvp::config::LoongClawConfig::default(),
             false,
+            Some(std::ffi::OsStr::new("")),
         );
 
         assert!(
             next_steps.iter().any(|step| {
-                step == "Try a one-shot task: loongclaw ask --config '/tmp/loongclaw.toml' --message \"Summarize this repository and suggest the best next step.\""
+                step == "Get a first answer: loongclaw ask --config '/tmp/loongclaw.toml' --message 'Summarize this repository and suggest the best next step.'"
             }),
             "green doctor runs should hand the user into ask immediately: {next_steps:#?}"
         );
         assert!(
             next_steps.iter().any(|step| {
-                step == "Open interactive chat: loongclaw chat --config '/tmp/loongclaw.toml'"
+                step == "Continue in chat: loongclaw chat --config '/tmp/loongclaw.toml'"
             }),
             "green doctor runs should still advertise chat as the follow-up path: {next_steps:#?}"
+        );
+        assert!(
+            next_steps.iter().any(|step| {
+                step == "Optional browser preview: loongclaw skills enable-browser-preview --config '/tmp/loongclaw.toml'"
+            }),
+            "green doctor runs should surface the optional browser preview with a single concrete command: {next_steps:#?}"
+        );
+        assert!(
+            !next_steps.iter().any(|step| {
+                step == "Install browser preview runtime: npm install -g agent-browser && agent-browser install"
+            }),
+            "green doctor runs should not push runtime install steps before preview has been enabled: {next_steps:#?}"
+        );
+        assert!(
+            !next_steps.iter().any(
+                |step| step == "Verify browser preview runtime: agent-browser open example.com"
+            ),
+            "green doctor runs should not ask for runtime verification before preview has been enabled: {next_steps:#?}"
+        );
+    }
+
+    #[test]
+    fn build_doctor_next_steps_guides_browser_companion_preview_setup() {
+        let root = browser_companion_temp_dir("preview-runtime-missing");
+        let install_root = root.join("managed-skills");
+        std::fs::create_dir_all(install_root.join("browser-companion-preview"))
+            .expect("create managed skill directory");
+        std::fs::write(
+            install_root
+                .join("browser-companion-preview")
+                .join("SKILL.md"),
+            "# Browser Companion Preview\n\nUse agent-browser through shell.exec.\n",
+        )
+        .expect("write managed preview skill");
+        let checks = vec![DoctorCheck {
+            name: "provider credentials".to_owned(),
+            level: DoctorCheckLevel::Pass,
+            detail: "provider credentials are available".to_owned(),
+        }];
+        let mut config = mvp::config::LoongClawConfig::default();
+        config.tools.file_root = Some(root.display().to_string());
+        config.tools.shell_allow.push("agent-browser".to_owned());
+        config.external_skills.enabled = true;
+        config.external_skills.auto_expose_installed = true;
+        config.external_skills.install_root = Some(install_root.display().to_string());
+
+        let next_steps = build_doctor_next_steps_with_path_env(
+            &checks,
+            Path::new("/tmp/loongclaw.toml"),
+            &config,
+            false,
+            Some(std::ffi::OsStr::new("")),
+        );
+
+        assert!(
+            next_steps.iter().any(|step| {
+                step == "Install browser preview runtime: npm install -g agent-browser && agent-browser install"
+            }),
+            "doctor should point preview-enabled operators at a concrete runtime install action when agent-browser is missing: {next_steps:#?}"
+        );
+        assert!(
+            next_steps.iter().any(|step| {
+                step == "Verify browser preview runtime: agent-browser open example.com"
+            }),
+            "doctor should still surface a verification step after the runtime install hint: {next_steps:#?}"
+        );
+        assert!(
+            !next_steps.iter().any(|step| {
+                step == "Optional browser preview: loongclaw skills enable-browser-preview --config '/tmp/loongclaw.toml'"
+            }),
+            "doctor should not fall back to the optional enable step after preview has already been configured: {next_steps:#?}"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn build_doctor_next_steps_keeps_browser_preview_visible_when_channels_are_enabled() {
+        let checks = vec![DoctorCheck {
+            name: "provider credentials".to_owned(),
+            level: DoctorCheckLevel::Pass,
+            detail: "provider credentials are available".to_owned(),
+        }];
+        let mut config = mvp::config::LoongClawConfig::default();
+        config.telegram.enabled = true;
+
+        let next_steps = build_doctor_next_steps_with_path_env(
+            &checks,
+            Path::new("/tmp/loongclaw.toml"),
+            &config,
+            false,
+            Some(std::ffi::OsStr::new("")),
+        );
+
+        assert!(
+            next_steps.iter().any(|step| {
+                step == "Optional browser preview: loongclaw skills enable-browser-preview --config '/tmp/loongclaw.toml'"
+            }),
+            "doctor should keep a browser preview action visible even when channel actions are available: {next_steps:#?}"
         );
     }
 }

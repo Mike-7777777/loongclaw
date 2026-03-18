@@ -7,16 +7,93 @@ use loongclaw_contracts::{Capability, MemoryCoreRequest};
 use serde_json::{Value, json};
 
 use crate::CliResult;
+use crate::KernelContext;
 #[cfg(feature = "memory-sqlite")]
 use crate::memory;
 #[cfg(feature = "memory-sqlite")]
 use crate::memory::runtime_config::MemoryRuntimeConfig;
 
 use super::analytics::{
-    SafeLaneEventSummary, TurnCheckpointEventSummary, summarize_safe_lane_events,
+    DiscoveryFirstEventSummary, SafeLaneEventSummary, TurnCheckpointEventSummary,
+    summarize_discovery_first_events, summarize_safe_lane_events,
     summarize_turn_checkpoint_history,
 };
 use super::runtime_binding::ConversationRuntimeBinding;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AssistantHistoryLoadErrorCode {
+    DirectReadFailed,
+    KernelRequestFailed,
+    KernelNonOkStatus,
+    KernelMalformedPayload,
+}
+
+impl AssistantHistoryLoadErrorCode {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::DirectReadFailed => "direct_read_failed",
+            Self::KernelRequestFailed => "kernel_request_failed",
+            Self::KernelNonOkStatus => "kernel_non_ok_status",
+            Self::KernelMalformedPayload => "kernel_malformed_payload",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AssistantHistoryLoadError {
+    code: AssistantHistoryLoadErrorCode,
+    message: String,
+}
+
+impl AssistantHistoryLoadError {
+    #[cfg(feature = "memory-sqlite")]
+    fn direct_read_failed(error: impl std::fmt::Display) -> Self {
+        Self {
+            code: AssistantHistoryLoadErrorCode::DirectReadFailed,
+            message: format!("direct read failed: {error}"),
+        }
+    }
+
+    #[cfg(feature = "memory-sqlite")]
+    fn kernel_request_failed(error: impl std::fmt::Display) -> Self {
+        Self {
+            code: AssistantHistoryLoadErrorCode::KernelRequestFailed,
+            message: format!("load assistant history via kernel failed: {error}"),
+        }
+    }
+
+    #[cfg(feature = "memory-sqlite")]
+    fn kernel_non_ok_status(status: impl AsRef<str>) -> Self {
+        Self {
+            code: AssistantHistoryLoadErrorCode::KernelNonOkStatus,
+            message: format!(
+                "load assistant history via kernel returned non-ok status: {}",
+                status.as_ref()
+            ),
+        }
+    }
+
+    #[cfg(feature = "memory-sqlite")]
+    fn kernel_malformed_payload(reason: impl AsRef<str>) -> Self {
+        Self {
+            code: AssistantHistoryLoadErrorCode::KernelMalformedPayload,
+            message: format!(
+                "load assistant history via kernel returned malformed payload: {}",
+                reason.as_ref()
+            ),
+        }
+    }
+
+    pub(crate) fn code(&self) -> AssistantHistoryLoadErrorCode {
+        self.code
+    }
+}
+
+impl std::fmt::Display for AssistantHistoryLoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TurnCheckpointLatestEntry {
@@ -105,6 +182,48 @@ pub async fn load_safe_lane_event_summary(
     }
 }
 
+pub async fn load_discovery_first_event_summary(
+    session_id: &str,
+    limit: usize,
+    kernel_ctx: Option<&KernelContext>,
+    #[cfg(feature = "memory-sqlite")] memory_config: &MemoryRuntimeConfig,
+) -> CliResult<DiscoveryFirstEventSummary> {
+    load_discovery_first_event_summary_with_binding(
+        session_id,
+        limit,
+        kernel_ctx.map_or_else(
+            ConversationRuntimeBinding::direct,
+            ConversationRuntimeBinding::kernel,
+        ),
+        #[cfg(feature = "memory-sqlite")]
+        memory_config,
+    )
+    .await
+}
+
+pub(crate) async fn load_discovery_first_event_summary_with_binding(
+    session_id: &str,
+    limit: usize,
+    binding: ConversationRuntimeBinding<'_>,
+    #[cfg(feature = "memory-sqlite")] memory_config: &MemoryRuntimeConfig,
+) -> CliResult<DiscoveryFirstEventSummary> {
+    #[cfg(feature = "memory-sqlite")]
+    {
+        let assistant_contents =
+            load_assistant_contents_from_session_window(session_id, limit, binding, memory_config)
+                .await?;
+        Ok(summarize_discovery_first_events(
+            assistant_contents.iter().map(String::as_str),
+        ))
+    }
+
+    #[cfg(not(feature = "memory-sqlite"))]
+    {
+        let _ = (session_id, limit, binding);
+        Err("discovery-first summary unavailable: memory-sqlite feature disabled".to_owned())
+    }
+}
+
 pub(crate) async fn load_latest_turn_checkpoint_entry(
     session_id: &str,
     limit: usize,
@@ -147,6 +266,18 @@ pub(crate) async fn load_assistant_contents_from_session_window(
     binding: ConversationRuntimeBinding<'_>,
     memory_config: &MemoryRuntimeConfig,
 ) -> CliResult<Vec<String>> {
+    load_assistant_contents_from_session_window_detailed(session_id, limit, binding, memory_config)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(feature = "memory-sqlite")]
+pub(crate) async fn load_assistant_contents_from_session_window_detailed(
+    session_id: &str,
+    limit: usize,
+    binding: ConversationRuntimeBinding<'_>,
+    memory_config: &MemoryRuntimeConfig,
+) -> Result<Vec<String>, AssistantHistoryLoadError> {
     if let Some(ctx) = binding.kernel_context() {
         let request = MemoryCoreRequest {
             operation: memory::MEMORY_OP_WINDOW.to_owned(),
@@ -160,18 +291,20 @@ pub(crate) async fn load_assistant_contents_from_session_window(
         let outcome = ctx
             .kernel
             .execute_memory_core(ctx.pack_id(), &ctx.token, &caps, None, request)
-            .await;
-        if let Ok(outcome) = outcome
-            && outcome.status == "ok"
-        {
-            return Ok(collect_assistant_contents_from_memory_window_payload(
-                outcome.payload.get("turns"),
+            .await
+            .map_err(AssistantHistoryLoadError::kernel_request_failed)?;
+
+        if outcome.status != "ok" {
+            return Err(AssistantHistoryLoadError::kernel_non_ok_status(
+                &outcome.status,
             ));
         }
+
+        return collect_assistant_contents_from_memory_window_payload(outcome.payload.get("turns"));
     }
 
     let turns = memory::window_direct(session_id, limit, memory_config)
-        .map_err(|error| format!("load turn checkpoint summary failed: {error}"))?;
+        .map_err(AssistantHistoryLoadError::direct_read_failed)?;
     Ok(turns
         .iter()
         .filter_map(|turn| (turn.role == "assistant").then_some(turn.content.clone()))
@@ -193,22 +326,23 @@ fn build_turn_checkpoint_history_snapshot(
 #[cfg(feature = "memory-sqlite")]
 fn collect_assistant_contents_from_memory_window_payload(
     turns_payload: Option<&Value>,
-) -> Vec<String> {
-    turns_payload
-        .and_then(Value::as_array)
-        .map(|turns| {
-            turns
-                .iter()
-                .filter_map(|turn| {
-                    (turn.get("role").and_then(Value::as_str) == Some("assistant"))
-                        .then(|| {
-                            turn.get("content")
-                                .and_then(Value::as_str)
-                                .unwrap_or_default()
-                        })
-                        .map(ToOwned::to_owned)
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+) -> Result<Vec<String>, AssistantHistoryLoadError> {
+    let turns = turns_payload.and_then(Value::as_array).ok_or_else(|| {
+        AssistantHistoryLoadError::kernel_malformed_payload("missing or non-array turns")
+    })?;
+    let mut assistant_contents = Vec::new();
+    for (index, turn) in turns.iter().enumerate() {
+        if turn.get("role").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+
+        let content = turn.get("content").and_then(Value::as_str).ok_or_else(|| {
+            AssistantHistoryLoadError::kernel_malformed_payload(format!(
+                "assistant turn at index {index} missing or non-string content"
+            ))
+        })?;
+        assistant_contents.push(content.to_owned());
+    }
+
+    Ok(assistant_contents)
 }

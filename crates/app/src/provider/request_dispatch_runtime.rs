@@ -49,6 +49,8 @@ pub(super) async fn request_completion_with_model(
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn request_turn_with_model(
     config: &LoongClawConfig,
+    session_id: &str,
+    turn_id: &str,
     messages: &[Value],
     model: String,
     auto_model_mode: bool,
@@ -63,6 +65,8 @@ pub(super) async fn request_turn_with_model(
     request_turn_with_provider(
         config,
         &config.provider,
+        session_id,
+        turn_id,
         messages,
         model.as_str(),
         auto_model_mode,
@@ -151,6 +155,8 @@ async fn request_completion_with_provider(
 async fn request_turn_with_provider(
     base_config: &LoongClawConfig,
     request_provider: &ProviderConfig,
+    session_id: &str,
+    turn_id: &str,
     messages: &[Value],
     model: &str,
     auto_model_mode: bool,
@@ -201,7 +207,14 @@ async fn request_turn_with_provider(
                     tool_definitions,
                 )
             },
-            shape::extract_provider_turn,
+            |body| {
+                shape::extract_provider_turn_with_scope_and_messages(
+                    body,
+                    Some(session_id),
+                    Some(turn_id),
+                    messages,
+                )
+            },
             "choices[0].message",
             |api_error| {
                 if include_tool_schema.load(Ordering::Relaxed)
@@ -249,9 +262,7 @@ fn should_fallback_responses_to_chat_completions(
     status_code: u16,
     error: &ProviderApiError,
 ) -> bool {
-    if provider.responses_fallback_provider().is_none()
-        || !matches!(status_code, 400 | 404 | 405 | 415 | 422)
-    {
+    if provider.responses_fallback_provider().is_none() {
         return false;
     }
 
@@ -263,6 +274,19 @@ fn should_fallback_responses_to_chat_completions(
         || message.contains("rate limit")
         || message.contains("insufficient quota")
     {
+        return false;
+    }
+
+    let compatibility_status = matches!(status_code, 400 | 404 | 405 | 415 | 422);
+    let gateway_rejection = matches!(status_code, 500 | 502 | 503 | 504)
+        && (message.contains("bad gateway")
+            || message.contains("gateway timeout")
+            || message.contains("upstream")
+            || message.contains("proxy")
+            || message.contains("error code: 502")
+            || message.contains("error code: 503")
+            || message.contains("error code: 504"));
+    if !compatibility_status && !gateway_rejection {
         return false;
     }
 
@@ -295,5 +319,9 @@ fn should_fallback_responses_to_chat_completions(
         || message.contains("unsupported parameter `instructions`")
         || message.contains("unsupported parameter: `instructions`");
 
-    mentions_chat_endpoint || rejects_responses_input || requires_messages || textual_messages_hint
+    gateway_rejection
+        || mentions_chat_endpoint
+        || rejects_responses_input
+        || requires_messages
+        || textual_messages_hint
 }

@@ -11,14 +11,14 @@ use crate::acp::{
     AcpConversationTurnOptions, AcpTurnEventSink, JsonlAcpTurnEventSink,
     resolve_acp_backend_selection,
 };
-use crate::context::{DEFAULT_TOKEN_TTL_S, bootstrap_kernel_context};
+use crate::context::{DEFAULT_TOKEN_TTL_S, bootstrap_kernel_context_with_config};
 
 use super::config::{self, ConversationConfig, LoongClawConfig};
 #[cfg(feature = "memory-sqlite")]
 use super::conversation::load_safe_lane_event_summary;
 use super::conversation::{
-    ConversationSessionAddress, ConversationTurnCoordinator, ProviderErrorMode,
-    resolve_context_engine_selection,
+    ConversationRuntimeBinding, ConversationSessionAddress, ConversationTurnCoordinator,
+    ProviderErrorMode, resolve_context_engine_selection,
 };
 #[cfg(any(test, feature = "memory-sqlite"))]
 use super::conversation::{SafeLaneEventSummary, SafeLaneFinalStatus};
@@ -29,7 +29,7 @@ use super::conversation::{
     TurnCheckpointSessionState, TurnCheckpointStage, TurnCheckpointTailRepairOutcome,
     TurnCheckpointTailRepairReason, TurnCheckpointTailRepairRuntimeProbe,
 };
-#[cfg(feature = "memory-sqlite")]
+#[cfg(any(test, feature = "memory-sqlite"))]
 use super::memory;
 #[cfg(feature = "memory-sqlite")]
 use super::memory::runtime_config::MemoryRuntimeConfig;
@@ -160,7 +160,7 @@ pub async fn run_cli_chat(
             print_history(
                 &runtime.session_id,
                 runtime.config.memory.sliding_window,
-                Some(&runtime.kernel_ctx),
+                ConversationRuntimeBinding::kernel(&runtime.kernel_ctx),
                 &runtime.memory_config,
             )
             .await?;
@@ -168,7 +168,7 @@ pub async fn run_cli_chat(
             print_history(
                 &runtime.session_id,
                 runtime.config.memory.sliding_window,
-                Some(&runtime.kernel_ctx),
+                ConversationRuntimeBinding::kernel(&runtime.kernel_ctx),
             )
             .await?;
             continue;
@@ -181,7 +181,7 @@ pub async fn run_cli_chat(
                 &runtime.session_id,
                 limit,
                 &runtime.config.conversation,
-                Some(&runtime.kernel_ctx),
+                ConversationRuntimeBinding::kernel(&runtime.kernel_ctx),
                 &runtime.memory_config,
             )
             .await?;
@@ -190,7 +190,7 @@ pub async fn run_cli_chat(
                 &runtime.session_id,
                 limit,
                 &runtime.config.conversation,
-                Some(&runtime.kernel_ctx),
+                ConversationRuntimeBinding::kernel(&runtime.kernel_ctx),
             )
             .await?;
             continue;
@@ -204,7 +204,7 @@ pub async fn run_cli_chat(
                 &runtime.config,
                 &runtime.session_id,
                 limit,
-                Some(&runtime.kernel_ctx),
+                ConversationRuntimeBinding::kernel(&runtime.kernel_ctx),
                 &runtime.memory_config,
             )
             .await?;
@@ -214,26 +214,17 @@ pub async fn run_cli_chat(
                 &runtime.config,
                 &runtime.session_id,
                 limit,
-                Some(&runtime.kernel_ctx),
+                ConversationRuntimeBinding::kernel(&runtime.kernel_ctx),
             )
             .await?;
             continue;
         }
         if is_turn_checkpoint_repair_command(input)? {
-            #[cfg(feature = "memory-sqlite")]
             print_turn_checkpoint_repair(
                 &runtime.turn_coordinator,
                 &runtime.config,
                 &runtime.session_id,
-                Some(&runtime.kernel_ctx),
-            )
-            .await?;
-            #[cfg(not(feature = "memory-sqlite"))]
-            print_turn_checkpoint_repair(
-                &runtime.turn_coordinator,
-                &runtime.config,
-                &runtime.session_id,
-                Some(&runtime.kernel_ctx),
+                ConversationRuntimeBinding::kernel(&runtime.kernel_ctx),
             )
             .await?;
             continue;
@@ -298,7 +289,8 @@ async fn initialize_cli_turn_runtime(
     }
 
     crate::runtime_env::initialize_runtime_environment(&config, Some(&resolved_path));
-    let kernel_ctx = bootstrap_kernel_context(kernel_scope, DEFAULT_TOKEN_TTL_S)?;
+    let kernel_ctx =
+        bootstrap_kernel_context_with_config(kernel_scope, DEFAULT_TOKEN_TTL_S, &config)?;
     let explicit_acp_request = options.requests_explicit_acp();
     let effective_bootstrap_mcp_servers = config
         .acp
@@ -389,12 +381,14 @@ fn build_cli_chat_startup_summary(
 fn render_cli_chat_startup_lines(summary: &CliChatStartupSummary) -> Vec<String> {
     let mut lines = vec![
         "loongclaw chat ready".to_owned(),
+        "start here".to_owned(),
+        format!("- first prompt: {DEFAULT_FIRST_PROMPT}"),
+        "- type your request, or use /help for commands".to_owned(),
+        "session details".to_owned(),
         format!("- session: {}", summary.session_id),
         format!("- config: {}", summary.config_path),
         format!("- memory: {}", summary.memory_label),
-        "- start typing a request, or use /help for commands".to_owned(),
-        format!("- try this first: {DEFAULT_FIRST_PROMPT}"),
-        "assistant runtime".to_owned(),
+        "runtime details".to_owned(),
     ];
 
     let allowed_channels = if summary.allowed_channels.is_empty() {
@@ -494,65 +488,97 @@ fn print_help() {
 async fn print_history(
     session_id: &str,
     limit: usize,
-    kernel_ctx: Option<&crate::KernelContext>,
+    binding: ConversationRuntimeBinding<'_>,
     #[cfg(feature = "memory-sqlite")] memory_config: &MemoryRuntimeConfig,
 ) -> CliResult<()> {
     #[cfg(feature = "memory-sqlite")]
     {
-        if let Some(ctx) = kernel_ctx {
-            let request = memory::build_window_request(session_id, limit);
-            let caps = BTreeSet::from([Capability::MemoryRead]);
-            let outcome = ctx
-                .kernel
-                .execute_memory_core(ctx.pack_id(), &ctx.token, &caps, None, request)
-                .await
-                .map_err(|error| format!("load history via kernel failed: {error}"))?;
-            let turns = memory::decode_window_turns(&outcome.payload);
-            if turns.is_empty() {
-                println!("(no history yet)");
-                return Ok(());
-            }
-            for turn in turns {
-                println!(
-                    "[{}] {}: {}",
-                    turn.ts.unwrap_or_default(),
-                    turn.role,
-                    turn.content
-                );
-            }
-            return Ok(());
-        }
-
-        let entries = memory::load_prompt_context(session_id, memory_config)
-            .map_err(|error| format!("load history failed: {error}"))?;
-        if entries.is_empty() {
-            println!("(no history yet)");
-            return Ok(());
-        }
-        for entry in entries {
-            match entry.kind {
-                memory::MemoryContextKind::Profile => {
-                    println!("[profile]");
-                    println!("{}", entry.content);
-                }
-                memory::MemoryContextKind::Summary => {
-                    println!("[summary]");
-                    println!("{}", entry.content);
-                }
-                memory::MemoryContextKind::Turn => {
-                    println!("{}: {}", entry.role, entry.content);
-                }
-            }
+        for line in load_history_lines(session_id, limit, binding, memory_config).await? {
+            println!("{line}");
         }
         Ok(())
     }
 
     #[cfg(not(feature = "memory-sqlite"))]
     {
-        let _ = (session_id, limit, kernel_ctx);
+        let _ = (session_id, limit, binding);
         println!("history unavailable: memory-sqlite feature disabled");
         Ok(())
     }
+}
+
+#[cfg(any(test, feature = "memory-sqlite"))]
+fn format_window_history_lines(turns: &[memory::WindowTurn]) -> Vec<String> {
+    if turns.is_empty() {
+        return vec!["(no history yet)".to_owned()];
+    }
+
+    turns
+        .iter()
+        .map(|turn| {
+            format!(
+                "[{}] {}: {}",
+                turn.ts.unwrap_or_default(),
+                turn.role,
+                turn.content
+            )
+        })
+        .collect()
+}
+
+#[cfg(any(test, feature = "memory-sqlite"))]
+fn format_prompt_context_history_lines(entries: &[memory::MemoryContextEntry]) -> Vec<String> {
+    if entries.is_empty() {
+        return vec!["(no history yet)".to_owned()];
+    }
+
+    let mut lines = Vec::new();
+    for entry in entries {
+        match entry.kind {
+            memory::MemoryContextKind::Profile => {
+                lines.push("[profile]".to_owned());
+                lines.push(entry.content.clone());
+            }
+            memory::MemoryContextKind::Summary => {
+                lines.push("[summary]".to_owned());
+                lines.push(entry.content.clone());
+            }
+            memory::MemoryContextKind::Turn => {
+                lines.push(format!("{}: {}", entry.role, entry.content));
+            }
+        }
+    }
+    lines
+}
+
+#[cfg(feature = "memory-sqlite")]
+async fn load_history_lines(
+    session_id: &str,
+    limit: usize,
+    binding: ConversationRuntimeBinding<'_>,
+    memory_config: &MemoryRuntimeConfig,
+) -> CliResult<Vec<String>> {
+    if let Some(ctx) = binding.kernel_context() {
+        let request = memory::build_window_request(session_id, limit);
+        let caps = BTreeSet::from([Capability::MemoryRead]);
+        let outcome = ctx
+            .kernel
+            .execute_memory_core(ctx.pack_id(), &ctx.token, &caps, None, request)
+            .await
+            .map_err(|error| format!("load history via kernel failed: {error}"))?;
+        if outcome.status != "ok" {
+            return Err(format!(
+                "load history via kernel returned non-ok status: {}",
+                outcome.status
+            ));
+        }
+        let turns = memory::decode_window_turns(&outcome.payload);
+        return Ok(format_window_history_lines(&turns));
+    }
+
+    let entries = memory::load_prompt_context(session_id, memory_config)
+        .map_err(|error| format!("load history failed: {error}"))?;
+    Ok(format_prompt_context_history_lines(&entries))
 }
 
 fn parse_safe_lane_summary_limit(input: &str, default_window: usize) -> CliResult<Option<usize>> {
@@ -636,33 +662,48 @@ async fn print_safe_lane_summary(
     session_id: &str,
     limit: usize,
     conversation_config: &ConversationConfig,
-    kernel_ctx: Option<&crate::KernelContext>,
+    binding: ConversationRuntimeBinding<'_>,
     #[cfg(feature = "memory-sqlite")] memory_config: &MemoryRuntimeConfig,
 ) -> CliResult<()> {
     #[cfg(feature = "memory-sqlite")]
     {
-        let summary = load_safe_lane_event_summary(
-            session_id,
-            limit,
-            crate::conversation::ConversationRuntimeBinding::from_optional_kernel_context(
-                kernel_ctx,
-            ),
-            memory_config,
-        )
-        .await?;
         println!(
             "{}",
-            format_safe_lane_summary(session_id, limit, conversation_config, &summary)
+            load_safe_lane_summary_output(
+                session_id,
+                limit,
+                conversation_config,
+                binding,
+                memory_config,
+            )
+            .await?
         );
         Ok(())
     }
 
     #[cfg(not(feature = "memory-sqlite"))]
     {
-        let _ = (session_id, limit, conversation_config, kernel_ctx);
+        let _ = (session_id, limit, conversation_config, binding);
         println!("safe-lane summary unavailable: memory-sqlite feature disabled");
         Ok(())
     }
+}
+
+#[cfg(feature = "memory-sqlite")]
+async fn load_safe_lane_summary_output(
+    session_id: &str,
+    limit: usize,
+    conversation_config: &ConversationConfig,
+    binding: ConversationRuntimeBinding<'_>,
+    memory_config: &MemoryRuntimeConfig,
+) -> CliResult<String> {
+    let summary = load_safe_lane_event_summary(session_id, limit, binding, memory_config).await?;
+    Ok(format_safe_lane_summary(
+        session_id,
+        limit,
+        conversation_config,
+        &summary,
+    ))
 }
 
 #[allow(clippy::print_stdout)] // CLI output
@@ -671,34 +712,49 @@ async fn print_turn_checkpoint_summary(
     config: &LoongClawConfig,
     session_id: &str,
     limit: usize,
-    kernel_ctx: Option<&crate::KernelContext>,
+    binding: ConversationRuntimeBinding<'_>,
     #[cfg(feature = "memory-sqlite")] _memory_config: &MemoryRuntimeConfig,
 ) -> CliResult<()> {
     #[cfg(feature = "memory-sqlite")]
     {
-        let diagnostics = turn_coordinator
-            .load_turn_checkpoint_diagnostics_with_limit(
+        println!(
+            "{}",
+            load_turn_checkpoint_summary_output(
+                turn_coordinator,
                 config,
                 session_id,
                 limit,
-                crate::conversation::ConversationRuntimeBinding::from_optional_kernel_context(
-                    kernel_ctx,
-                ),
+                binding,
             )
-            .await?;
-        println!(
-            "{}",
-            format_turn_checkpoint_summary_output(session_id, limit, &diagnostics)
+            .await?
         );
         Ok(())
     }
 
     #[cfg(not(feature = "memory-sqlite"))]
     {
-        let _ = (turn_coordinator, config, session_id, limit, kernel_ctx);
+        let _ = (turn_coordinator, config, session_id, limit, binding);
         println!("turn checkpoint summary unavailable: memory-sqlite feature disabled");
         Ok(())
     }
+}
+
+#[cfg(feature = "memory-sqlite")]
+async fn load_turn_checkpoint_summary_output(
+    turn_coordinator: &ConversationTurnCoordinator,
+    config: &LoongClawConfig,
+    session_id: &str,
+    limit: usize,
+    binding: ConversationRuntimeBinding<'_>,
+) -> CliResult<String> {
+    let diagnostics = turn_coordinator
+        .load_turn_checkpoint_diagnostics_with_limit(config, session_id, limit, binding)
+        .await?;
+    Ok(format_turn_checkpoint_summary_output(
+        session_id,
+        limit,
+        &diagnostics,
+    ))
 }
 
 #[allow(clippy::print_stdout)] // CLI output
@@ -706,29 +762,37 @@ async fn print_turn_checkpoint_repair(
     turn_coordinator: &ConversationTurnCoordinator,
     config: &LoongClawConfig,
     session_id: &str,
-    kernel_ctx: Option<&crate::KernelContext>,
+    binding: ConversationRuntimeBinding<'_>,
 ) -> CliResult<()> {
     #[cfg(feature = "memory-sqlite")]
     {
-        let outcome = turn_coordinator
-            .repair_turn_checkpoint_tail(
-                config,
-                session_id,
-                crate::conversation::ConversationRuntimeBinding::from_optional_kernel_context(
-                    kernel_ctx,
-                ),
-            )
-            .await?;
-        println!("{}", format_turn_checkpoint_repair(session_id, &outcome));
+        println!(
+            "{}",
+            load_turn_checkpoint_repair_output(turn_coordinator, config, session_id, binding)
+                .await?
+        );
         Ok(())
     }
 
     #[cfg(not(feature = "memory-sqlite"))]
     {
-        let _ = (turn_coordinator, config, session_id, kernel_ctx);
+        let _ = (turn_coordinator, config, session_id, binding);
         println!("turn checkpoint repair unavailable: memory-sqlite feature disabled");
         Ok(())
     }
+}
+
+#[cfg(feature = "memory-sqlite")]
+async fn load_turn_checkpoint_repair_output(
+    turn_coordinator: &ConversationTurnCoordinator,
+    config: &LoongClawConfig,
+    session_id: &str,
+    binding: ConversationRuntimeBinding<'_>,
+) -> CliResult<String> {
+    let outcome = turn_coordinator
+        .repair_turn_checkpoint_tail(config, session_id, binding)
+        .await?;
+    Ok(format_turn_checkpoint_repair(session_id, &outcome))
 }
 
 #[cfg(any(test, feature = "memory-sqlite"))]
@@ -1308,7 +1372,25 @@ fn format_milli_ratio(value: Option<u32>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::conversation::ConversationRuntimeBinding;
     use std::path::PathBuf;
+    #[cfg(feature = "memory-sqlite")]
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        sync::{Arc, Mutex},
+    };
+
+    #[cfg(feature = "memory-sqlite")]
+    use async_trait::async_trait;
+    #[cfg(feature = "memory-sqlite")]
+    use loongclaw_contracts::{Capability, ExecutionRoute, HarnessKind, MemoryPlaneError};
+    #[cfg(feature = "memory-sqlite")]
+    use loongclaw_kernel::{
+        CoreMemoryAdapter, FixedClock, InMemoryAuditSink, LoongClawKernel, MemoryCoreOutcome,
+        MemoryCoreRequest, StaticPolicyEngine, VerticalPackManifest,
+    };
+    #[cfg(feature = "memory-sqlite")]
+    use serde_json::{Value, json};
 
     #[test]
     fn cli_chat_options_detect_explicit_acp_requests() {
@@ -1342,6 +1424,239 @@ mod tests {
         assert!(!CliChatOptions::default().requests_explicit_acp());
     }
 
+    #[cfg(feature = "memory-sqlite")]
+    fn unique_chat_sqlite_path(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "loongclaw-chat-binding-{label}-{}.sqlite3",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ))
+    }
+
+    #[cfg(feature = "memory-sqlite")]
+    fn cleanup_chat_test_memory(sqlite_path: &Path) {
+        let _ = std::fs::remove_file(sqlite_path);
+        let _ = std::fs::remove_file(format!("{}-wal", sqlite_path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", sqlite_path.display()));
+    }
+
+    #[cfg(feature = "memory-sqlite")]
+    fn init_chat_test_memory(label: &str) -> (LoongClawConfig, MemoryRuntimeConfig, PathBuf) {
+        let sqlite_path = unique_chat_sqlite_path(label);
+        cleanup_chat_test_memory(&sqlite_path);
+
+        let mut config = LoongClawConfig::default();
+        config.memory.sqlite_path = sqlite_path.display().to_string();
+        let memory_config = MemoryRuntimeConfig::from_memory_config(&config.memory);
+        crate::memory::ensure_memory_db_ready(
+            Some(config.memory.resolved_sqlite_path()),
+            &memory_config,
+        )
+        .expect("initialize sqlite memory");
+
+        (config, memory_config, sqlite_path)
+    }
+
+    #[cfg(feature = "memory-sqlite")]
+    struct SharedTestMemoryAdapter {
+        invocations: Arc<Mutex<Vec<MemoryCoreRequest>>>,
+        status: String,
+        window_turns: Value,
+    }
+
+    #[cfg(feature = "memory-sqlite")]
+    #[async_trait]
+    impl CoreMemoryAdapter for SharedTestMemoryAdapter {
+        fn name(&self) -> &str {
+            "chat-binding-memory-shared"
+        }
+
+        async fn execute_core_memory(
+            &self,
+            request: MemoryCoreRequest,
+        ) -> Result<MemoryCoreOutcome, MemoryPlaneError> {
+            let payload = if request.operation == crate::memory::MEMORY_OP_WINDOW {
+                json!({
+                    "turns": self.window_turns.clone()
+                })
+            } else {
+                json!({})
+            };
+            self.invocations
+                .lock()
+                .expect("invocations lock")
+                .push(request);
+            Ok(MemoryCoreOutcome {
+                status: self.status.clone(),
+                payload,
+            })
+        }
+    }
+
+    #[cfg(feature = "memory-sqlite")]
+    fn build_kernel_context_with_window_turns(
+        window_turns: Value,
+    ) -> (crate::KernelContext, Arc<Mutex<Vec<MemoryCoreRequest>>>) {
+        build_kernel_context_with_window_outcome("ok", window_turns)
+    }
+
+    #[cfg(feature = "memory-sqlite")]
+    fn build_kernel_context_with_window_outcome(
+        status: &str,
+        window_turns: Value,
+    ) -> (crate::KernelContext, Arc<Mutex<Vec<MemoryCoreRequest>>>) {
+        let audit = Arc::new(InMemoryAuditSink::default());
+        let clock = Arc::new(FixedClock::new(1_700_000_000));
+        let mut kernel = LoongClawKernel::with_runtime(StaticPolicyEngine::default(), clock, audit);
+
+        let pack = VerticalPackManifest {
+            pack_id: "chat-test-pack".to_owned(),
+            domain: "testing".to_owned(),
+            version: "0.1.0".to_owned(),
+            default_route: ExecutionRoute {
+                harness_kind: HarnessKind::EmbeddedPi,
+                adapter: None,
+            },
+            allowed_connectors: BTreeSet::new(),
+            granted_capabilities: BTreeSet::from([Capability::MemoryRead, Capability::MemoryWrite]),
+            metadata: BTreeMap::new(),
+        };
+        kernel.register_pack(pack).expect("register pack");
+
+        let invocations = Arc::new(Mutex::new(Vec::new()));
+        kernel.register_core_memory_adapter(SharedTestMemoryAdapter {
+            invocations: invocations.clone(),
+            status: status.to_owned(),
+            window_turns,
+        });
+        kernel
+            .set_default_core_memory_adapter("chat-binding-memory-shared")
+            .expect("set default memory adapter");
+
+        let token = kernel
+            .issue_token("chat-test-pack", "chat-test-agent", 3600)
+            .expect("issue token");
+
+        let ctx = crate::KernelContext {
+            kernel: Arc::new(kernel),
+            token,
+        };
+        (ctx, invocations)
+    }
+
+    #[cfg(feature = "memory-sqlite")]
+    fn append_assistant_payloads(
+        session_id: &str,
+        payloads: &[String],
+        memory_config: &MemoryRuntimeConfig,
+    ) {
+        for payload in payloads {
+            crate::memory::append_turn_direct(session_id, "assistant", payload, memory_config)
+                .expect("persist assistant payload");
+        }
+    }
+
+    #[cfg(feature = "memory-sqlite")]
+    fn assistant_window_turns(payloads: &[String]) -> Value {
+        json!(
+            payloads
+                .iter()
+                .enumerate()
+                .map(|(index, payload)| json!({
+                    "role": "assistant",
+                    "content": payload,
+                    "ts": index as i64 + 1
+                }))
+                .collect::<Vec<_>>()
+        )
+    }
+
+    #[cfg(feature = "memory-sqlite")]
+    fn safe_lane_event_payloads() -> Vec<String> {
+        vec![
+            json!({
+                "type": "conversation_event",
+                "event": "plan_round_started",
+                "payload": {
+                    "round": 0
+                }
+            })
+            .to_string(),
+            json!({
+                "type": "conversation_event",
+                "event": "verify_failed",
+                "payload": {
+                    "failure_code": "safe_lane_plan_verify_failed"
+                }
+            })
+            .to_string(),
+            json!({
+                "type": "conversation_event",
+                "event": "final_status",
+                "payload": {
+                    "status": "failed",
+                    "failure_code": "safe_lane_plan_verify_failed",
+                    "route_decision": "terminal"
+                }
+            })
+            .to_string(),
+        ]
+    }
+
+    #[cfg(feature = "memory-sqlite")]
+    fn turn_checkpoint_event_payloads() -> Vec<String> {
+        vec![
+            json!({
+                "type": "conversation_event",
+                "event": "turn_checkpoint",
+                "payload": {
+                    "schema_version": 1,
+                    "stage": "post_persist",
+                    "checkpoint": {
+                        "lane": {
+                            "lane": "safe",
+                            "result_kind": "tool_call"
+                        },
+                        "finalization": {
+                            "persistence_mode": "success"
+                        }
+                    },
+                    "finalization_progress": {
+                        "after_turn": "pending",
+                        "compaction": "pending"
+                    },
+                    "failure": null
+                }
+            })
+            .to_string(),
+            json!({
+                "type": "conversation_event",
+                "event": "turn_checkpoint",
+                "payload": {
+                    "schema_version": 1,
+                    "stage": "finalized",
+                    "checkpoint": {
+                        "lane": {
+                            "lane": "safe",
+                            "result_kind": "tool_call"
+                        },
+                        "finalization": {
+                            "persistence_mode": "success"
+                        }
+                    },
+                    "finalization_progress": {
+                        "after_turn": "completed",
+                        "compaction": "skipped"
+                    },
+                    "failure": null
+                }
+            })
+            .to_string(),
+        ]
+    }
+
     #[tokio::test]
     async fn run_cli_ask_rejects_empty_message() {
         let error = run_cli_ask(None, None, "   ", &CliChatOptions::default())
@@ -1349,6 +1664,225 @@ mod tests {
             .expect_err("empty one-shot message should fail");
 
         assert!(error.contains("ask message must not be empty"));
+    }
+
+    #[cfg(feature = "memory-sqlite")]
+    #[tokio::test]
+    async fn print_history_accepts_explicit_runtime_binding() {
+        let (config, memory_config, sqlite_path) = init_chat_test_memory("diagnostics");
+
+        let session_id = "chat-binding-history-direct";
+        crate::memory::append_turn_direct(session_id, "user", "hello", &memory_config)
+            .expect("persist user turn");
+        crate::memory::append_turn_direct(session_id, "assistant", "world", &memory_config)
+            .expect("persist assistant turn");
+
+        let direct_lines = load_history_lines(
+            session_id,
+            config.memory.sliding_window,
+            ConversationRuntimeBinding::direct(),
+            &memory_config,
+        )
+        .await
+        .expect("load history lines with explicit direct binding");
+        assert_eq!(
+            direct_lines,
+            vec!["user: hello".to_owned(), "assistant: world".to_owned()]
+        );
+
+        let (kernel_ctx, invocations) = build_kernel_context_with_window_turns(json!([
+            {
+                "role": "user",
+                "content": "kernel hello",
+                "ts": 7
+            },
+            {
+                "role": "assistant",
+                "content": "kernel world",
+                "ts": 8
+            }
+        ]));
+        let kernel_lines = load_history_lines(
+            "chat-binding-history-kernel",
+            16,
+            ConversationRuntimeBinding::kernel(&kernel_ctx),
+            &memory_config,
+        )
+        .await
+        .expect("load history lines with explicit kernel binding");
+        assert_eq!(
+            kernel_lines,
+            vec![
+                "[7] user: kernel hello".to_owned(),
+                "[8] assistant: kernel world".to_owned()
+            ]
+        );
+
+        let captured = invocations.lock().expect("invocations lock");
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].operation, crate::memory::MEMORY_OP_WINDOW);
+        assert_eq!(
+            captured[0].payload["session_id"],
+            "chat-binding-history-kernel"
+        );
+        assert_eq!(captured[0].payload["limit"], json!(16));
+
+        cleanup_chat_test_memory(&sqlite_path);
+    }
+
+    #[cfg(feature = "memory-sqlite")]
+    #[tokio::test]
+    async fn print_history_rejects_non_ok_kernel_memory_outcome() {
+        let (_config, memory_config, sqlite_path) = init_chat_test_memory("diagnostics-non-ok");
+
+        let (kernel_ctx, invocations) = build_kernel_context_with_window_outcome(
+            "error",
+            json!([
+                {
+                    "role": "user",
+                    "content": "kernel hello",
+                    "ts": 7
+                }
+            ]),
+        );
+        let error = load_history_lines(
+            "chat-binding-history-kernel-non-ok",
+            16,
+            ConversationRuntimeBinding::kernel(&kernel_ctx),
+            &memory_config,
+        )
+        .await
+        .expect_err("non-ok kernel memory outcome should fail closed");
+        assert!(error.contains("non-ok status"), "unexpected error: {error}");
+        assert!(error.contains("error"), "unexpected error: {error}");
+
+        let captured = invocations.lock().expect("invocations lock");
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].operation, crate::memory::MEMORY_OP_WINDOW);
+        assert_eq!(
+            captured[0].payload["session_id"],
+            "chat-binding-history-kernel-non-ok"
+        );
+        assert_eq!(captured[0].payload["limit"], json!(16));
+
+        cleanup_chat_test_memory(&sqlite_path);
+    }
+
+    #[cfg(feature = "memory-sqlite")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn safe_lane_summary_output_accepts_explicit_runtime_binding() {
+        let (config, memory_config, sqlite_path) = init_chat_test_memory("safe-lane-output");
+
+        let direct_payloads = safe_lane_event_payloads();
+        append_assistant_payloads(
+            "chat-binding-safe-lane-direct",
+            &direct_payloads,
+            &memory_config,
+        );
+        let direct_output = load_safe_lane_summary_output(
+            "chat-binding-safe-lane-direct",
+            64,
+            &config.conversation,
+            ConversationRuntimeBinding::direct(),
+            &memory_config,
+        )
+        .await
+        .expect("load safe lane summary via direct binding");
+        assert!(
+            direct_output
+                .contains("safe_lane_summary session=chat-binding-safe-lane-direct limit=64")
+        );
+        assert!(direct_output.contains("round_started=1"));
+        assert!(direct_output.contains("verify_failed=1"));
+        assert!(direct_output.contains("failure_code=safe_lane_plan_verify_failed"));
+
+        let kernel_payloads = safe_lane_event_payloads();
+        let (kernel_ctx, invocations) =
+            build_kernel_context_with_window_turns(assistant_window_turns(&kernel_payloads));
+        let kernel_output = load_safe_lane_summary_output(
+            "chat-binding-safe-lane-kernel",
+            80,
+            &config.conversation,
+            ConversationRuntimeBinding::kernel(&kernel_ctx),
+            &memory_config,
+        )
+        .await
+        .expect("load safe lane summary via kernel binding");
+        assert!(
+            kernel_output
+                .contains("safe_lane_summary session=chat-binding-safe-lane-kernel limit=80")
+        );
+        assert!(kernel_output.contains("round_started=1"));
+        assert!(kernel_output.contains("verify_failed=1"));
+        assert!(kernel_output.contains("failure_code=safe_lane_plan_verify_failed"));
+
+        let captured = invocations.lock().expect("invocations lock");
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].operation, crate::memory::MEMORY_OP_WINDOW);
+        assert_eq!(
+            captured[0].payload["session_id"],
+            "chat-binding-safe-lane-kernel"
+        );
+        assert_eq!(captured[0].payload["limit"], json!(80));
+        assert_eq!(captured[0].payload["allow_extended_limit"], json!(true));
+
+        cleanup_chat_test_memory(&sqlite_path);
+    }
+
+    #[cfg(feature = "memory-sqlite")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn turn_checkpoint_summary_output_accepts_explicit_runtime_binding() {
+        let (config, memory_config, sqlite_path) = init_chat_test_memory("turn-checkpoint-output");
+
+        let direct_payloads = turn_checkpoint_event_payloads();
+        append_assistant_payloads(
+            "chat-binding-turn-checkpoint-direct",
+            &direct_payloads,
+            &memory_config,
+        );
+        let coordinator = ConversationTurnCoordinator::new();
+        let direct_output = load_turn_checkpoint_summary_output(
+            &coordinator,
+            &config,
+            "chat-binding-turn-checkpoint-direct",
+            96,
+            ConversationRuntimeBinding::direct(),
+        )
+        .await
+        .expect("load turn checkpoint summary via direct binding");
+        assert!(direct_output.contains("turn_checkpoint_summary session=chat-binding-turn-checkpoint-direct limit=96 checkpoints=2"));
+        assert!(direct_output.contains("state=finalized"));
+        assert!(direct_output.contains("after_turn=completed"));
+        assert!(direct_output.contains("compaction=skipped"));
+
+        let kernel_payloads = turn_checkpoint_event_payloads();
+        let (kernel_ctx, invocations) =
+            build_kernel_context_with_window_turns(assistant_window_turns(&kernel_payloads));
+        let kernel_output = load_turn_checkpoint_summary_output(
+            &coordinator,
+            &config,
+            "chat-binding-turn-checkpoint-kernel",
+            112,
+            ConversationRuntimeBinding::kernel(&kernel_ctx),
+        )
+        .await
+        .expect("load turn checkpoint summary via kernel binding");
+        assert!(kernel_output.contains("turn_checkpoint_summary session=chat-binding-turn-checkpoint-kernel limit=112 checkpoints=2"));
+        assert!(kernel_output.contains("state=finalized"));
+        assert!(kernel_output.contains("after_turn=completed"));
+        assert!(kernel_output.contains("compaction=skipped"));
+
+        let captured = invocations.lock().expect("invocations lock");
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].operation, crate::memory::MEMORY_OP_WINDOW);
+        assert_eq!(
+            captured[0].payload["session_id"],
+            "chat-binding-turn-checkpoint-kernel"
+        );
+        assert_eq!(captured[0].payload["limit"], json!(112));
+        assert_eq!(captured[0].payload["allow_extended_limit"], json!(true));
+
+        cleanup_chat_test_memory(&sqlite_path);
     }
 
     #[test]
@@ -1372,22 +1906,33 @@ mod tests {
         });
 
         assert_eq!(lines[0], "loongclaw chat ready");
-        assert!(lines.iter().any(|line| line == "- session: default"));
         assert!(
-            lines
-                .iter()
-                .any(|line| line == "- start typing a request, or use /help for commands"),
-            "chat startup should read like a product entry point instead of a raw runtime dump: {lines:#?}"
+            lines.iter().any(|line| line == "start here"),
+            "chat startup should lead with a dedicated first-action heading: {lines:#?}"
         );
         assert!(
             lines.iter().any(|line| {
-                line == "- try this first: Summarize this repository and suggest the best next step."
+                line == "- first prompt: Summarize this repository and suggest the best next step."
             }),
             "chat startup should suggest a concrete first prompt: {lines:#?}"
         );
         assert!(
-            lines.iter().any(|line| line == "assistant runtime"),
-            "chat startup should still preserve a compact runtime section for operator context: {lines:#?}"
+            lines
+                .iter()
+                .any(|line| line == "- type your request, or use /help for commands"),
+            "chat startup should keep the usage hint, but under the assistant-first opening block: {lines:#?}"
+        );
+        assert!(
+            lines.iter().any(|line| line == "session details"),
+            "chat startup should tuck session/config facts into a secondary section: {lines:#?}"
+        );
+        assert!(
+            lines.iter().any(|line| line == "runtime details"),
+            "chat startup should still preserve runtime context in a compact secondary section: {lines:#?}"
+        );
+        assert!(
+            lines.iter().any(|line| line == "- session: default"),
+            "chat startup should continue to show session identity after the handoff block: {lines:#?}"
         );
     }
 

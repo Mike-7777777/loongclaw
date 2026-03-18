@@ -78,6 +78,25 @@ pub fn initialize_runtime_environment(
         config.tools.browser.max_text_chars.to_string(),
     );
     set_env_var(
+        "LOONGCLAW_BROWSER_COMPANION_ENABLED",
+        bool_env(config.tools.browser_companion.enabled),
+    );
+    set_env_var(
+        "LOONGCLAW_BROWSER_COMPANION_TIMEOUT_SECONDS",
+        config.tools.browser_companion.timeout_seconds.to_string(),
+    );
+    match normalized_optional_str(config.tools.browser_companion.command.as_deref()) {
+        Some(command) => set_env_var("LOONGCLAW_BROWSER_COMPANION_COMMAND", command),
+        None => remove_env_var("LOONGCLAW_BROWSER_COMPANION_COMMAND"),
+    }
+    match normalized_optional_str(config.tools.browser_companion.expected_version.as_deref()) {
+        Some(expected_version) => set_env_var(
+            "LOONGCLAW_BROWSER_COMPANION_EXPECTED_VERSION",
+            expected_version,
+        ),
+        None => remove_env_var("LOONGCLAW_BROWSER_COMPANION_EXPECTED_VERSION"),
+    }
+    set_env_var(
         "LOONGCLAW_WEB_FETCH_ENABLED",
         bool_env(config.tools.web.enabled),
     );
@@ -154,6 +173,10 @@ fn bool_env(value: bool) -> &'static str {
     if value { "true" } else { "false" }
 }
 
+fn normalized_optional_str(raw: Option<&str>) -> Option<&str> {
+    raw.map(str::trim).filter(|value| !value.is_empty())
+}
+
 fn set_env_var(key: &str, value: impl AsRef<std::ffi::OsStr>) {
     crate::process_env::set_var(key, value);
 }
@@ -167,17 +190,53 @@ mod tests {
     use std::path::PathBuf;
 
     use crate::config::{LoongClawConfig, MemoryProfile};
+    use crate::test_support::ScopedEnv;
 
     use super::*;
 
-    fn env_lock() -> &'static std::sync::Mutex<()> {
-        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    fn clear_runtime_environment_exports(env: &mut ScopedEnv) {
+        for key in [
+            "LOONGCLAW_CONFIG_PATH",
+            "LOONGCLAW_MEMORY_BACKEND",
+            "LOONGCLAW_MEMORY_PROFILE",
+            "LOONGCLAW_SQLITE_PATH",
+            "LOONGCLAW_SLIDING_WINDOW",
+            "LOONGCLAW_MEMORY_SUMMARY_MAX_CHARS",
+            "LOONGCLAW_MEMORY_PROFILE_NOTE",
+            "LOONGCLAW_SHELL_ALLOWLIST",
+            "LOONGCLAW_SHELL_DENY",
+            "LOONGCLAW_SHELL_DEFAULT_MODE",
+            "LOONGCLAW_FILE_ROOT",
+            "LOONGCLAW_EXTERNAL_SKILLS_ENABLED",
+            "LOONGCLAW_EXTERNAL_SKILLS_REQUIRE_DOWNLOAD_APPROVAL",
+            "LOONGCLAW_EXTERNAL_SKILLS_ALLOWED_DOMAINS",
+            "LOONGCLAW_EXTERNAL_SKILLS_BLOCKED_DOMAINS",
+            "LOONGCLAW_EXTERNAL_SKILLS_INSTALL_ROOT",
+            "LOONGCLAW_EXTERNAL_SKILLS_AUTO_EXPOSE_INSTALLED",
+            "LOONGCLAW_BROWSER_ENABLED",
+            "LOONGCLAW_BROWSER_MAX_SESSIONS",
+            "LOONGCLAW_BROWSER_MAX_LINKS",
+            "LOONGCLAW_BROWSER_MAX_TEXT_CHARS",
+            "LOONGCLAW_BROWSER_COMPANION_ENABLED",
+            "LOONGCLAW_BROWSER_COMPANION_TIMEOUT_SECONDS",
+            "LOONGCLAW_BROWSER_COMPANION_COMMAND",
+            "LOONGCLAW_BROWSER_COMPANION_EXPECTED_VERSION",
+            "LOONGCLAW_WEB_FETCH_ENABLED",
+            "LOONGCLAW_WEB_FETCH_ALLOW_PRIVATE_HOSTS",
+            "LOONGCLAW_WEB_FETCH_ALLOWED_DOMAINS",
+            "LOONGCLAW_WEB_FETCH_BLOCKED_DOMAINS",
+            "LOONGCLAW_WEB_FETCH_TIMEOUT_SECONDS",
+            "LOONGCLAW_WEB_FETCH_MAX_BYTES",
+            "LOONGCLAW_WEB_FETCH_MAX_REDIRECTS",
+        ] {
+            env.remove(key);
+        }
     }
 
     #[test]
     fn initialize_runtime_environment_exports_core_env_vars() {
-        let _guard = env_lock().lock().expect("env lock");
+        let mut env = ScopedEnv::new();
+        clear_runtime_environment_exports(&mut env);
         let mut config = LoongClawConfig::default();
         config.memory.profile = MemoryProfile::WindowPlusSummary;
         config.memory.summary_max_chars = 900;
@@ -187,6 +246,9 @@ mod tests {
         config.tools.browser.max_sessions = 4;
         config.tools.browser.max_links = 12;
         config.tools.browser.max_text_chars = 2048;
+        config.tools.browser_companion.enabled = true;
+        config.tools.browser_companion.command = Some("loongclaw-browser-companion".to_owned());
+        config.tools.browser_companion.expected_version = Some("1.2.3".to_owned());
         config.tools.web.enabled = false;
         config.tools.web.allow_private_hosts = true;
         config.tools.web.allowed_domains = vec!["docs.example.com".to_owned()];
@@ -257,6 +319,30 @@ mod tests {
             Some("2048")
         );
         assert_eq!(
+            std::env::var("LOONGCLAW_BROWSER_COMPANION_ENABLED")
+                .ok()
+                .as_deref(),
+            Some("true")
+        );
+        assert_eq!(
+            std::env::var("LOONGCLAW_BROWSER_COMPANION_TIMEOUT_SECONDS")
+                .ok()
+                .as_deref(),
+            Some("30")
+        );
+        assert_eq!(
+            std::env::var("LOONGCLAW_BROWSER_COMPANION_COMMAND")
+                .ok()
+                .as_deref(),
+            Some("loongclaw-browser-companion")
+        );
+        assert_eq!(
+            std::env::var("LOONGCLAW_BROWSER_COMPANION_EXPECTED_VERSION")
+                .ok()
+                .as_deref(),
+            Some("1.2.3")
+        );
+        assert_eq!(
             std::env::var("LOONGCLAW_WEB_FETCH_ENABLED").ok().as_deref(),
             Some("false")
         );
@@ -296,34 +382,33 @@ mod tests {
                 .as_deref(),
             Some("1")
         );
+    }
 
-        crate::process_env::remove_var("LOONGCLAW_CONFIG_PATH");
-        crate::process_env::remove_var("LOONGCLAW_MEMORY_BACKEND");
-        crate::process_env::remove_var("LOONGCLAW_MEMORY_PROFILE");
-        crate::process_env::remove_var("LOONGCLAW_SQLITE_PATH");
-        crate::process_env::remove_var("LOONGCLAW_SLIDING_WINDOW");
-        crate::process_env::remove_var("LOONGCLAW_MEMORY_SUMMARY_MAX_CHARS");
-        crate::process_env::remove_var("LOONGCLAW_MEMORY_PROFILE_NOTE");
-        crate::process_env::remove_var("LOONGCLAW_SHELL_ALLOWLIST");
-        crate::process_env::remove_var("LOONGCLAW_SHELL_DENY");
-        crate::process_env::remove_var("LOONGCLAW_SHELL_DEFAULT_MODE");
-        crate::process_env::remove_var("LOONGCLAW_FILE_ROOT");
-        crate::process_env::remove_var("LOONGCLAW_EXTERNAL_SKILLS_ENABLED");
-        crate::process_env::remove_var("LOONGCLAW_EXTERNAL_SKILLS_REQUIRE_DOWNLOAD_APPROVAL");
-        crate::process_env::remove_var("LOONGCLAW_EXTERNAL_SKILLS_ALLOWED_DOMAINS");
-        crate::process_env::remove_var("LOONGCLAW_EXTERNAL_SKILLS_BLOCKED_DOMAINS");
-        crate::process_env::remove_var("LOONGCLAW_EXTERNAL_SKILLS_INSTALL_ROOT");
-        crate::process_env::remove_var("LOONGCLAW_EXTERNAL_SKILLS_AUTO_EXPOSE_INSTALLED");
-        crate::process_env::remove_var("LOONGCLAW_BROWSER_ENABLED");
-        crate::process_env::remove_var("LOONGCLAW_BROWSER_MAX_SESSIONS");
-        crate::process_env::remove_var("LOONGCLAW_BROWSER_MAX_LINKS");
-        crate::process_env::remove_var("LOONGCLAW_BROWSER_MAX_TEXT_CHARS");
-        crate::process_env::remove_var("LOONGCLAW_WEB_FETCH_ENABLED");
-        crate::process_env::remove_var("LOONGCLAW_WEB_FETCH_ALLOW_PRIVATE_HOSTS");
-        crate::process_env::remove_var("LOONGCLAW_WEB_FETCH_ALLOWED_DOMAINS");
-        crate::process_env::remove_var("LOONGCLAW_WEB_FETCH_BLOCKED_DOMAINS");
-        crate::process_env::remove_var("LOONGCLAW_WEB_FETCH_TIMEOUT_SECONDS");
-        crate::process_env::remove_var("LOONGCLAW_WEB_FETCH_MAX_BYTES");
-        crate::process_env::remove_var("LOONGCLAW_WEB_FETCH_MAX_REDIRECTS");
+    #[test]
+    fn initialize_runtime_environment_drops_blank_browser_companion_metadata() {
+        let mut env = ScopedEnv::new();
+        clear_runtime_environment_exports(&mut env);
+        let mut config = LoongClawConfig::default();
+        config.tools.browser_companion.enabled = true;
+        config.tools.browser_companion.timeout_seconds = 7;
+        config.tools.browser_companion.command = Some("   ".to_owned());
+        config.tools.browser_companion.expected_version = Some("\n\t".to_owned());
+
+        initialize_runtime_environment(&config, None);
+
+        assert_eq!(
+            std::env::var("LOONGCLAW_BROWSER_COMPANION_TIMEOUT_SECONDS")
+                .ok()
+                .as_deref(),
+            Some("7")
+        );
+        assert_eq!(
+            std::env::var("LOONGCLAW_BROWSER_COMPANION_COMMAND").ok(),
+            None
+        );
+        assert_eq!(
+            std::env::var("LOONGCLAW_BROWSER_COMPANION_EXPECTED_VERSION").ok(),
+            None
+        );
     }
 }

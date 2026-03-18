@@ -4,6 +4,7 @@ use std::ops::Deref;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use futures_util::stream::{self, StreamExt};
 use loongclaw_contracts::{KernelError, ToolCoreOutcome, ToolCoreRequest, ToolPlaneError};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -17,9 +18,10 @@ use crate::session::repository::{
     NewApprovalRequestRecord, NewSessionRecord, SessionKind, SessionRepository, SessionState,
 };
 use crate::tools::{
-    ToolApprovalMode, ToolExecutionKind, ToolView, delegate_child_tool_view_for_config,
-    delegate_child_tool_view_for_config_with_delegate, governance_profile_for_descriptor,
-    runtime_tool_view, runtime_tool_view_for_config, tool_catalog,
+    ToolApprovalMode, ToolExecutionKind, ToolSchedulingClass, ToolView,
+    delegate_child_tool_view_for_config, delegate_child_tool_view_for_config_with_delegate,
+    governance_profile_for_descriptor, runtime_tool_view, runtime_tool_view_for_config,
+    tool_catalog,
 };
 
 use super::runtime::SessionContext;
@@ -239,8 +241,8 @@ pub(crate) fn classify_kernel_error(error: &KernelError) -> KernelFailureClass {
         KernelError::Policy(_)
         | KernelError::PackCapabilityBoundary { .. }
         | KernelError::ConnectorNotAllowed { .. } => KernelFailureClass::PolicyDenied,
-        KernelError::ToolPlane(ToolPlaneError::Execution(_)) => {
-            KernelFailureClass::RetryableExecution
+        KernelError::ToolPlane(ToolPlaneError::Execution(reason)) => {
+            classify_tool_execution_reason(reason)
         }
         _ => KernelFailureClass::NonRetryable,
     }
@@ -335,28 +337,43 @@ impl DefaultAppToolDispatcher {
                         )
                     })?;
                 let allow_nested_delegate = depth < self.tool_config.delegate.max_depth;
-                return Ok(delegate_child_tool_view_for_config_with_delegate(
-                    &self.tool_config,
-                    allow_nested_delegate,
+                return Ok(with_runtime_ready_browser_companion_tools(
+                    delegate_child_tool_view_for_config_with_delegate(
+                        &self.tool_config,
+                        allow_nested_delegate,
+                    ),
+                    &session_context.tool_view,
                 ));
             }
-            return Ok(runtime_tool_view_for_config(&self.tool_config));
+            return Ok(with_runtime_ready_browser_companion_tools(
+                runtime_tool_view_for_config(&self.tool_config),
+                &session_context.tool_view,
+            ));
         }
         if repo
             .load_session_summary_with_legacy_fallback(&session_context.session_id)?
             .is_some_and(|session| session.kind == SessionKind::DelegateChild)
         {
-            return Ok(delegate_child_tool_view_for_config(&self.tool_config));
+            return Ok(with_runtime_ready_browser_companion_tools(
+                delegate_child_tool_view_for_config(&self.tool_config),
+                &session_context.tool_view,
+            ));
         }
-        Ok(runtime_tool_view_for_config(&self.tool_config))
+        Ok(with_runtime_ready_browser_companion_tools(
+            runtime_tool_view_for_config(&self.tool_config),
+            &session_context.tool_view,
+        ))
     }
 
     #[cfg(not(feature = "memory-sqlite"))]
     fn effective_tool_view_for_session(
         &self,
-        _session_context: &SessionContext,
+        session_context: &SessionContext,
     ) -> Result<ToolView, String> {
-        Ok(runtime_tool_view_for_config(&self.tool_config))
+        Ok(with_runtime_ready_browser_companion_tools(
+            runtime_tool_view_for_config(&self.tool_config),
+            &session_context.tool_view,
+        ))
     }
 
     #[cfg(feature = "memory-sqlite")]
@@ -586,7 +603,7 @@ impl AppToolDispatcher for DefaultAppToolDispatcher {
                 .execute_sessions_send(session_context, request.payload)
                 .await;
         }
-        crate::tools::execute_app_tool_with_config(
+        crate::tools::execute_app_tool_with_visibility_checked_config(
             request,
             &session_context.session_id,
             &self.memory_config,
@@ -595,41 +612,118 @@ impl AppToolDispatcher for DefaultAppToolDispatcher {
     }
 }
 
-pub(crate) async fn execute_tool_intent_via_kernel(
-    request: ToolCoreRequest,
-    kernel_ctx: &KernelContext,
-    trusted_internal_context: bool,
-) -> Result<ToolCoreOutcome, TurnFailure> {
-    crate::tools::execute_kernel_tool_request(kernel_ctx, request, trusted_internal_context)
-        .await
-        .map_err(|error| {
-            let reason = format!("{error}");
-            match classify_kernel_error(&error) {
-                KernelFailureClass::PolicyDenied => {
-                    TurnFailure::policy_denied("kernel_policy_denied", reason)
-                }
-                KernelFailureClass::RetryableExecution => {
-                    TurnFailure::retryable("tool_execution_failed", reason)
-                }
-                KernelFailureClass::NonRetryable => {
-                    TurnFailure::non_retryable("kernel_execution_failed", reason)
-                }
-            }
-        })
+fn classify_tool_execution_reason(reason: &str) -> KernelFailureClass {
+    if reason.starts_with("policy_denied: ") {
+        KernelFailureClass::PolicyDenied
+    } else {
+        KernelFailureClass::RetryableExecution
+    }
+}
+
+fn with_runtime_ready_browser_companion_tools(
+    base_view: ToolView,
+    session_tool_view: &ToolView,
+) -> ToolView {
+    let mut names: BTreeSet<String> = base_view.tool_names().map(str::to_owned).collect();
+    names.extend(
+        session_tool_view
+            .tool_names()
+            .filter(|name| name.starts_with("browser.companion."))
+            .map(str::to_owned),
+    );
+    ToolView::from_tool_names(names)
+}
+
+pub(crate) fn render_kernel_error_reason(error: &KernelError) -> String {
+    #[allow(clippy::wildcard_enum_match_arm)]
+    match error {
+        KernelError::ToolPlane(ToolPlaneError::Execution(reason)) => format!(
+            "tool execution failed: {}",
+            reason.strip_prefix("policy_denied: ").unwrap_or(reason)
+        ),
+        _ => format!("{error}"),
+    }
 }
 
 fn augment_tool_payload_for_kernel(
     canonical_tool_name: &str,
     payload: serde_json::Value,
-    session_id: &str,
+    session_context: &SessionContext,
 ) -> serde_json::Value {
-    if !matches!(
-        canonical_tool_name,
-        "browser.open" | "browser.extract" | "browser.click"
-    ) {
+    let payload = inject_runtime_narrowing_context(payload, session_context);
+
+    // Direct browser tool calls: inject scope at the top level.
+    if browser_scope_injection_required(canonical_tool_name) {
+        return inject_browser_scope_field(payload, &session_context.session_id);
+    }
+
+    // tool.invoke wrapping a browser tool: inject scope into the nested arguments.
+    let is_browser_invoke = canonical_tool_name == "tool.invoke"
+        && payload
+            .get("tool_id")
+            .and_then(serde_json::Value::as_str)
+            .map(crate::tools::canonical_tool_name)
+            .is_some_and(browser_scope_injection_required);
+    if is_browser_invoke && let serde_json::Value::Object(mut outer) = payload {
+        if let Some(arguments) = outer.remove("arguments") {
+            outer.insert(
+                "arguments".to_owned(),
+                inject_browser_scope_field(arguments, &session_context.session_id),
+            );
+        }
+        return serde_json::Value::Object(outer);
+    }
+
+    payload
+}
+
+fn inject_runtime_narrowing_context(
+    payload: serde_json::Value,
+    session_context: &SessionContext,
+) -> serde_json::Value {
+    let Some(runtime_narrowing) = session_context.runtime_narrowing.as_ref() else {
+        return payload;
+    };
+    if runtime_narrowing.is_empty() {
         return payload;
     }
 
+    let serde_json::Value::Object(mut object) = payload else {
+        return payload;
+    };
+    let mut internal = object
+        .remove(crate::tools::LOONGCLAW_INTERNAL_TOOL_CONTEXT_KEY)
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    internal.insert(
+        crate::tools::LOONGCLAW_INTERNAL_RUNTIME_NARROWING_KEY.to_owned(),
+        serde_json::to_value(runtime_narrowing)
+            .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new())),
+    );
+    object.insert(
+        crate::tools::LOONGCLAW_INTERNAL_TOOL_CONTEXT_KEY.to_owned(),
+        serde_json::Value::Object(internal),
+    );
+    serde_json::Value::Object(object)
+}
+
+fn browser_scope_injection_required(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "browser.open"
+            | "browser.extract"
+            | "browser.click"
+            | "browser.companion.session.start"
+            | "browser.companion.navigate"
+            | "browser.companion.snapshot"
+            | "browser.companion.wait"
+            | "browser.companion.session.stop"
+            | "browser.companion.click"
+            | "browser.companion.type"
+    )
+}
+
+fn inject_browser_scope_field(payload: serde_json::Value, session_id: &str) -> serde_json::Value {
     match payload {
         serde_json::Value::Object(mut object) => {
             object.insert(
@@ -667,11 +761,12 @@ pub(crate) fn format_tool_result_line_with_limit(
     payload_summary_limit_chars: usize,
 ) -> String {
     let envelope = build_tool_result_envelope(intent, outcome, payload_summary_limit_chars);
+    let effective_tool_name = effective_result_tool_name(intent);
     let encoded = serde_json::to_string(&envelope).unwrap_or_else(|_| {
         format!(
             "{{\"status\":\"{}\",\"tool\":\"{}\",\"tool_call_id\":\"{}\",\"payload_summary\":\"[tool_payload_unserializable]\",\"payload_chars\":0,\"payload_truncated\":false}}",
             outcome.status,
-            crate::tools::canonical_tool_name(intent.tool_name.as_str()),
+            effective_tool_name,
             intent.tool_call_id
         )
     });
@@ -683,6 +778,7 @@ fn build_tool_result_envelope(
     outcome: &ToolCoreOutcome,
     payload_summary_limit_chars: usize,
 ) -> ToolResultEnvelope {
+    let effective_tool_name = effective_result_tool_name(intent);
     let normalized_limit = effective_payload_summary_limit(intent, payload_summary_limit_chars)
         .clamp(
             MIN_TOOL_RESULT_PAYLOAD_SUMMARY_LIMIT_CHARS,
@@ -695,7 +791,7 @@ fn build_tool_result_envelope(
 
     ToolResultEnvelope {
         status: outcome.status.clone(),
-        tool: crate::tools::canonical_tool_name(intent.tool_name.as_str()).to_owned(),
+        tool: effective_tool_name,
         tool_call_id: intent.tool_call_id.clone(),
         payload_summary,
         payload_chars,
@@ -704,10 +800,28 @@ fn build_tool_result_envelope(
 }
 
 fn effective_payload_summary_limit(intent: &ToolIntent, default_limit: usize) -> usize {
-    if crate::tools::canonical_tool_name(intent.tool_name.as_str()) == "external_skills.invoke" {
+    if effective_result_tool_name(intent) == "external_skills.invoke" {
         return MAX_TOOL_RESULT_PAYLOAD_SUMMARY_LIMIT_CHARS;
     }
     default_limit
+}
+
+fn effective_result_tool_name(intent: &ToolIntent) -> String {
+    let canonical_tool_name = crate::tools::canonical_tool_name(intent.tool_name.as_str());
+    if canonical_tool_name != "tool.invoke" {
+        return canonical_tool_name.to_owned();
+    }
+    intent
+        .args_json
+        .get("tool_id")
+        .and_then(serde_json::Value::as_str)
+        .map(crate::tools::canonical_tool_name)
+        .and_then(|tool_name| {
+            crate::tools::resolve_tool_execution(tool_name).map(|resolved| resolved.canonical_name)
+        })
+        .filter(|tool_name| !crate::tools::is_provider_exposed_tool_name(tool_name))
+        .unwrap_or(canonical_tool_name)
+        .to_owned()
 }
 
 fn truncate_by_chars(value: &str, limit: usize) -> (String, usize, bool) {
@@ -724,6 +838,93 @@ fn truncate_by_chars(value: &str, limit: usize) -> (String, usize, bool) {
     (truncated, total_chars, true)
 }
 
+fn effective_visible_tool_name(
+    intent: &ToolIntent,
+    descriptor: &crate::tools::ToolDescriptor,
+) -> String {
+    if descriptor.name != "tool.invoke" {
+        return descriptor.name.to_owned();
+    }
+
+    intent
+        .args_json
+        .get("tool_id")
+        .and_then(serde_json::Value::as_str)
+        .map(crate::tools::canonical_tool_name)
+        .and_then(|tool_name| {
+            tool_catalog()
+                .descriptor(tool_name)
+                .filter(|target| !target.is_provider_core())
+                .map(|target| target.name.to_owned())
+        })
+        .unwrap_or_else(|| descriptor.name.to_owned())
+}
+
+fn provider_tool_denial_should_conceal_name(
+    intent: &ToolIntent,
+    descriptor: &crate::tools::ToolDescriptor,
+    tool_is_visible: bool,
+) -> bool {
+    if !intent.source.starts_with("provider_") {
+        return false;
+    }
+
+    if !descriptor.is_provider_core() {
+        return true;
+    }
+
+    !tool_is_visible
+        && descriptor.name == "tool.invoke"
+        && effective_visible_tool_name(intent, descriptor) != descriptor.name
+}
+
+fn concealed_provider_tool_denial() -> TurnFailure {
+    TurnFailure::policy_denied(
+        "tool_not_found",
+        "tool_not_found: requested tool is not available",
+    )
+}
+
+fn tool_intent_is_visible(
+    session_context: &SessionContext,
+    intent: &ToolIntent,
+    descriptor: &crate::tools::ToolDescriptor,
+) -> bool {
+    if descriptor.is_provider_core() {
+        if descriptor.name != "tool.invoke" {
+            return true;
+        }
+        let effective_name = effective_visible_tool_name(intent, descriptor);
+        return effective_name == descriptor.name
+            || session_context.tool_view.contains(effective_name.as_str());
+    }
+
+    session_context.tool_view.contains(descriptor.name)
+}
+
+async fn execute_tool_intent_via_kernel(
+    request: ToolCoreRequest,
+    kernel_ctx: &KernelContext,
+    trusted_internal_context: bool,
+) -> Result<ToolCoreOutcome, TurnFailure> {
+    crate::tools::execute_kernel_tool_request(kernel_ctx, request, trusted_internal_context)
+        .await
+        .map_err(|error| {
+            let reason = render_kernel_error_reason(&error);
+            match classify_kernel_error(&error) {
+                KernelFailureClass::PolicyDenied => {
+                    TurnFailure::policy_denied("kernel_policy_denied", reason)
+                }
+                KernelFailureClass::RetryableExecution => {
+                    TurnFailure::retryable("tool_execution_failed", reason)
+                }
+                KernelFailureClass::NonRetryable => {
+                    TurnFailure::non_retryable("kernel_execution_failed", reason)
+                }
+            }
+        })
+}
+
 /// Single orchestration boundary for tool-call evaluation and execution.
 ///
 /// `evaluate_turn` performs synchronous validation (no execution).
@@ -731,13 +932,114 @@ fn truncate_by_chars(value: &str, limit: usize) -> (String, usize, bool) {
 pub struct TurnEngine {
     max_tool_steps: usize,
     tool_result_payload_summary_limit_chars: usize,
+    parallel_tool_execution_enabled: bool,
+    parallel_tool_execution_max_in_flight: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ToolBatchExecutionMode {
+    Sequential,
+    Parallel,
+}
+
+impl ToolBatchExecutionMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Sequential => "sequential",
+            Self::Parallel => "parallel",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PreparedBatchSegment {
+    len: usize,
+    scheduling_class: ToolSchedulingClass,
+    execution_mode: ToolBatchExecutionMode,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ToolBatchExecutionSegmentTrace {
+    pub segment_index: usize,
+    pub scheduling_class: ToolSchedulingClass,
+    pub execution_mode: ToolBatchExecutionMode,
+    pub intent_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ToolBatchExecutionTrace {
+    pub total_intents: usize,
+    pub parallel_execution_enabled: bool,
+    pub parallel_execution_max_in_flight: usize,
+    pub segments: Vec<ToolBatchExecutionSegmentTrace>,
+}
+
+impl ToolBatchExecutionTrace {
+    pub(crate) fn as_event_payload(&self) -> serde_json::Value {
+        let parallel_safe_intents = self
+            .segments
+            .iter()
+            .filter(|segment| segment.scheduling_class == ToolSchedulingClass::ParallelSafe)
+            .map(|segment| segment.intent_count)
+            .sum::<usize>();
+        let serial_only_intents = self
+            .segments
+            .iter()
+            .filter(|segment| segment.scheduling_class == ToolSchedulingClass::SerialOnly)
+            .map(|segment| segment.intent_count)
+            .sum::<usize>();
+        let parallel_segments = self
+            .segments
+            .iter()
+            .filter(|segment| segment.execution_mode == ToolBatchExecutionMode::Parallel)
+            .count();
+        let sequential_segments = self
+            .segments
+            .iter()
+            .filter(|segment| segment.execution_mode == ToolBatchExecutionMode::Sequential)
+            .count();
+
+        json!({
+            "schema_version": 1,
+            "total_intents": self.total_intents,
+            "parallel_execution_enabled": self.parallel_execution_enabled,
+            "parallel_execution_max_in_flight": self.parallel_execution_max_in_flight,
+            "parallel_safe_intents": parallel_safe_intents,
+            "serial_only_intents": serial_only_intents,
+            "parallel_segments": parallel_segments,
+            "sequential_segments": sequential_segments,
+            "segments": self
+                .segments
+                .iter()
+                .map(|segment| {
+                    json!({
+                        "segment_index": segment.segment_index,
+                        "scheduling_class": segment.scheduling_class.as_str(),
+                        "execution_mode": segment.execution_mode.as_str(),
+                        "intent_count": segment.intent_count,
+                    })
+                })
+                .collect::<Vec<_>>(),
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PreparedToolIntent {
+    intent: ToolIntent,
+    request: ToolCoreRequest,
+    execution_kind: ToolExecutionKind,
+    scheduling_class: ToolSchedulingClass,
+    trusted_internal_context: bool,
 }
 
 impl TurnEngine {
     pub fn new(max_tool_steps: usize) -> Self {
-        Self::with_tool_result_payload_summary_limit(
+        Self::with_parallel_tool_execution(
             max_tool_steps,
             TOOL_RESULT_PAYLOAD_SUMMARY_LIMIT_CHARS,
+            false,
+            1,
         )
     }
 
@@ -745,12 +1047,28 @@ impl TurnEngine {
         max_tool_steps: usize,
         tool_result_payload_summary_limit_chars: usize,
     ) -> Self {
+        Self::with_parallel_tool_execution(
+            max_tool_steps,
+            tool_result_payload_summary_limit_chars,
+            false,
+            1,
+        )
+    }
+
+    pub fn with_parallel_tool_execution(
+        max_tool_steps: usize,
+        tool_result_payload_summary_limit_chars: usize,
+        parallel_tool_execution_enabled: bool,
+        parallel_tool_execution_max_in_flight: usize,
+    ) -> Self {
         Self {
             max_tool_steps,
             tool_result_payload_summary_limit_chars: tool_result_payload_summary_limit_chars.clamp(
                 MIN_TOOL_RESULT_PAYLOAD_SUMMARY_LIMIT_CHARS,
                 MAX_TOOL_RESULT_PAYLOAD_SUMMARY_LIMIT_CHARS,
             ),
+            parallel_tool_execution_enabled,
+            parallel_tool_execution_max_in_flight: parallel_tool_execution_max_in_flight.max(1),
         }
     }
 
@@ -810,18 +1128,55 @@ impl TurnEngine {
             ));
         }
 
+        let catalog = tool_catalog();
         for intent in &turn.tool_intents {
             let Some(resolved_tool) = crate::tools::resolve_tool_execution(&intent.tool_name)
             else {
                 let reason = format!("tool_not_found: {}", intent.tool_name);
                 return Err(TurnFailure::policy_denied("tool_not_found", reason));
             };
-            if !session_context
-                .tool_view
-                .contains(resolved_tool.canonical_name)
-            {
-                let reason = format!("tool_not_visible: {}", intent.tool_name);
-                return Err(TurnFailure::policy_denied("tool_not_visible", reason));
+            if let Some(descriptor) = catalog.resolve(&intent.tool_name) {
+                let tool_is_visible = tool_intent_is_visible(session_context, intent, descriptor);
+                if !tool_is_visible {
+                    if provider_tool_denial_should_conceal_name(intent, descriptor, false) {
+                        return Err(concealed_provider_tool_denial());
+                    }
+                    let reason = format!(
+                        "tool_not_visible: {}",
+                        effective_visible_tool_name(intent, descriptor)
+                    );
+                    return Err(TurnFailure::policy_denied("tool_not_visible", reason));
+                }
+                if provider_tool_denial_should_conceal_name(intent, descriptor, true) {
+                    return Err(concealed_provider_tool_denial());
+                }
+                // For tool.invoke, the inner tool_id is validated by lease during
+                // execution.  We do not check inner visibility here because discoverable
+                // tools are intentionally hidden from the tool_view and accessed only
+                // through a valid lease obtained from tool.search.
+                // For all other provider-sourced intents, verify they are provider-exposed
+                // (this gate catches non-bridge paths where a discoverable tool name
+                // arrives without being rewritten to tool.invoke).
+                if descriptor.name == "tool.invoke" {
+                    // Lease validation happens in resolve_tool_invoke_request during execution.
+                } else if !crate::tools::is_provider_exposed_tool_name(&intent.tool_name) {
+                    let reason = format!("tool_not_provider_exposed: {}", intent.tool_name);
+                    return Err(TurnFailure::policy_denied(
+                        "tool_not_provider_exposed",
+                        reason,
+                    ));
+                }
+            } else {
+                if !session_context
+                    .tool_view
+                    .contains(resolved_tool.canonical_name)
+                {
+                    let reason = format!("tool_not_visible: {}", intent.tool_name);
+                    return Err(TurnFailure::policy_denied("tool_not_visible", reason));
+                }
+                if intent.source.starts_with("provider_") {
+                    return Err(concealed_provider_tool_denial());
+                }
             }
         }
 
@@ -889,115 +1244,374 @@ impl TurnEngine {
         binding: ConversationRuntimeBinding<'_>,
         ingress: Option<&ConversationIngressContext>,
     ) -> TurnResult {
+        self.execute_turn_in_context_with_trace(
+            turn,
+            session_context,
+            app_dispatcher,
+            binding,
+            ingress,
+        )
+        .await
+        .0
+    }
+
+    pub(crate) async fn execute_turn_in_context_with_trace<D: AppToolDispatcher + ?Sized>(
+        &self,
+        turn: &ProviderTurn,
+        session_context: &SessionContext,
+        app_dispatcher: &D,
+        binding: ConversationRuntimeBinding<'_>,
+        ingress: Option<&ConversationIngressContext>,
+    ) -> (TurnResult, Option<ToolBatchExecutionTrace>) {
         match self.validate_turn_in_context(turn, session_context) {
-            Ok(TurnValidation::FinalText(text)) => return TurnResult::FinalText(text),
-            Err(failure) => return TurnResult::ToolDenied(failure),
+            Ok(TurnValidation::FinalText(text)) => return (TurnResult::FinalText(text), None),
+            Err(failure) => return (TurnResult::ToolDenied(failure), None),
             Ok(TurnValidation::ToolExecutionRequired) => {}
         }
 
-        let mut outputs = Vec::new();
+        let mut prepared = Vec::new();
         for intent in &turn.tool_intents {
-            let Some(resolved_tool) = crate::tools::resolve_tool_execution(&intent.tool_name)
-            else {
-                let reason = format!("tool_not_found: {}", intent.tool_name);
-                return TurnResult::policy_denied("tool_not_found", reason);
-            };
-            let injected = inject_internal_tool_ingress(
-                resolved_tool.canonical_name,
-                intent.args_json.clone(),
-                ingress,
-            );
-            let augmented_payload = augment_tool_payload_for_kernel(
-                resolved_tool.canonical_name,
-                injected.payload,
-                &session_context.session_id,
-            );
-            let request = ToolCoreRequest {
-                tool_name: resolved_tool.canonical_name.to_owned(),
-                payload: augmented_payload,
-            };
-            let outcome = match resolved_tool.execution_kind {
-                ToolExecutionKind::Core => {
-                    let Some(kernel_ctx) = binding.kernel_context() else {
-                        return TurnResult::policy_denied("no_kernel_context", "no_kernel_context");
-                    };
-                    match execute_tool_intent_via_kernel(
-                        request,
-                        kernel_ctx,
-                        injected.trusted_internal_context,
+            match self
+                .prepare_tool_intent(intent, session_context, app_dispatcher, binding, ingress)
+                .await
+            {
+                Ok(prepared_intent) => prepared.push(prepared_intent),
+                Err(result) => return (result, None),
+            }
+        }
+        let trace = self.trace_prepared_batch(&prepared);
+
+        let outputs = match self
+            .execute_prepared_batch(&prepared, session_context, app_dispatcher, binding)
+            .await
+        {
+            Ok(outputs) => outputs,
+            Err(result) => return (result, trace),
+        };
+
+        (TurnResult::FinalText(outputs.join("\n")), trace)
+    }
+
+    async fn execute_prepared_batch<D: AppToolDispatcher + ?Sized>(
+        &self,
+        prepared: &[PreparedToolIntent],
+        session_context: &SessionContext,
+        app_dispatcher: &D,
+        binding: ConversationRuntimeBinding<'_>,
+    ) -> Result<Vec<String>, TurnResult> {
+        let mut outputs = Vec::with_capacity(prepared.len());
+        let mut remaining = prepared;
+        for segment in self.prepared_batch_segments(prepared) {
+            let (prepared_segment, rest) = remaining.split_at(segment.len);
+            let mut segment_outputs = match segment.execution_mode {
+                ToolBatchExecutionMode::Parallel => {
+                    self.execute_prepared_batch_in_parallel(
+                        prepared_segment,
+                        session_context,
+                        app_dispatcher,
+                        binding,
                     )
-                    .await
-                    {
-                        Ok(outcome) => outcome,
-                        Err(failure) => return turn_result_from_tool_execution_failure(failure),
-                    }
+                    .await?
                 }
-                ToolExecutionKind::App => {
-                    let catalog = crate::tools::tool_catalog();
-                    let Some(descriptor) = catalog.resolve(resolved_tool.canonical_name) else {
-                        let reason =
-                            format!("tool_descriptor_missing: {}", resolved_tool.canonical_name);
-                        return TurnResult::non_retryable_tool_error(
-                            "tool_descriptor_missing",
-                            reason,
-                        );
-                    };
-                    let kernel_ctx = binding.kernel_context();
-                    match app_dispatcher
-                        .maybe_require_approval(session_context, intent, descriptor, kernel_ctx)
-                        .await
-                    {
-                        Ok(Some(requirement)) => return TurnResult::NeedsApproval(requirement),
-                        Ok(None) => {}
-                        Err(reason) if reason.starts_with("app_tool_denied:") => {
-                            return TurnResult::policy_denied("app_tool_denied", reason);
-                        }
-                        Err(reason) => {
-                            return TurnResult::non_retryable_tool_error(
-                                "app_tool_preflight_failed",
-                                reason,
-                            );
-                        }
-                    }
-
-                    match app_dispatcher
-                        .execute_app_tool(session_context, request, binding)
-                        .await
-                    {
-                        Ok(outcome) => outcome,
-                        Err(reason) if reason.starts_with("tool_not_visible:") => {
-                            return TurnResult::policy_denied("tool_not_visible", reason);
-                        }
-                        Err(reason)
-                            if reason.starts_with("tool_not_found:")
-                                || reason.starts_with("app_tool_not_found:") =>
-                        {
-                            return TurnResult::policy_denied("tool_not_found", reason);
-                        }
-                        Err(reason) if reason.starts_with("app_tool_disabled:") => {
-                            return TurnResult::policy_denied("app_tool_disabled", reason);
-                        }
-                        Err(reason) if reason.starts_with("app_tool_denied:") => {
-                            return TurnResult::policy_denied("app_tool_denied", reason);
-                        }
-                        Err(reason) => {
-                            return TurnResult::non_retryable_tool_error(
-                                "app_tool_execution_failed",
-                                reason,
-                            );
-                        }
-                    }
+                ToolBatchExecutionMode::Sequential => {
+                    self.execute_prepared_batch_sequential(
+                        prepared_segment,
+                        session_context,
+                        app_dispatcher,
+                        binding,
+                    )
+                    .await?
                 }
             };
+            outputs.append(&mut segment_outputs);
+            remaining = rest;
+        }
 
+        Ok(outputs)
+    }
+
+    fn trace_prepared_batch(
+        &self,
+        prepared: &[PreparedToolIntent],
+    ) -> Option<ToolBatchExecutionTrace> {
+        if prepared.is_empty() {
+            return None;
+        }
+
+        Some(ToolBatchExecutionTrace {
+            total_intents: prepared.len(),
+            parallel_execution_enabled: self.parallel_tool_execution_enabled,
+            parallel_execution_max_in_flight: self.parallel_tool_execution_max_in_flight,
+            segments: self
+                .prepared_batch_segments(prepared)
+                .into_iter()
+                .enumerate()
+                .map(|(segment_index, segment)| ToolBatchExecutionSegmentTrace {
+                    segment_index,
+                    scheduling_class: segment.scheduling_class,
+                    execution_mode: segment.execution_mode,
+                    intent_count: segment.len,
+                })
+                .collect(),
+        })
+    }
+
+    fn prepared_batch_segments(
+        &self,
+        prepared: &[PreparedToolIntent],
+    ) -> Vec<PreparedBatchSegment> {
+        let mut segments = Vec::new();
+        let mut remaining = prepared;
+        while let Some((first, _)) = remaining.split_first() {
+            let scheduling_class = first.scheduling_class;
+            let len = remaining
+                .iter()
+                .take_while(|prepared_intent| prepared_intent.scheduling_class == scheduling_class)
+                .count();
+            segments.push(PreparedBatchSegment {
+                len,
+                scheduling_class,
+                execution_mode: self.segment_execution_mode(scheduling_class, len),
+            });
+            let (_, rest) = remaining.split_at(len);
+            remaining = rest;
+        }
+        segments
+    }
+
+    fn segment_execution_mode(
+        &self,
+        scheduling_class: ToolSchedulingClass,
+        segment_len: usize,
+    ) -> ToolBatchExecutionMode {
+        if self.parallel_tool_execution_enabled
+            && scheduling_class == ToolSchedulingClass::ParallelSafe
+            && segment_len > 1
+        {
+            ToolBatchExecutionMode::Parallel
+        } else {
+            ToolBatchExecutionMode::Sequential
+        }
+    }
+
+    async fn execute_prepared_batch_sequential<D: AppToolDispatcher + ?Sized>(
+        &self,
+        prepared: &[PreparedToolIntent],
+        session_context: &SessionContext,
+        app_dispatcher: &D,
+        binding: ConversationRuntimeBinding<'_>,
+    ) -> Result<Vec<String>, TurnResult> {
+        let mut outputs = Vec::with_capacity(prepared.len());
+        for prepared_intent in prepared {
+            let outcome = self
+                .execute_prepared_tool_intent(
+                    prepared_intent,
+                    session_context,
+                    app_dispatcher,
+                    binding,
+                )
+                .await?;
             outputs.push(format_tool_result_line_with_limit(
-                intent,
+                &prepared_intent.intent,
                 &outcome,
                 self.tool_result_payload_summary_limit_chars,
             ));
         }
+        Ok(outputs)
+    }
 
-        TurnResult::FinalText(outputs.join("\n"))
+    async fn execute_prepared_batch_in_parallel<D: AppToolDispatcher + ?Sized>(
+        &self,
+        prepared: &[PreparedToolIntent],
+        session_context: &SessionContext,
+        app_dispatcher: &D,
+        binding: ConversationRuntimeBinding<'_>,
+    ) -> Result<Vec<String>, TurnResult> {
+        let payload_summary_limit_chars = self.tool_result_payload_summary_limit_chars;
+        let mut results = Vec::with_capacity(prepared.len());
+        let mut executions = stream::iter(prepared.iter().cloned().enumerate().map(
+            |(index, prepared_intent)| async move {
+                let result = self
+                    .execute_prepared_tool_intent(
+                        &prepared_intent,
+                        session_context,
+                        app_dispatcher,
+                        binding,
+                    )
+                    .await
+                    .map(|outcome| {
+                        format_tool_result_line_with_limit(
+                            &prepared_intent.intent,
+                            &outcome,
+                            payload_summary_limit_chars,
+                        )
+                    });
+                (index, result)
+            },
+        ))
+        .buffer_unordered(self.parallel_tool_execution_max_in_flight);
+
+        while let Some((index, result)) = executions.next().await {
+            match result {
+                Ok(output) => results.push((index, output)),
+                Err(turn_result) => return Err(turn_result),
+            }
+        }
+        results.sort_by_key(|(index, _)| *index);
+
+        Ok(results.into_iter().map(|(_, output)| output).collect())
+    }
+
+    async fn prepare_tool_intent<D: AppToolDispatcher + ?Sized>(
+        &self,
+        intent: &ToolIntent,
+        session_context: &SessionContext,
+        app_dispatcher: &D,
+        binding: ConversationRuntimeBinding<'_>,
+        ingress: Option<&ConversationIngressContext>,
+    ) -> Result<PreparedToolIntent, TurnResult> {
+        let Some(resolved_tool) = crate::tools::resolve_tool_execution(&intent.tool_name) else {
+            let reason = format!("tool_not_found: {}", intent.tool_name);
+            return Err(TurnResult::policy_denied("tool_not_found", reason));
+        };
+        let injected = inject_internal_tool_ingress(
+            resolved_tool.canonical_name,
+            intent.args_json.clone(),
+            ingress,
+        );
+        let augmented_payload = augment_tool_payload_for_kernel(
+            resolved_tool.canonical_name,
+            injected.payload,
+            session_context,
+        );
+        let request = ToolCoreRequest {
+            tool_name: resolved_tool.canonical_name.to_owned(),
+            payload: augmented_payload,
+        };
+        let (effective_execution_kind, effective_request, effective_intent) =
+            if resolved_tool.canonical_name == "tool.invoke" {
+                match crate::tools::resolve_tool_invoke_request(&request) {
+                    Ok((inner_resolved, inner_request))
+                        if inner_resolved.execution_kind == ToolExecutionKind::App =>
+                    {
+                        let inner_intent = ToolIntent {
+                            tool_name: inner_resolved.canonical_name.to_owned(),
+                            args_json: inner_request.payload.clone(),
+                            source: intent.source.clone(),
+                            session_id: intent.session_id.clone(),
+                            turn_id: intent.turn_id.clone(),
+                            tool_call_id: intent.tool_call_id.clone(),
+                        };
+                        (ToolExecutionKind::App, inner_request, inner_intent)
+                    }
+                    _ => (resolved_tool.execution_kind, request, intent.clone()),
+                }
+            } else {
+                (resolved_tool.execution_kind, request, intent.clone())
+            };
+        let catalog = crate::tools::tool_catalog();
+        let Some(descriptor) = catalog.resolve(effective_request.tool_name.as_str()) else {
+            let reason = format!("tool_descriptor_missing: {}", effective_request.tool_name);
+            return Err(TurnResult::non_retryable_tool_error(
+                "tool_descriptor_missing",
+                reason,
+            ));
+        };
+        let scheduling_class = descriptor.scheduling_class();
+
+        match effective_execution_kind {
+            ToolExecutionKind::Core => {
+                if binding.kernel_context().is_none() {
+                    return Err(TurnResult::policy_denied(
+                        "no_kernel_context",
+                        "no_kernel_context",
+                    ));
+                }
+            }
+            ToolExecutionKind::App => {
+                let kernel_ctx = binding.kernel_context();
+                match app_dispatcher
+                    .maybe_require_approval(
+                        session_context,
+                        &effective_intent,
+                        descriptor,
+                        kernel_ctx,
+                    )
+                    .await
+                {
+                    Ok(Some(requirement)) => return Err(TurnResult::NeedsApproval(requirement)),
+                    Ok(None) => {}
+                    Err(reason) if reason.starts_with("app_tool_denied:") => {
+                        return Err(TurnResult::policy_denied("app_tool_denied", reason));
+                    }
+                    Err(reason) => {
+                        return Err(TurnResult::non_retryable_tool_error(
+                            "app_tool_preflight_failed",
+                            reason,
+                        ));
+                    }
+                }
+            }
+        }
+
+        Ok(PreparedToolIntent {
+            intent: intent.clone(),
+            request: effective_request,
+            execution_kind: effective_execution_kind,
+            scheduling_class,
+            trusted_internal_context: injected.trusted_internal_context,
+        })
+    }
+
+    async fn execute_prepared_tool_intent<D: AppToolDispatcher + ?Sized>(
+        &self,
+        prepared_intent: &PreparedToolIntent,
+        session_context: &SessionContext,
+        app_dispatcher: &D,
+        binding: ConversationRuntimeBinding<'_>,
+    ) -> Result<ToolCoreOutcome, TurnResult> {
+        match prepared_intent.execution_kind {
+            ToolExecutionKind::Core => {
+                let Some(kernel_ctx) = binding.kernel_context() else {
+                    return Err(TurnResult::policy_denied(
+                        "no_kernel_context",
+                        "no_kernel_context",
+                    ));
+                };
+                execute_tool_intent_via_kernel(
+                    prepared_intent.request.clone(),
+                    kernel_ctx,
+                    prepared_intent.trusted_internal_context,
+                )
+                .await
+                .map_err(turn_result_from_tool_execution_failure)
+            }
+            ToolExecutionKind::App => match app_dispatcher
+                .execute_app_tool(session_context, prepared_intent.request.clone(), binding)
+                .await
+            {
+                Ok(outcome) => Ok(outcome),
+                Err(reason) if reason.starts_with("tool_not_visible:") => {
+                    Err(TurnResult::policy_denied("tool_not_visible", reason))
+                }
+                Err(reason)
+                    if reason.starts_with("tool_not_found:")
+                        || reason.starts_with("app_tool_not_found:") =>
+                {
+                    Err(TurnResult::policy_denied("tool_not_found", reason))
+                }
+                Err(reason) if reason.starts_with("app_tool_disabled:") => {
+                    Err(TurnResult::policy_denied("app_tool_disabled", reason))
+                }
+                Err(reason) if reason.starts_with("app_tool_denied:") => {
+                    Err(TurnResult::policy_denied("app_tool_denied", reason))
+                }
+                Err(reason) => Err(TurnResult::non_retryable_tool_error(
+                    "app_tool_execution_failed",
+                    reason,
+                )),
+            },
+        }
     }
 }
 
@@ -1012,7 +1626,9 @@ fn session_context_from_turn(turn: &ProviderTurn, tool_view: ToolView) -> Sessio
 
 #[cfg(test)]
 mod tests {
+    use crate::test_support::unique_temp_dir;
     use std::fs;
+    use std::path::{Path, PathBuf};
 
     use serde_json::json;
 
@@ -1037,13 +1653,19 @@ mod tests {
     }
 
     fn delegate_async_turn(session_id: &str, turn_id: &str, tool_call_id: &str) -> ProviderTurn {
+        let (tool_name, args_json) = crate::tools::synthesize_test_provider_tool_call_with_scope(
+            "delegate_async",
+            json!({
+                "task": "inspect the child task"
+            }),
+            Some(session_id),
+            Some(turn_id),
+        );
         ProviderTurn {
             assistant_text: "queueing child delegate".to_owned(),
             tool_intents: vec![ToolIntent {
-                tool_name: "delegate_async".to_owned(),
-                args_json: json!({
-                    "task": "inspect the child task"
-                }),
+                tool_name,
+                args_json,
                 source: "assistant".to_owned(),
                 session_id: session_id.to_owned(),
                 turn_id: turn_id.to_owned(),
@@ -1051,6 +1673,82 @@ mod tests {
             }],
             raw_meta: json!({}),
         }
+    }
+
+    fn discovered_delegate_async_turn(
+        session_id: &str,
+        turn_id: &str,
+        tool_call_id: &str,
+    ) -> ProviderTurn {
+        delegate_async_turn(session_id, turn_id, tool_call_id)
+    }
+
+    fn browser_companion_click_turn(
+        session_id: &str,
+        turn_id: &str,
+        tool_call_id: &str,
+        companion_session_id: &str,
+    ) -> ProviderTurn {
+        let (tool_name, args_json) = crate::tools::synthesize_test_provider_tool_call_with_scope(
+            "browser.companion.click",
+            json!({
+                "session_id": companion_session_id,
+                "selector": "#submit"
+            }),
+            Some(session_id),
+            Some(turn_id),
+        );
+        ProviderTurn {
+            assistant_text: "clicking through browser companion".to_owned(),
+            tool_intents: vec![ToolIntent {
+                tool_name,
+                args_json,
+                source: "assistant".to_owned(),
+                session_id: session_id.to_owned(),
+                turn_id: turn_id.to_owned(),
+                tool_call_id: tool_call_id.to_owned(),
+            }],
+            raw_meta: json!({}),
+        }
+    }
+
+    fn unique_browser_companion_temp_dir(prefix: &str) -> PathBuf {
+        unique_temp_dir(prefix)
+    }
+
+    #[cfg(unix)]
+    fn write_browser_companion_script(
+        root: &Path,
+        name: &str,
+        stdout_body: &str,
+        log_path: &Path,
+    ) -> PathBuf {
+        let path = root.join(name);
+        let script = format!(
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  printf '1.2.3\\n'\n  exit 0\nfi\nBODY=\"$(cat)\"\nprintf '%s' \"$BODY\" > \"{}\"\nprintf '%s' '{}'\n",
+            log_path.display(),
+            stdout_body.replace('\'', "'\"'\"'")
+        );
+        crate::test_support::write_executable_script_atomically(&path, &script)
+            .expect("write browser companion script");
+        path
+    }
+
+    #[cfg(windows)]
+    fn write_browser_companion_script(
+        root: &Path,
+        name: &str,
+        stdout_body: &str,
+        log_path: &Path,
+    ) -> PathBuf {
+        let path = root.join(format!("{name}.cmd"));
+        let script = format!(
+            "@echo off\r\nif \"%~1\"==\"--version\" (\r\n  echo 1.2.3\r\n  exit /b 0\r\n)\r\nsetlocal enableextensions\r\nset /p BODY=\r\n> \"{}\" <nul set /p =%BODY%\r\necho {}\r\n",
+            log_path.display(),
+            stdout_body
+        );
+        fs::write(&path, script).expect("write browser companion script");
+        path
     }
 
     #[tokio::test]
@@ -1114,6 +1812,76 @@ mod tests {
         assert_eq!(stored.tool_call_id, "call-1");
         assert_eq!(stored.turn_id, "turn-1");
         assert_eq!(stored.approval_key, "tool:delegate_async");
+    }
+
+    #[tokio::test]
+    async fn governed_tool_approval_request_is_persisted_for_discovered_delegate_async() {
+        let memory_config = isolated_memory_config("persist-discovered");
+        let repo = SessionRepository::new(&memory_config).expect("repository");
+        repo.ensure_session(NewSessionRecord {
+            session_id: "root-session".to_owned(),
+            kind: SessionKind::Root,
+            parent_session_id: None,
+            label: Some("Root".to_owned()),
+            state: SessionState::Ready,
+        })
+        .expect("ensure root session");
+
+        let mut tool_config = ToolConfig::default();
+        tool_config.approval.mode = GovernedToolApprovalMode::Strict;
+        let tool_view = runtime_tool_view_for_config(&tool_config);
+        let session_context = SessionContext::root_with_tool_view("root-session", tool_view);
+        let dispatcher = DefaultAppToolDispatcher::new(memory_config.clone(), tool_config);
+
+        let result = TurnEngine::new(4)
+            .execute_turn_in_context(
+                &discovered_delegate_async_turn(
+                    "root-session",
+                    "turn-discovered",
+                    "call-discovered",
+                ),
+                &session_context,
+                &dispatcher,
+                ConversationRuntimeBinding::direct(),
+                None,
+            )
+            .await;
+
+        let approval_request_id = match result {
+            TurnResult::NeedsApproval(requirement) => {
+                assert_eq!(requirement.tool_name.as_deref(), Some("delegate_async"));
+                assert_eq!(
+                    requirement.approval_key.as_deref(),
+                    Some("tool:delegate_async")
+                );
+                requirement
+                    .approval_request_id
+                    .expect("approval request id should be present")
+            }
+            other @ TurnResult::FinalText(_)
+            | other @ TurnResult::ToolDenied(_)
+            | other @ TurnResult::ToolError(_)
+            | other @ TurnResult::ProviderError(_) => {
+                panic!("expected NeedsApproval, got {other:?}")
+            }
+        };
+
+        let stored = repo
+            .load_approval_request(&approval_request_id)
+            .expect("load approval request")
+            .expect("approval request row");
+        assert_eq!(stored.status, ApprovalRequestStatus::Pending);
+        assert_eq!(stored.tool_name, "delegate_async");
+        assert_eq!(stored.turn_id, "turn-discovered");
+        assert_eq!(stored.tool_call_id, "call-discovered");
+        assert_eq!(stored.approval_key, "tool:delegate_async");
+        assert_eq!(stored.request_payload_json["tool_name"], "delegate_async");
+        assert_eq!(
+            stored.request_payload_json["args_json"],
+            json!({
+                "task": "inspect the child task"
+            })
+        );
     }
 
     #[tokio::test]
@@ -1185,5 +1953,400 @@ mod tests {
             .expect("list approval requests");
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].approval_request_id, first_request_id);
+    }
+
+    #[tokio::test]
+    async fn governed_tool_approval_request_is_persisted_for_browser_companion_click() {
+        let memory_config = isolated_memory_config("browser-companion-click-approval");
+        let repo = SessionRepository::new(&memory_config).expect("repository");
+        repo.ensure_session(NewSessionRecord {
+            session_id: "root-session".to_owned(),
+            kind: SessionKind::Root,
+            parent_session_id: None,
+            label: Some("Root".to_owned()),
+            state: SessionState::Ready,
+        })
+        .expect("ensure root session");
+
+        let mut tool_config = ToolConfig::default();
+        tool_config.approval.mode = GovernedToolApprovalMode::Strict;
+        tool_config.browser_companion.enabled = true;
+        tool_config.browser_companion.command = Some("browser-companion".to_owned());
+
+        let mut runtime_config = crate::tools::runtime_config::ToolRuntimeConfig::default();
+        runtime_config.browser_companion.enabled = true;
+        runtime_config.browser_companion.ready = true;
+        runtime_config.browser_companion.command = Some("browser-companion".to_owned());
+
+        let tool_view = crate::tools::runtime_tool_view_for_runtime_config(&runtime_config);
+        let session_context = SessionContext::root_with_tool_view("root-session", tool_view);
+        let dispatcher = DefaultAppToolDispatcher::new(memory_config.clone(), tool_config);
+
+        let result = TurnEngine::new(4)
+            .execute_turn_in_context(
+                &browser_companion_click_turn(
+                    "root-session",
+                    "turn-browser-companion",
+                    "call-browser-companion",
+                    "browser-companion-123",
+                ),
+                &session_context,
+                &dispatcher,
+                ConversationRuntimeBinding::direct(),
+                None,
+            )
+            .await;
+
+        let approval_request_id = match result {
+            TurnResult::NeedsApproval(requirement) => {
+                assert_eq!(
+                    requirement.tool_name.as_deref(),
+                    Some("browser.companion.click")
+                );
+                assert_eq!(
+                    requirement.approval_key.as_deref(),
+                    Some("tool:browser.companion.click")
+                );
+                requirement
+                    .approval_request_id
+                    .expect("approval request id should exist")
+            }
+            other @ TurnResult::FinalText(_)
+            | other @ TurnResult::ToolDenied(_)
+            | other @ TurnResult::ToolError(_)
+            | other @ TurnResult::ProviderError(_) => {
+                panic!("expected NeedsApproval, got {other:?}")
+            }
+        };
+
+        let stored = repo
+            .load_approval_request(&approval_request_id)
+            .expect("load approval request")
+            .expect("approval request row");
+        assert_eq!(stored.status, ApprovalRequestStatus::Pending);
+        assert_eq!(stored.tool_name, "browser.companion.click");
+        assert_eq!(
+            stored.request_payload_json["args_json"]["selector"],
+            "#submit"
+        );
+    }
+
+    #[tokio::test]
+    async fn browser_companion_click_turn_executes_when_approval_is_disabled() {
+        let memory_config = isolated_memory_config("browser-companion-click-exec");
+        let repo = SessionRepository::new(&memory_config).expect("repository");
+        repo.ensure_session(NewSessionRecord {
+            session_id: "root-session".to_owned(),
+            kind: SessionKind::Root,
+            parent_session_id: None,
+            label: Some("Root".to_owned()),
+            state: SessionState::Ready,
+        })
+        .expect("ensure root session");
+
+        let root = unique_browser_companion_temp_dir("loongclaw-turn-engine-browser-companion");
+        fs::create_dir_all(&root).expect("create fixture root");
+        let log_path = root.join("request.json");
+        let script_path = write_browser_companion_script(
+            &root,
+            "browser-companion-click",
+            r#"{"ok":true,"result":{"clicked":true}}"#,
+            &log_path,
+        );
+
+        let mut runtime_config = crate::tools::runtime_config::ToolRuntimeConfig::default();
+        runtime_config.browser_companion.enabled = true;
+        runtime_config.browser_companion.ready = true;
+        runtime_config.browser_companion.command = Some(script_path.display().to_string());
+
+        let start = crate::tools::execute_tool_core_with_config(
+            loongclaw_contracts::ToolCoreRequest {
+                tool_name: "browser.companion.session.start".to_owned(),
+                payload: json!({
+                    "url": "https://example.com",
+                    crate::tools::BROWSER_SESSION_SCOPE_FIELD: "root-session"
+                }),
+            },
+            &runtime_config,
+        )
+        .expect("browser companion start should succeed");
+        let companion_session_id = start.payload["session_id"]
+            .as_str()
+            .expect("session id should exist")
+            .to_owned();
+
+        let mut env = crate::test_support::ScopedEnv::new();
+        env.set("LOONGCLAW_BROWSER_COMPANION_READY", "true");
+
+        let mut tool_config = ToolConfig::default();
+        tool_config.browser_companion.enabled = true;
+        tool_config.browser_companion.command = Some(script_path.display().to_string());
+
+        let tool_view = crate::tools::runtime_tool_view_for_runtime_config(&runtime_config);
+        let session_context = SessionContext::root_with_tool_view("root-session", tool_view);
+        let dispatcher = DefaultAppToolDispatcher::new(memory_config, tool_config);
+
+        let result = TurnEngine::new(4)
+            .execute_turn_in_context(
+                &browser_companion_click_turn(
+                    "root-session",
+                    "turn-browser-companion-exec",
+                    "call-browser-companion-exec",
+                    &companion_session_id,
+                ),
+                &session_context,
+                &dispatcher,
+                ConversationRuntimeBinding::direct(),
+                None,
+            )
+            .await;
+
+        let reply = match result {
+            TurnResult::FinalText(reply) => reply,
+            other @ TurnResult::NeedsApproval(_)
+            | other @ TurnResult::ToolDenied(_)
+            | other @ TurnResult::ToolError(_)
+            | other @ TurnResult::ProviderError(_) => {
+                panic!("expected FinalText, got {other:?}")
+            }
+        };
+        assert!(
+            reply.contains("\"tool\":\"browser.companion.click\""),
+            "reply should include the executed companion tool: {reply}"
+        );
+        assert!(
+            reply.contains("\"status\":\"ok\""),
+            "reply should show a successful tool outcome: {reply}"
+        );
+
+        let request: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&log_path).expect("request log should exist"))
+                .expect("request log should be valid json");
+        assert_eq!(request["session_scope"], "root-session");
+        assert_eq!(request["operation"], "click");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn browser_companion_click_turn_uses_runtime_visible_readiness_without_env_recheck() {
+        let memory_config = isolated_memory_config("browser-companion-click-runtime-ready");
+        let repo = SessionRepository::new(&memory_config).expect("repository");
+        repo.ensure_session(NewSessionRecord {
+            session_id: "root-session".to_owned(),
+            kind: SessionKind::Root,
+            parent_session_id: None,
+            label: Some("Root".to_owned()),
+            state: SessionState::Ready,
+        })
+        .expect("ensure root session");
+
+        let root =
+            unique_browser_companion_temp_dir("loongclaw-turn-engine-browser-companion-runtime");
+        fs::create_dir_all(&root).expect("create fixture root");
+        let log_path = root.join("request.json");
+        let script_path = write_browser_companion_script(
+            &root,
+            "browser-companion-click-runtime",
+            r#"{"ok":true,"result":{"clicked":true}}"#,
+            &log_path,
+        );
+
+        let mut runtime_config = crate::tools::runtime_config::ToolRuntimeConfig::default();
+        runtime_config.browser_companion.enabled = true;
+        runtime_config.browser_companion.ready = true;
+        runtime_config.browser_companion.command = Some(script_path.display().to_string());
+
+        let start = crate::tools::execute_tool_core_with_config(
+            loongclaw_contracts::ToolCoreRequest {
+                tool_name: "browser.companion.session.start".to_owned(),
+                payload: json!({
+                    "url": "https://example.com",
+                    crate::tools::BROWSER_SESSION_SCOPE_FIELD: "root-session"
+                }),
+            },
+            &runtime_config,
+        )
+        .expect("browser companion start should succeed");
+        let companion_session_id = start.payload["session_id"]
+            .as_str()
+            .expect("session id should exist")
+            .to_owned();
+
+        let mut env = crate::test_support::ScopedEnv::new();
+        env.set("LOONGCLAW_BROWSER_COMPANION_READY", "false");
+
+        let mut tool_config = ToolConfig::default();
+        tool_config.browser_companion.enabled = true;
+        tool_config.browser_companion.command = Some(script_path.display().to_string());
+
+        let tool_view = crate::tools::runtime_tool_view_for_runtime_config(&runtime_config);
+        let session_context = SessionContext::root_with_tool_view("root-session", tool_view);
+        let dispatcher = DefaultAppToolDispatcher::new(memory_config, tool_config);
+
+        let result = TurnEngine::new(4)
+            .execute_turn_in_context(
+                &browser_companion_click_turn(
+                    "root-session",
+                    "turn-browser-companion-runtime",
+                    "call-browser-companion-runtime",
+                    &companion_session_id,
+                ),
+                &session_context,
+                &dispatcher,
+                ConversationRuntimeBinding::direct(),
+                None,
+            )
+            .await;
+
+        let reply = match result {
+            TurnResult::FinalText(reply) => reply,
+            other @ TurnResult::NeedsApproval(_)
+            | other @ TurnResult::ToolDenied(_)
+            | other @ TurnResult::ToolError(_)
+            | other @ TurnResult::ProviderError(_) => {
+                panic!("expected FinalText, got {other:?}")
+            }
+        };
+        assert!(
+            reply.contains("\"tool\":\"browser.companion.click\""),
+            "reply should include the executed companion tool: {reply}"
+        );
+        assert!(
+            reply.contains("\"status\":\"ok\""),
+            "reply should show a successful tool outcome: {reply}"
+        );
+
+        let request: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&log_path).expect("request log should exist"))
+                .expect("request log should be valid json");
+        assert_eq!(request["session_scope"], "root-session");
+        assert_eq!(request["operation"], "click");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn browser_companion_click_turn_uses_runtime_visible_policy_when_app_config_is_default() {
+        let memory_config = isolated_memory_config("browser-companion-click-runtime-policy");
+        let repo = SessionRepository::new(&memory_config).expect("repository");
+        repo.ensure_session(NewSessionRecord {
+            session_id: "root-session".to_owned(),
+            kind: SessionKind::Root,
+            parent_session_id: None,
+            label: Some("Root".to_owned()),
+            state: SessionState::Ready,
+        })
+        .expect("ensure root session");
+
+        let root = unique_browser_companion_temp_dir(
+            "loongclaw-turn-engine-browser-companion-runtime-policy",
+        );
+        fs::create_dir_all(&root).expect("create fixture root");
+        let log_path = root.join("request.json");
+        let script_path = write_browser_companion_script(
+            &root,
+            "browser-companion-click-runtime-policy",
+            r#"{"ok":true,"result":{"clicked":true}}"#,
+            &log_path,
+        );
+
+        let mut runtime_config = crate::tools::runtime_config::ToolRuntimeConfig::default();
+        runtime_config.browser_companion.enabled = true;
+        runtime_config.browser_companion.ready = true;
+        runtime_config.browser_companion.command = Some(script_path.display().to_string());
+
+        let start = crate::tools::execute_tool_core_with_config(
+            loongclaw_contracts::ToolCoreRequest {
+                tool_name: "browser.companion.session.start".to_owned(),
+                payload: json!({
+                    "url": "https://example.com",
+                    crate::tools::BROWSER_SESSION_SCOPE_FIELD: "root-session"
+                }),
+            },
+            &runtime_config,
+        )
+        .expect("browser companion start should succeed");
+        let companion_session_id = start.payload["session_id"]
+            .as_str()
+            .expect("session id should exist")
+            .to_owned();
+
+        let mut env = crate::test_support::ScopedEnv::new();
+        env.set("LOONGCLAW_BROWSER_COMPANION_ENABLED", "true");
+        env.set("LOONGCLAW_BROWSER_COMPANION_READY", "false");
+        env.set(
+            "LOONGCLAW_BROWSER_COMPANION_COMMAND",
+            script_path.display().to_string(),
+        );
+
+        let tool_view = crate::tools::runtime_tool_view_for_runtime_config(&runtime_config);
+        let session_context = SessionContext::root_with_tool_view("root-session", tool_view);
+        let dispatcher = DefaultAppToolDispatcher::new(memory_config, ToolConfig::default());
+
+        let result = TurnEngine::new(4)
+            .execute_turn_in_context(
+                &browser_companion_click_turn(
+                    "root-session",
+                    "turn-browser-companion-runtime-policy",
+                    "call-browser-companion-runtime-policy",
+                    &companion_session_id,
+                ),
+                &session_context,
+                &dispatcher,
+                ConversationRuntimeBinding::direct(),
+                None,
+            )
+            .await;
+
+        let reply = match result {
+            TurnResult::FinalText(reply) => reply,
+            other @ TurnResult::NeedsApproval(_)
+            | other @ TurnResult::ToolDenied(_)
+            | other @ TurnResult::ToolError(_)
+            | other @ TurnResult::ProviderError(_) => {
+                panic!("expected FinalText, got {other:?}")
+            }
+        };
+        assert!(
+            reply.contains("\"tool\":\"browser.companion.click\""),
+            "reply should include the executed companion tool: {reply}"
+        );
+        assert!(
+            reply.contains("\"status\":\"ok\""),
+            "reply should show a successful tool outcome: {reply}"
+        );
+
+        let request: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&log_path).expect("request log should exist"))
+                .expect("request log should be valid json");
+        assert_eq!(request["session_scope"], "root-session");
+        assert_eq!(request["operation"], "click");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn augment_tool_payload_injects_browser_scope_for_companion_tool_invoke() {
+        let (tool_name, payload) = crate::tools::synthesize_test_provider_tool_call_with_scope(
+            "browser.companion.session.start",
+            json!({
+                "url": "https://example.com"
+            }),
+            Some("root-session"),
+            Some("turn-browser-companion-start"),
+        );
+
+        let session_context = SessionContext::root_with_tool_view(
+            "root-session",
+            crate::tools::ToolView::from_tool_names(std::iter::empty::<&str>()),
+        );
+        let augmented = augment_tool_payload_for_kernel(&tool_name, payload, &session_context);
+
+        assert_eq!(augmented["tool_id"], "browser.companion.session.start");
+        assert_eq!(
+            augmented["arguments"][crate::tools::BROWSER_SESSION_SCOPE_FIELD],
+            "root-session"
+        );
     }
 }

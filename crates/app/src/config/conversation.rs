@@ -20,6 +20,10 @@ pub struct ConversationConfig {
     pub safe_lane_plan_execution_enabled: bool,
     #[serde(default = "default_fast_lane_max_tool_steps_per_turn")]
     pub fast_lane_max_tool_steps_per_turn: usize,
+    #[serde(default)]
+    pub fast_lane_parallel_tool_execution_enabled: bool,
+    #[serde(default = "default_fast_lane_parallel_tool_execution_max_in_flight")]
+    pub fast_lane_parallel_tool_execution_max_in_flight: usize,
     #[serde(default = "default_safe_lane_max_tool_steps_per_turn")]
     pub safe_lane_max_tool_steps_per_turn: usize,
     #[serde(default = "default_safe_lane_node_max_attempts")]
@@ -118,6 +122,9 @@ impl Default for ConversationConfig {
             hybrid_lane_enabled: default_true(),
             safe_lane_plan_execution_enabled: false,
             fast_lane_max_tool_steps_per_turn: default_fast_lane_max_tool_steps_per_turn(),
+            fast_lane_parallel_tool_execution_enabled: false,
+            fast_lane_parallel_tool_execution_max_in_flight:
+                default_fast_lane_parallel_tool_execution_max_in_flight(),
             safe_lane_max_tool_steps_per_turn: default_safe_lane_max_tool_steps_per_turn(),
             safe_lane_node_max_attempts: default_safe_lane_node_max_attempts(),
             safe_lane_plan_max_wall_time_ms: default_safe_lane_plan_max_wall_time_ms(),
@@ -200,6 +207,8 @@ pub struct ConversationTurnLoopConfig {
     pub max_followup_tool_payload_chars: usize,
     #[serde(default = "default_turn_loop_max_followup_tool_payload_chars_total")]
     pub max_followup_tool_payload_chars_total: usize,
+    #[serde(default = "default_turn_loop_max_discovery_followup_rounds")]
+    pub max_discovery_followup_rounds: usize,
 }
 
 impl Default for ConversationTurnLoopConfig {
@@ -213,6 +222,7 @@ impl Default for ConversationTurnLoopConfig {
             max_followup_tool_payload_chars: default_turn_loop_max_followup_tool_payload_chars(),
             max_followup_tool_payload_chars_total:
                 default_turn_loop_max_followup_tool_payload_chars_total(),
+            max_discovery_followup_rounds: default_turn_loop_max_discovery_followup_rounds(),
         }
     }
 }
@@ -277,6 +287,10 @@ impl ConversationConfig {
 
     pub fn fast_lane_max_tool_steps(&self) -> usize {
         self.fast_lane_max_tool_steps_per_turn.max(1)
+    }
+
+    pub fn fast_lane_parallel_tool_execution_max_in_flight(&self) -> usize {
+        self.fast_lane_parallel_tool_execution_max_in_flight.max(1)
     }
 
     pub fn safe_lane_max_tool_steps(&self) -> usize {
@@ -438,8 +452,16 @@ const fn default_turn_loop_max_followup_tool_payload_chars_total() -> usize {
     20_000
 }
 
+const fn default_turn_loop_max_discovery_followup_rounds() -> usize {
+    2
+}
+
 const fn default_fast_lane_max_tool_steps_per_turn() -> usize {
     1
+}
+
+const fn default_fast_lane_parallel_tool_execution_max_in_flight() -> usize {
+    4
 }
 
 const fn default_safe_lane_max_tool_steps_per_turn() -> usize {
@@ -673,6 +695,16 @@ mod tests {
             ..ConversationConfig::default()
         };
         assert_eq!(too_large.tool_result_payload_summary_limit_chars(), 64_000);
+    }
+
+    #[test]
+    fn fast_lane_parallel_tool_execution_max_in_flight_is_clamped() {
+        let config = ConversationConfig {
+            fast_lane_parallel_tool_execution_max_in_flight: 0,
+            ..ConversationConfig::default()
+        };
+
+        assert_eq!(config.fast_lane_parallel_tool_execution_max_in_flight(), 1);
     }
 
     #[test]

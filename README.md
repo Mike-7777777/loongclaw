@@ -426,6 +426,7 @@ For the full layered execution model, see [ARCHITECTURE.md](ARCHITECTURE.md) and
 Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full workflow.
 
 - [Contributing Guide](CONTRIBUTING.md)
+- [Contribution Areas We Especially Welcome](docs/references/contribution-areas.md)
 - [Code of Conduct](CODE_OF_CONDUCT.md)
 - [Security Policy](SECURITY.md)
 

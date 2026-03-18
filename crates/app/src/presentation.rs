@@ -494,6 +494,38 @@ mod tests {
     }
 
     #[test]
+    fn presentation_current_build_surfaces_embedded_git_trace_metadata_when_available() {
+        let release_build = option_env!("LOONGCLAW_RELEASE_BUILD")
+            .map(str::trim)
+            .is_some_and(is_truthy_env_value);
+        if release_build {
+            return;
+        }
+
+        let version_line = BuildVersionInfo::current().render_version_line();
+
+        if let Some(short_sha) = option_env!("LOONGCLAW_GIT_SHA")
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            assert!(
+                version_line.contains(short_sha),
+                "current build version line should expose the embedded short git sha when build metadata provides it: {version_line}"
+            );
+        }
+
+        if let Some(channel) = option_env!("LOONGCLAW_BUILD_CHANNEL")
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            assert!(
+                version_line.contains(channel),
+                "current build version line should surface the embedded build channel: {version_line}"
+            );
+        }
+    }
+
+    #[test]
     fn presentation_style_brand_lines_can_disable_color() {
         let lines = vec![
             BrandLine::new(BrandLineRole::Banner, "LOONGCLAW"),

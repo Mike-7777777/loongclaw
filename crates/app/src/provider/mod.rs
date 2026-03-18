@@ -43,7 +43,17 @@ mod shape;
 mod transport;
 
 pub use runtime_binding::ProviderRuntimeBinding;
-pub use shape::extract_provider_turn;
+pub use shape::{
+    extract_provider_turn, extract_provider_turn_with_scope,
+    extract_provider_turn_with_scope_and_messages,
+};
+
+pub fn is_auth_style_failure_message(message: &str) -> bool {
+    matches!(
+        profile_health_policy::classify_profile_failure_reason_from_message(message),
+        ProviderFailoverReason::AuthRejected
+    )
+}
 
 #[cfg(test)]
 use auth_profile_runtime::{ProviderAuthProfile, resolve_provider_auth_profiles};
@@ -196,11 +206,15 @@ pub async fn request_completion(
 
 pub async fn request_turn(
     config: &LoongClawConfig,
+    session_id: &str,
+    turn_id: &str,
     messages: &[Value],
     binding: ProviderRuntimeBinding<'_>,
 ) -> CliResult<crate::conversation::turn_engine::ProviderTurn> {
     request_turn_in_view(
         config,
+        session_id,
+        turn_id,
         messages,
         &crate::tools::runtime_tool_view(),
         binding,
@@ -210,6 +224,8 @@ pub async fn request_turn(
 
 pub async fn request_turn_in_view(
     config: &LoongClawConfig,
+    session_id: &str,
+    turn_id: &str,
     messages: &[Value],
     tool_view: &crate::tools::ToolView,
     binding: ProviderRuntimeBinding<'_>,
@@ -235,6 +251,8 @@ pub async fn request_turn_in_view(
         |model, auto_model_mode, auth_profile| {
             request_turn_with_model(
                 config,
+                session_id,
+                turn_id,
                 messages,
                 model,
                 auto_model_mode,

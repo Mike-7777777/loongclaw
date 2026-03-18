@@ -637,21 +637,17 @@ fn build_messages_includes_capability_snapshot_block() {
     assert!(!messages.is_empty());
     let system_content = messages[0]["content"].as_str().expect("system content");
     assert!(
-        system_content.contains("[available_tools]"),
+        system_content.contains("[tool_discovery_runtime]"),
         "system prompt should contain capability snapshot marker, got: {system_content}"
     );
     assert!(
-        system_content.contains("- shell.exec: Execute shell commands"),
-        "system prompt should list shell.exec tool"
+        system_content.contains("- tool.search: Discover non-core tools"),
+        "system prompt should describe tool.search"
     );
-    assert!(
-        system_content.contains("- file.read: Read file contents"),
-        "system prompt should list file.read tool"
-    );
-    assert!(
-        system_content.contains("- file.write: Write file contents"),
-        "system prompt should list file.write tool"
-    );
+    assert!(system_content.contains("- tool.invoke: Invoke a discovered non-core tool"));
+    assert!(!system_content.contains("shell.exec"));
+    assert!(!system_content.contains("file.read"));
+    assert!(!system_content.contains("file.write"));
 }
 
 #[test]
@@ -935,16 +931,7 @@ fn turn_body_includes_tool_schema_and_auto_choice() {
         .filter_map(Value::as_str)
         .collect();
 
-    let mut expected = Vec::new();
-    #[cfg(feature = "tool-file")]
-    {
-        expected.push("file_read");
-        expected.push("file_write");
-    }
-    #[cfg(feature = "tool-shell")]
-    {
-        expected.push("shell_exec");
-    }
+    let expected = vec!["tool_invoke", "tool_search"];
 
     for expected_name in expected {
         assert!(
@@ -1940,6 +1927,8 @@ async fn responses_turn_falls_back_to_chat_completions_for_compatible_endpoints(
 
     let turn = request_turn(
         &config,
+        "session-provider-test",
+        "turn-provider-test",
         &[json!({
             "role": "user",
             "content": "turn ping"
@@ -1966,6 +1955,73 @@ async fn responses_turn_falls_back_to_chat_completions_for_compatible_endpoints(
                 && request.contains("\"tools\"")
         }),
         "turn flow fallback should preserve tool schema on chat-completions: {requests:#?}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn responses_turn_does_not_fallback_for_generic_gateway_failures() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind local provider listener");
+    let addr = listener.local_addr().expect("local addr");
+    let server = std::thread::spawn(move || {
+        let mut requests = Vec::new();
+        for _ in 0..3 {
+            let (mut stream, _) = listener.accept().expect("accept local provider request");
+            let mut request_buf = [0_u8; 8192];
+            let len = stream.read(&mut request_buf).expect("read request");
+            let request = String::from_utf8_lossy(&request_buf[..len]).to_string();
+            requests.push(request.clone());
+
+            let body =
+                r#"{"error":{"message":"temporary backend outage while handling the request"}}"#;
+            let response = format!(
+                "HTTP/1.1 502 Bad Gateway\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write response");
+        }
+        requests
+    });
+
+    let config = test_config(ProviderConfig {
+        kind: ProviderKind::Deepseek,
+        base_url: format!("http://{addr}"),
+        model: "deepseek-chat".to_owned(),
+        wire_api: crate::config::ProviderWireApi::Responses,
+        api_key: Some("deepseek-test-key".to_owned()),
+        ..ProviderConfig::default()
+    });
+
+    let error = request_turn(
+        &config,
+        "session-provider-test",
+        "turn-provider-test",
+        &[json!({
+            "role": "user",
+            "content": "turn ping"
+        })],
+        ProviderRuntimeBinding::direct(),
+    )
+    .await
+    .expect_err("generic gateway failures should stay on the same transport and eventually fail");
+
+    assert!(
+        error.contains("status 502"),
+        "the surfaced error should still report the gateway failure: {error}"
+    );
+
+    let requests = server.join().expect("join local provider server");
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.starts_with("POST /v1/responses ")),
+        "generic gateway failures should not trigger chat-completions fallback: {requests:#?}"
+    );
+    assert!(
+        !requests.is_empty(),
+        "the test server should observe at least the initial responses request"
     );
 }
 

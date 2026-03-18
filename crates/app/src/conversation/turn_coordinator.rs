@@ -2,6 +2,8 @@
 use std::any::Any;
 use std::collections::BTreeSet;
 #[cfg(feature = "memory-sqlite")]
+use std::future::Future;
+#[cfg(feature = "memory-sqlite")]
 use std::panic::AssertUnwindSafe;
 #[cfg(feature = "memory-sqlite")]
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -65,22 +67,27 @@ use super::safe_lane_failure::{
 };
 #[cfg(feature = "memory-sqlite")]
 use super::session_history::{
-    load_assistant_contents_from_session_window, load_latest_turn_checkpoint_entry,
-    load_turn_checkpoint_history_snapshot,
+    AssistantHistoryLoadErrorCode, load_assistant_contents_from_session_window_detailed,
+    load_latest_turn_checkpoint_entry, load_turn_checkpoint_history_snapshot,
+};
+#[cfg(feature = "memory-sqlite")]
+use super::subagent::{
+    ConstrainedSubagentExecution, ConstrainedSubagentMode, ConstrainedSubagentTerminalReason,
 };
 use super::turn_budget::{
     EscalatingAttemptBudget, SafeLaneBackpressureBudget, SafeLaneContinuationBudgetDecision,
     SafeLaneFailureRouteReason, SafeLaneReplanBudget,
 };
 use super::turn_engine::{
-    AppToolDispatcher, DefaultAppToolDispatcher, ProviderTurn, ToolIntent, TurnEngine, TurnFailure,
-    TurnFailureKind, TurnResult, TurnValidation,
+    AppToolDispatcher, DefaultAppToolDispatcher, ProviderTurn, ToolBatchExecutionTrace, ToolIntent,
+    TurnEngine, TurnFailure, TurnFailureKind, TurnResult, TurnValidation,
 };
 use super::turn_shared::{
     ProviderTurnRequestAction, ReplyPersistenceMode, ReplyResolutionMode, ToolDrivenFollowupKind,
     ToolDrivenFollowupPayload, ToolDrivenReplyBaseDecision, ToolDrivenReplyPhase,
     build_tool_driven_followup_tail, decide_provider_turn_request_action,
-    format_approval_required_reply, request_completion_with_raw_fallback,
+    format_approval_required_reply, next_conversation_turn_id, reduce_followup_payload_for_model,
+    request_completion_with_raw_fallback, tool_driven_followup_payload,
     tool_result_contains_truncation_signal, user_requested_raw_tool_output,
 };
 #[cfg(feature = "memory-sqlite")]
@@ -498,10 +505,30 @@ impl SafeLaneRuntimeHealthSignal {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum SafeLaneGovernorHistoryLoadStatus {
+    #[default]
+    Disabled,
+    Loaded,
+    Unavailable,
+}
+
+impl SafeLaneGovernorHistoryLoadStatus {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Loaded => "loaded",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
 struct SafeLaneSessionGovernorDecision {
     engaged: bool,
     history_window_turns: usize,
+    history_load_status: SafeLaneGovernorHistoryLoadStatus,
+    history_load_error: Option<AssistantHistoryLoadErrorCode>,
     failed_final_status_events: u32,
     failed_final_status_threshold: u32,
     failed_threshold_triggered: bool,
@@ -526,10 +553,12 @@ struct SafeLaneSessionGovernorDecision {
 }
 
 impl SafeLaneSessionGovernorDecision {
-    fn as_json(self) -> Value {
+    fn as_json(&self) -> Value {
         json!({
             "engaged": self.engaged,
             "history_window_turns": self.history_window_turns,
+            "history_load_status": self.history_load_status.as_str(),
+            "history_load_error": self.history_load_error.map(|error| error.as_str()),
             "failed_final_status_events": self.failed_final_status_events,
             "failed_final_status_threshold": self.failed_final_status_threshold,
             "failed_threshold_triggered": self.failed_threshold_triggered,
@@ -557,6 +586,8 @@ impl SafeLaneSessionGovernorDecision {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct SafeLaneGovernorHistorySignals {
+    history_load_status: SafeLaneGovernorHistoryLoadStatus,
+    history_load_error: Option<AssistantHistoryLoadErrorCode>,
     summary: SafeLaneEventSummary,
     final_status_failed_samples: Vec<bool>,
     backpressure_failure_samples: Vec<bool>,
@@ -575,6 +606,7 @@ struct SafeLanePlanLoopState {
 
 impl SafeLanePlanLoopState {
     fn new(config: &LoongClawConfig, governor: SafeLaneSessionGovernorDecision) -> Self {
+        let force_no_replan = governor.force_no_replan;
         let mut tool_node_max_attempts = config.conversation.safe_lane_node_max_attempts.max(1);
         if let Some(forced_node_max_attempts) = governor.forced_node_max_attempts {
             tool_node_max_attempts = tool_node_max_attempts.min(forced_node_max_attempts.max(1));
@@ -589,7 +621,7 @@ impl SafeLanePlanLoopState {
 
         Self {
             governor,
-            replan_budget: SafeLaneReplanBudget::new(if governor.force_no_replan {
+            replan_budget: SafeLaneReplanBudget::new(if force_no_replan {
                 0
             } else {
                 config.conversation.safe_lane_replan_max_rounds
@@ -748,13 +780,32 @@ struct ProviderTurnPreparation {
     session: ProviderTurnSessionState,
     lane_plan: ProviderTurnLanePlan,
     raw_tool_output_requested: bool,
+    turn_id: String,
 }
 
 impl ProviderTurnPreparation {
+    #[cfg(test)]
     fn from_assembled_context(
         config: &LoongClawConfig,
         assembled_context: AssembledConversationContext,
         user_input: &str,
+        ingress: Option<&ConversationIngressContext>,
+    ) -> Self {
+        let turn_id = next_conversation_turn_id();
+        Self::from_assembled_context_with_turn_id(
+            config,
+            assembled_context,
+            user_input,
+            turn_id.as_str(),
+            ingress,
+        )
+    }
+
+    fn from_assembled_context_with_turn_id(
+        config: &LoongClawConfig,
+        assembled_context: AssembledConversationContext,
+        user_input: &str,
+        turn_id: &str,
         ingress: Option<&ConversationIngressContext>,
     ) -> Self {
         Self {
@@ -765,6 +816,19 @@ impl ProviderTurnPreparation {
             ),
             lane_plan: ProviderTurnLanePlan::from_user_input(config, user_input),
             raw_tool_output_requested: user_requested_raw_tool_output(user_input),
+            turn_id: turn_id.to_owned(),
+        }
+    }
+
+    fn for_followup_messages(&self, messages: Vec<Value>) -> Self {
+        Self {
+            session: ProviderTurnSessionState {
+                messages,
+                estimated_tokens: None,
+            },
+            lane_plan: self.lane_plan.clone(),
+            raw_tool_output_requested: self.raw_tool_output_requested,
+            turn_id: self.turn_id.clone(),
         }
     }
 
@@ -822,6 +886,7 @@ struct ProviderTurnLaneExecution {
     lane: ExecutionLane,
     assistant_preface: String,
     had_tool_intents: bool,
+    requires_provider_turn_followup: bool,
     raw_tool_output_requested: bool,
     turn_result: TurnResult,
     safe_lane_terminal_route: Option<SafeLaneFailureRoute>,
@@ -854,6 +919,7 @@ struct ProviderTurnContinuePhase {
     lane_execution: ProviderTurnLaneExecution,
     reply_phase: ToolDrivenReplyPhase,
     followup_config: LoongClawConfig,
+    ingress: Option<ConversationIngressContext>,
 }
 
 impl ProviderTurnContinuePhase {
@@ -861,6 +927,7 @@ impl ProviderTurnContinuePhase {
         tool_intents: usize,
         lane_execution: ProviderTurnLaneExecution,
         followup_config: LoongClawConfig,
+        ingress: Option<&ConversationIngressContext>,
     ) -> Self {
         let reply_phase = lane_execution.reply_phase();
         Self {
@@ -868,6 +935,7 @@ impl ProviderTurnContinuePhase {
             lane_execution,
             reply_phase,
             followup_config,
+            ingress: ingress.cloned(),
         }
     }
 
@@ -888,21 +956,33 @@ impl ProviderTurnContinuePhase {
         )
     }
 
-    async fn resolve_reply<R: ConversationRuntime + ?Sized>(
+    fn tool_intent_count(&self) -> usize {
+        match self.request {
+            TurnCheckpointRequest::Continue { tool_intents } => tool_intents,
+            TurnCheckpointRequest::FinalizeInlineProviderError
+            | TurnCheckpointRequest::ReturnError => 0,
+        }
+    }
+
+    async fn resolve<R: ConversationRuntime + ?Sized>(
         &self,
         runtime: &R,
+        session_id: &str,
         preparation: &ProviderTurnPreparation,
         user_input: &str,
+        remaining_provider_rounds: usize,
         binding: ConversationRuntimeBinding<'_>,
-    ) -> String {
+    ) -> ResolvedProviderTurn {
         resolve_provider_turn_reply(
             runtime,
             &self.followup_config,
+            session_id,
             preparation,
-            &self.lane_execution,
-            &self.reply_phase,
+            self,
             user_input,
+            remaining_provider_rounds,
             binding,
+            self.ingress.as_ref(),
         )
         .await
     }
@@ -1910,12 +1990,14 @@ impl ConversationTurnCoordinator {
         let tool_view = session_context.tool_view.clone();
         let visible_ingress = ingress.filter(|value| value.has_contextual_hints());
         emit_turn_ingress_event(runtime, session_id, visible_ingress, binding).await;
-        let preparation = ProviderTurnPreparation::from_assembled_context(
+        let turn_id = next_conversation_turn_id();
+        let preparation = ProviderTurnPreparation::from_assembled_context_with_turn_id(
             config,
             runtime
                 .build_context(config, session_id, true, binding)
                 .await?,
             user_input,
+            turn_id.as_str(),
             visible_ingress,
         );
         let resolved_turn = resolve_provider_turn(
@@ -1925,7 +2007,14 @@ impl ConversationTurnCoordinator {
             user_input,
             &preparation,
             runtime
-                .request_turn(config, &preparation.session.messages, &tool_view, binding)
+                .request_turn(
+                    config,
+                    session_id,
+                    preparation.turn_id.as_str(),
+                    &preparation.session.messages,
+                    &tool_view,
+                    binding,
+                )
                 .await,
             error_mode,
             binding,
@@ -1950,9 +2039,27 @@ impl ConversationTurnCoordinator {
         turn: &ProviderTurn,
     ) -> LoongClawConfig {
         let config_path_from_tool = turn.tool_intents.iter().rev().find_map(|intent| {
-            (crate::tools::canonical_tool_name(intent.tool_name.as_str()) == "provider.switch")
-                .then_some(intent.args_json.as_object())
-                .flatten()
+            let canonical_tool_name = crate::tools::canonical_tool_name(intent.tool_name.as_str());
+            let payload = if canonical_tool_name == "provider.switch" {
+                intent.args_json.as_object()
+            } else if canonical_tool_name == "tool.invoke" {
+                intent
+                    .args_json
+                    .as_object()
+                    .filter(|payload| {
+                        payload
+                            .get("tool_id")
+                            .and_then(Value::as_str)
+                            .map(crate::tools::canonical_tool_name)
+                            == Some("provider.switch")
+                    })
+                    .and_then(|payload| payload.get("arguments"))
+                    .and_then(Value::as_object)
+            } else {
+                None
+            };
+
+            payload
                 .and_then(|payload| payload.get("config_path"))
                 .and_then(Value::as_str)
                 .map(str::trim)
@@ -2167,6 +2274,8 @@ async fn resolve_provider_turn<R: ConversationRuntime + ?Sized>(
 ) -> ResolvedProviderTurn {
     match decide_provider_turn_request_action(result, error_mode) {
         ProviderTurnRequestAction::Continue { turn } => {
+            let turn =
+                scope_provider_turn_tool_intents(turn, session_id, preparation.turn_id.as_str());
             let continue_phase = prepare_provider_turn_continue_phase(
                 config,
                 runtime,
@@ -2177,11 +2286,20 @@ async fn resolve_provider_turn<R: ConversationRuntime + ?Sized>(
                 ingress,
             )
             .await;
-            let reply = continue_phase
-                .resolve_reply(runtime, preparation, user_input, binding)
-                .await;
-            let checkpoint = continue_phase.checkpoint(preparation, user_input, reply.as_str());
-            ResolvedProviderTurn::persist_reply(reply, checkpoint)
+            continue_phase
+                .resolve(
+                    runtime,
+                    session_id,
+                    preparation,
+                    user_input,
+                    config
+                        .conversation
+                        .turn_loop
+                        .max_discovery_followup_rounds
+                        .max(1),
+                    binding,
+                )
+                .await
         }
         ProviderTurnRequestAction::FinalizeInlineProviderError { reply } => {
             ProviderTurnRequestTerminalPhase::persist_inline_provider_error(reply)
@@ -2191,6 +2309,29 @@ async fn resolve_provider_turn<R: ConversationRuntime + ?Sized>(
             ProviderTurnRequestTerminalPhase::return_error(error).resolve(preparation, user_input)
         }
     }
+}
+
+fn scope_provider_turn_tool_intents(
+    mut turn: ProviderTurn,
+    session_id: &str,
+    turn_id: &str,
+) -> ProviderTurn {
+    for intent in &mut turn.tool_intents {
+        if intent.source.starts_with("provider_") {
+            // Provider-originated intents: runtime scope is authoritative.
+            intent.session_id = session_id.to_owned();
+            intent.turn_id = turn_id.to_owned();
+        } else {
+            // Non-provider intents: only fill in if missing.
+            if intent.session_id.trim().is_empty() {
+                intent.session_id = session_id.to_owned();
+            }
+            if intent.turn_id.trim().is_empty() {
+                intent.turn_id = turn_id.to_owned();
+            }
+        }
+    }
+    turn
 }
 
 async fn prepare_provider_turn_continue_phase<R: ConversationRuntime + ?Sized>(
@@ -2215,38 +2356,253 @@ async fn prepare_provider_turn_continue_phase<R: ConversationRuntime + ?Sized>(
     .await;
     let followup_config =
         ConversationTurnCoordinator::reload_followup_provider_config_after_tool_turn(config, &turn);
-    ProviderTurnContinuePhase::new(tool_intents, lane_execution, followup_config)
+    ProviderTurnContinuePhase::new(tool_intents, lane_execution, followup_config, ingress)
 }
 
 async fn resolve_provider_turn_reply<R: ConversationRuntime + ?Sized>(
     runtime: &R,
-    config: &LoongClawConfig,
+    _config: &LoongClawConfig,
+    session_id: &str,
     preparation: &ProviderTurnPreparation,
-    lane_execution: &ProviderTurnLaneExecution,
-    phase: &ToolDrivenReplyPhase,
+    continue_phase: &ProviderTurnContinuePhase,
     user_input: &str,
+    remaining_provider_rounds: usize,
     binding: ConversationRuntimeBinding<'_>,
-) -> String {
-    match phase.decision() {
-        ToolDrivenReplyBaseDecision::FinalizeDirect { reply } => reply.clone(),
-        ToolDrivenReplyBaseDecision::RequireFollowup {
-            raw_reply,
-            payload: followup,
-        } => {
-            let follow_up_messages = build_turn_reply_followup_messages(
-                &preparation.session.messages,
-                lane_execution.assistant_preface.as_str(),
-                followup.clone(),
-                user_input,
-            );
-            request_completion_with_raw_fallback(
+    ingress: Option<&ConversationIngressContext>,
+) -> ResolvedProviderTurn {
+    enum ReplyLoopDecision {
+        FinalizeDirect(String),
+        Followup {
+            raw_reply: String,
+            payload: ToolDrivenFollowupPayload,
+            requires_completion_pass: bool,
+        },
+    }
+
+    let mut current_preparation = preparation.clone();
+    let mut current_continue_phase = continue_phase.clone();
+    let mut remaining_provider_rounds = remaining_provider_rounds.max(1);
+    let mut provider_round_index = 0usize;
+    let kernel_ctx = binding.kernel_context();
+
+    loop {
+        if current_continue_phase
+            .lane_execution
+            .requires_provider_turn_followup
+        {
+            emit_discovery_first_event(
                 runtime,
-                config,
-                &follow_up_messages,
-                binding,
-                raw_reply.as_str(),
+                session_id,
+                "discovery_first_search_round",
+                json!({
+                    "provider_round": provider_round_index,
+                    "search_tool_calls": current_continue_phase.tool_intent_count(),
+                    "raw_tool_output_requested": current_continue_phase
+                        .lane_execution
+                        .raw_tool_output_requested,
+                    "initial_estimated_tokens": estimate_tokens_for_messages(
+                        current_preparation.session.estimated_tokens,
+                        &current_preparation.session.messages,
+                    ),
+                }),
+                kernel_ctx,
             )
-            .await
+            .await;
+        }
+
+        let reply_decision = match current_continue_phase.reply_phase.decision() {
+            ToolDrivenReplyBaseDecision::FinalizeDirect { reply } => {
+                if current_continue_phase
+                    .lane_execution
+                    .requires_provider_turn_followup
+                    && let Some(payload) = tool_driven_followup_payload(
+                        current_continue_phase.lane_execution.had_tool_intents,
+                        &current_continue_phase.lane_execution.turn_result,
+                    )
+                {
+                    ReplyLoopDecision::Followup {
+                        raw_reply: reply.clone(),
+                        payload,
+                        requires_completion_pass: false,
+                    }
+                } else {
+                    ReplyLoopDecision::FinalizeDirect(reply.clone())
+                }
+            }
+            ToolDrivenReplyBaseDecision::RequireFollowup {
+                raw_reply,
+                payload: followup,
+            } => ReplyLoopDecision::Followup {
+                raw_reply: raw_reply.clone(),
+                payload: followup.clone(),
+                requires_completion_pass: true,
+            },
+        };
+
+        match reply_decision {
+            ReplyLoopDecision::FinalizeDirect(reply) => {
+                let checkpoint = current_continue_phase.checkpoint(preparation, user_input, &reply);
+                return ResolvedProviderTurn::persist_reply(reply, checkpoint);
+            }
+            ReplyLoopDecision::Followup {
+                raw_reply,
+                payload: followup,
+                requires_completion_pass,
+            } => {
+                let follow_up_messages = build_turn_reply_followup_messages(
+                    &current_preparation.session.messages,
+                    current_continue_phase
+                        .lane_execution
+                        .assistant_preface
+                        .as_str(),
+                    followup.clone(),
+                    user_input,
+                );
+                if current_continue_phase
+                    .lane_execution
+                    .requires_provider_turn_followup
+                    && remaining_provider_rounds > 1
+                {
+                    remaining_provider_rounds -= 1;
+                    let initial_estimated_tokens = estimate_tokens_for_messages(
+                        current_preparation.session.estimated_tokens,
+                        &current_preparation.session.messages,
+                    );
+                    let followup_estimated_tokens = estimate_tokens(&follow_up_messages);
+                    let followup_added_estimated_tokens = initial_estimated_tokens
+                        .zip(followup_estimated_tokens)
+                        .map(|(initial, followup)| followup.saturating_sub(initial));
+                    let followup_preparation =
+                        current_preparation.for_followup_messages(follow_up_messages);
+                    let followup_tool_view = match runtime.tool_view(
+                        &current_continue_phase.followup_config,
+                        session_id,
+                        binding,
+                    ) {
+                        Ok(tool_view) => tool_view,
+                        Err(_error) => {
+                            let checkpoint = current_continue_phase.checkpoint(
+                                preparation,
+                                user_input,
+                                raw_reply.as_str(),
+                            );
+                            return ResolvedProviderTurn::persist_reply(raw_reply, checkpoint);
+                        }
+                    };
+                    emit_discovery_first_event(
+                        runtime,
+                        session_id,
+                        "discovery_first_followup_requested",
+                        json!({
+                            "provider_round": provider_round_index.saturating_add(1),
+                            "raw_tool_output_requested": current_continue_phase
+                                .lane_execution
+                                .raw_tool_output_requested,
+                            "initial_estimated_tokens": initial_estimated_tokens,
+                            "followup_estimated_tokens": followup_estimated_tokens,
+                            "followup_added_estimated_tokens": followup_added_estimated_tokens,
+                        }),
+                        kernel_ctx,
+                    )
+                    .await;
+                    match decide_provider_turn_request_action(
+                        runtime
+                            .request_turn(
+                                &current_continue_phase.followup_config,
+                                session_id,
+                                followup_preparation.turn_id.as_str(),
+                                &followup_preparation.session.messages,
+                                &followup_tool_view,
+                                binding,
+                            )
+                            .await,
+                        ProviderErrorMode::Propagate,
+                    ) {
+                        ProviderTurnRequestAction::Continue { turn } => {
+                            let turn = scope_provider_turn_tool_intents(
+                                turn,
+                                session_id,
+                                followup_preparation.turn_id.as_str(),
+                            );
+                            let followup_result = summarize_discovery_first_followup_turn(&turn);
+                            emit_discovery_first_event(
+                                runtime,
+                                session_id,
+                                "discovery_first_followup_result",
+                                json!({
+                                    "provider_round": provider_round_index.saturating_add(1),
+                                    "outcome": followup_result.outcome,
+                                    "followup_tool_name": followup_result.followup_tool_name,
+                                    "followup_target_tool_id": followup_result.followup_target_tool_id,
+                                    "resolved_to_tool_invoke": followup_result
+                                        .resolved_to_tool_invoke,
+                                    "raw_tool_output_requested": current_continue_phase
+                                        .lane_execution
+                                        .raw_tool_output_requested,
+                                }),
+                                kernel_ctx,
+                            )
+                            .await;
+                            current_continue_phase = prepare_provider_turn_continue_phase(
+                                &current_continue_phase.followup_config,
+                                runtime,
+                                session_id,
+                                &followup_preparation,
+                                turn,
+                                binding,
+                                ingress,
+                            )
+                            .await;
+                            current_preparation = followup_preparation;
+                            provider_round_index = provider_round_index.saturating_add(1);
+                            continue;
+                        }
+                        ProviderTurnRequestAction::FinalizeInlineProviderError { .. }
+                        | ProviderTurnRequestAction::ReturnError { .. } => {
+                            emit_discovery_first_event(
+                                runtime,
+                                session_id,
+                                "discovery_first_followup_result",
+                                json!({
+                                    "provider_round": provider_round_index.saturating_add(1),
+                                    "outcome": "provider_error",
+                                    "followup_tool_name": Value::Null,
+                                    "followup_target_tool_id": Value::Null,
+                                    "resolved_to_tool_invoke": false,
+                                    "raw_tool_output_requested": current_continue_phase
+                                        .lane_execution
+                                        .raw_tool_output_requested,
+                                }),
+                                kernel_ctx,
+                            )
+                            .await;
+                            let checkpoint = current_continue_phase.checkpoint(
+                                preparation,
+                                user_input,
+                                raw_reply.as_str(),
+                            );
+                            return ResolvedProviderTurn::persist_reply(raw_reply, checkpoint);
+                        }
+                    }
+                }
+                if requires_completion_pass {
+                    let reply = request_completion_with_raw_fallback(
+                        runtime,
+                        &current_continue_phase.followup_config,
+                        &follow_up_messages,
+                        binding,
+                        raw_reply.as_str(),
+                    )
+                    .await;
+                    let checkpoint =
+                        current_continue_phase.checkpoint(preparation, user_input, reply.as_str());
+                    return ResolvedProviderTurn::persist_reply(reply, checkpoint);
+                }
+
+                let checkpoint =
+                    current_continue_phase.checkpoint(preparation, user_input, raw_reply.as_str());
+                return ResolvedProviderTurn::persist_reply(raw_reply, checkpoint);
+            }
         }
     }
 }
@@ -2295,9 +2651,89 @@ fn build_turn_reply_followup_messages(
         &followup,
         user_input,
         None,
-        |_, text| text.to_owned(),
+        |label, text| reduce_followup_payload_for_model(label, text).into_owned(),
     ));
     messages
+}
+
+#[derive(Debug)]
+struct DiscoveryFirstFollowupTurnSummary {
+    outcome: String,
+    followup_tool_name: Option<String>,
+    followup_target_tool_id: Option<String>,
+    resolved_to_tool_invoke: bool,
+}
+
+fn summarize_discovery_first_followup_turn(
+    turn: &ProviderTurn,
+) -> DiscoveryFirstFollowupTurnSummary {
+    let Some(first) = turn.tool_intents.first() else {
+        return DiscoveryFirstFollowupTurnSummary {
+            outcome: "final_reply".to_owned(),
+            followup_tool_name: None,
+            followup_target_tool_id: None,
+            resolved_to_tool_invoke: false,
+        };
+    };
+
+    // Prefer the first `tool.invoke` intent if present; fall back to first intent.
+    let intent = turn
+        .tool_intents
+        .iter()
+        .find(|i| crate::tools::canonical_tool_name(i.tool_name.as_str()) == "tool.invoke")
+        .unwrap_or(first);
+
+    let canonical_tool_name =
+        crate::tools::canonical_tool_name(intent.tool_name.as_str()).to_owned();
+    let resolved_to_tool_invoke = canonical_tool_name == "tool.invoke";
+    let followup_target_tool_id = resolved_to_tool_invoke
+        .then(|| {
+            intent
+                .args_json
+                .get("tool_id")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        })
+        .flatten();
+
+    DiscoveryFirstFollowupTurnSummary {
+        outcome: canonical_tool_name.clone(),
+        followup_tool_name: Some(canonical_tool_name),
+        followup_target_tool_id,
+        resolved_to_tool_invoke,
+    }
+}
+
+fn estimate_tokens_for_messages(
+    estimated_tokens: Option<usize>,
+    messages: &[Value],
+) -> Option<usize> {
+    estimated_tokens.or_else(|| estimate_tokens(messages))
+}
+
+async fn emit_discovery_first_event<R: ConversationRuntime + ?Sized>(
+    runtime: &R,
+    session_id: &str,
+    event_name: &str,
+    payload: Value,
+    kernel_ctx: Option<&KernelContext>,
+) {
+    let binding = ConversationRuntimeBinding::from_optional_kernel_context(kernel_ctx);
+    let _ = persist_conversation_event(runtime, session_id, event_name, payload, binding).await;
+    if let Some(ctx) = kernel_ctx {
+        let _ = ctx.kernel.record_audit_event(
+            Some(ctx.agent_id()),
+            AuditEventKind::PlaneInvoked {
+                pack_id: ctx.pack_id().to_owned(),
+                plane: ExecutionPlane::Runtime,
+                tier: PlaneTier::Core,
+                primary_adapter: "conversation.discovery_first".to_owned(),
+                delegated_core_adapter: None,
+                operation: format!("conversation.discovery_first.{event_name}"),
+                required_capabilities: Vec::new(),
+            },
+        );
+    }
 }
 
 async fn persist_turn_checkpoint_event<R: ConversationRuntime + ?Sized>(
@@ -3008,6 +3444,7 @@ where
                     self.runtime,
                     &session_context,
                     replay_request.payload,
+                    self.binding,
                 )
                 .await
             }
@@ -3318,6 +3755,7 @@ where
                     self.runtime,
                     session_context,
                     request.payload,
+                    binding,
                 )
                 .await
             }
@@ -3349,41 +3787,57 @@ async fn execute_delegate_tool<R: ConversationRuntime + ?Sized>(
     let child_session_id = crate::tools::delegate::next_delegate_session_id();
     let child_label = delegate_request.label.clone();
     let repo = SessionRepository::new(&MemoryRuntimeConfig::from_memory_config(&config.memory))?;
-    let current_depth = repo.session_lineage_depth(&session_context.session_id)?;
-    let next_child_depth = current_depth.saturating_add(1);
-    if next_child_depth > config.tools.delegate.max_depth {
-        return Err(format!(
-            "delegate_depth_exceeded: next child depth {next_child_depth} exceeds configured max_depth {}",
-            config.tools.delegate.max_depth
-        ));
-    }
-
-    repo.create_session_with_event(CreateSessionWithEventRequest {
-        session: NewSessionRecord {
-            session_id: child_session_id.clone(),
-            kind: SessionKind::DelegateChild,
-            parent_session_id: Some(session_context.session_id.clone()),
-            label: child_label.clone(),
-            state: SessionState::Running,
-        },
-        event_kind: "delegate_started".to_owned(),
-        actor_session_id: Some(session_context.session_id.clone()),
-        event_payload_json: json!({
-            "task": delegate_request.task.clone(),
-            "label": child_label.clone(),
-            "timeout_seconds": delegate_request.timeout_seconds,
-        }),
-    })?;
-
-    run_started_delegate_child_turn_with_runtime(
-        config,
+    let next_child_depth = next_delegate_child_depth_for_delegate(config, &repo, session_context)?;
+    with_prepared_subagent_spawn_cleanup_if_kernel_bound(
         runtime,
-        &child_session_id,
         &session_context.session_id,
-        child_label,
-        &delegate_request.task,
-        delegate_request.timeout_seconds,
+        &child_session_id,
         binding,
+        || async {
+            let (_, execution) = repo.create_delegate_child_session_with_event_if_within_limit(
+                &session_context.session_id,
+                config.tools.delegate.max_active_children,
+                |active_children| {
+                    let execution = constrained_subagent_execution_for_delegate(
+                        config,
+                        binding,
+                        ConstrainedSubagentMode::Inline,
+                        delegate_request.timeout_seconds,
+                        next_child_depth,
+                        active_children,
+                    );
+                    Ok((
+                        CreateSessionWithEventRequest {
+                            session: NewSessionRecord {
+                                session_id: child_session_id.clone(),
+                                kind: SessionKind::DelegateChild,
+                                parent_session_id: Some(session_context.session_id.clone()),
+                                label: child_label.clone(),
+                                state: SessionState::Running,
+                            },
+                            event_kind: "delegate_started".to_owned(),
+                            actor_session_id: Some(session_context.session_id.clone()),
+                            event_payload_json: execution
+                                .spawn_payload(&delegate_request.task, child_label.as_deref()),
+                        },
+                        execution,
+                    ))
+                },
+            )?;
+
+            run_started_delegate_child_turn_with_runtime(
+                config,
+                runtime,
+                &child_session_id,
+                &session_context.session_id,
+                child_label,
+                &delegate_request.task,
+                execution,
+                delegate_request.timeout_seconds,
+                binding,
+            )
+            .await
+        },
     )
     .await
 }
@@ -3394,6 +3848,7 @@ async fn execute_delegate_async_tool<R: ConversationRuntime + ?Sized>(
     runtime: &R,
     session_context: &SessionContext,
     payload: Value,
+    binding: ConversationRuntimeBinding<'_>,
 ) -> Result<loongclaw_contracts::ToolCoreOutcome, String> {
     if !config.tools.delegate.enabled {
         return Err("app_tool_disabled: delegate is disabled by config".to_owned());
@@ -3412,31 +3867,37 @@ async fn execute_delegate_async_tool<R: ConversationRuntime + ?Sized>(
     let child_label = delegate_request.label.clone();
     let memory_config = MemoryRuntimeConfig::from_memory_config(&config.memory);
     let repo = SessionRepository::new(&memory_config)?;
-    let current_depth = repo.session_lineage_depth(&session_context.session_id)?;
-    let next_child_depth = current_depth.saturating_add(1);
-    if next_child_depth > config.tools.delegate.max_depth {
-        return Err(format!(
-            "delegate_depth_exceeded: next child depth {next_child_depth} exceeds configured max_depth {}",
-            config.tools.delegate.max_depth
-        ));
-    }
-
-    repo.create_session_with_event(CreateSessionWithEventRequest {
-        session: NewSessionRecord {
-            session_id: child_session_id.clone(),
-            kind: SessionKind::DelegateChild,
-            parent_session_id: Some(session_context.session_id.clone()),
-            label: child_label.clone(),
-            state: SessionState::Ready,
+    let next_child_depth = next_delegate_child_depth_for_delegate(config, &repo, session_context)?;
+    let (_, execution) = repo.create_delegate_child_session_with_event_if_within_limit(
+        &session_context.session_id,
+        config.tools.delegate.max_active_children,
+        |active_children| {
+            let execution = constrained_subagent_execution_for_delegate(
+                config,
+                binding,
+                ConstrainedSubagentMode::Async,
+                delegate_request.timeout_seconds,
+                next_child_depth,
+                active_children,
+            );
+            Ok((
+                CreateSessionWithEventRequest {
+                    session: NewSessionRecord {
+                        session_id: child_session_id.clone(),
+                        kind: SessionKind::DelegateChild,
+                        parent_session_id: Some(session_context.session_id.clone()),
+                        label: child_label.clone(),
+                        state: SessionState::Ready,
+                    },
+                    event_kind: "delegate_queued".to_owned(),
+                    actor_session_id: Some(session_context.session_id.clone()),
+                    event_payload_json: execution
+                        .spawn_payload(&delegate_request.task, child_label.as_deref()),
+                },
+                execution,
+            ))
         },
-        event_kind: "delegate_queued".to_owned(),
-        actor_session_id: Some(session_context.session_id.clone()),
-        event_payload_json: json!({
-            "task": delegate_request.task,
-            "label": child_label,
-            "timeout_seconds": delegate_request.timeout_seconds,
-        }),
-    })?;
+    )?;
 
     spawn_async_delegate_detached(
         runtime_handle,
@@ -3447,7 +3908,9 @@ async fn execute_delegate_async_tool<R: ConversationRuntime + ?Sized>(
             parent_session_id: session_context.session_id.clone(),
             task: delegate_request.task,
             label: child_label,
+            execution,
             timeout_seconds: delegate_request.timeout_seconds,
+            kernel_context: binding.kernel_context().cloned(),
         },
     );
 
@@ -3475,6 +3938,7 @@ async fn execute_delegate_async_tool<R: ConversationRuntime + ?Sized>(
     _runtime: &R,
     _session_context: &SessionContext,
     _payload: Value,
+    _binding: ConversationRuntimeBinding<'_>,
 ) -> Result<loongclaw_contracts::ToolCoreOutcome, String> {
     Err("delegate_async requires sqlite memory support (enable feature `memory-sqlite`)".to_owned())
 }
@@ -3489,6 +3953,7 @@ pub(crate) async fn run_started_delegate_child_turn_with_runtime<
     parent_session_id: &str,
     child_label: Option<String>,
     user_input: &str,
+    execution: ConstrainedSubagentExecution,
     timeout_seconds: u64,
     binding: ConversationRuntimeBinding<'_>,
 ) -> Result<loongclaw_contracts::ToolCoreOutcome, String> {
@@ -3530,10 +3995,12 @@ pub(crate) async fn run_started_delegate_child_turn_with_runtime<
                     last_error: None,
                     event_kind: "delegate_completed".to_owned(),
                     actor_session_id: Some(parent_session_id.to_owned()),
-                    event_payload_json: json!({
-                        "turn_count": turn_count,
-                        "duration_ms": duration_ms,
-                    }),
+                    event_payload_json: execution.terminal_payload(
+                        ConstrainedSubagentTerminalReason::Completed,
+                        duration_ms,
+                        Some(turn_count),
+                        None,
+                    ),
                     outcome_status: outcome.status.clone(),
                     outcome_payload_json: outcome.payload.clone(),
                 },
@@ -3555,10 +4022,12 @@ pub(crate) async fn run_started_delegate_child_turn_with_runtime<
                     last_error: Some(error.clone()),
                     event_kind: "delegate_failed".to_owned(),
                     actor_session_id: Some(parent_session_id.to_owned()),
-                    event_payload_json: json!({
-                        "error": error,
-                        "duration_ms": duration_ms,
-                    }),
+                    event_payload_json: execution.terminal_payload(
+                        ConstrainedSubagentTerminalReason::Failed,
+                        duration_ms,
+                        None,
+                        Some(error.as_str()),
+                    ),
                     outcome_status: outcome.status.clone(),
                     outcome_payload_json: outcome.payload.clone(),
                 },
@@ -3581,10 +4050,12 @@ pub(crate) async fn run_started_delegate_child_turn_with_runtime<
                     last_error: Some(panic_error.clone()),
                     event_kind: "delegate_failed".to_owned(),
                     actor_session_id: Some(parent_session_id.to_owned()),
-                    event_payload_json: json!({
-                        "error": panic_error,
-                        "duration_ms": duration_ms,
-                    }),
+                    event_payload_json: execution.terminal_payload(
+                        ConstrainedSubagentTerminalReason::Failed,
+                        duration_ms,
+                        None,
+                        Some(panic_error.as_str()),
+                    ),
                     outcome_status: outcome.status.clone(),
                     outcome_payload_json: outcome.payload.clone(),
                 },
@@ -3606,10 +4077,12 @@ pub(crate) async fn run_started_delegate_child_turn_with_runtime<
                     last_error: Some(timeout_error.clone()),
                     event_kind: "delegate_timed_out".to_owned(),
                     actor_session_id: Some(parent_session_id.to_owned()),
-                    event_payload_json: json!({
-                        "error": timeout_error,
-                        "duration_ms": duration_ms,
-                    }),
+                    event_payload_json: execution.terminal_payload(
+                        ConstrainedSubagentTerminalReason::TimedOut,
+                        duration_ms,
+                        None,
+                        Some(timeout_error.as_str()),
+                    ),
                     outcome_status: outcome.status.clone(),
                     outcome_payload_json: outcome.payload.clone(),
                 },
@@ -3625,6 +4098,7 @@ fn finalize_async_delegate_spawn_failure(
     child_session_id: &str,
     parent_session_id: &str,
     label: Option<String>,
+    execution: &ConstrainedSubagentExecution,
     error: String,
 ) -> Result<(), String> {
     let repo = SessionRepository::new(memory_config)?;
@@ -3639,9 +4113,12 @@ fn finalize_async_delegate_spawn_failure(
         last_error: Some(error.clone()),
         event_kind: "delegate_spawn_failed".to_owned(),
         actor_session_id: Some(parent_session_id.to_owned()),
-        event_payload_json: json!({
-            "error": error,
-        }),
+        event_payload_json: execution.terminal_payload(
+            ConstrainedSubagentTerminalReason::SpawnFailed,
+            0,
+            None,
+            Some(error.as_str()),
+        ),
         outcome_status: outcome.status,
         outcome_payload_json: outcome.payload,
     };
@@ -3660,6 +4137,7 @@ fn finalize_async_delegate_spawn_failure_with_recovery(
     child_session_id: &str,
     parent_session_id: &str,
     label: Option<String>,
+    execution: &ConstrainedSubagentExecution,
     error: String,
 ) -> Result<(), String> {
     let recovery_label = label.clone();
@@ -3668,6 +4146,7 @@ fn finalize_async_delegate_spawn_failure_with_recovery(
         child_session_id,
         parent_session_id,
         label,
+        execution,
         error.clone(),
     ) {
         Ok(()) => Ok(()),
@@ -3748,6 +4227,7 @@ fn spawn_async_delegate_detached(
     let child_session_id = request.child_session_id.clone();
     let parent_session_id = request.parent_session_id.clone();
     let label = request.label.clone();
+    let execution = request.execution.clone();
     runtime_handle.spawn(async move {
         let spawn_failure = match AssertUnwindSafe(spawner.spawn(request))
             .catch_unwind()
@@ -3763,10 +4243,121 @@ fn spawn_async_delegate_detached(
                 &child_session_id,
                 &parent_session_id,
                 label,
+                &execution,
                 error,
             );
         }
     });
+}
+
+#[cfg(feature = "memory-sqlite")]
+fn constrained_subagent_execution_for_delegate(
+    config: &LoongClawConfig,
+    binding: ConversationRuntimeBinding<'_>,
+    mode: ConstrainedSubagentMode,
+    timeout_seconds: u64,
+    next_child_depth: usize,
+    active_children: usize,
+) -> ConstrainedSubagentExecution {
+    ConstrainedSubagentExecution {
+        mode,
+        depth: next_child_depth,
+        max_depth: config.tools.delegate.max_depth,
+        active_children,
+        max_active_children: config.tools.delegate.max_active_children,
+        timeout_seconds,
+        allow_shell_in_child: config.tools.delegate.allow_shell_in_child,
+        child_tool_allowlist: config.tools.delegate.child_tool_allowlist.clone(),
+        runtime_narrowing: config.tools.delegate.child_runtime.runtime_narrowing(),
+        kernel_bound: binding.is_kernel_bound(),
+    }
+}
+
+#[cfg(feature = "memory-sqlite")]
+fn next_delegate_child_depth_for_delegate(
+    config: &LoongClawConfig,
+    repo: &SessionRepository,
+    session_context: &SessionContext,
+) -> Result<usize, String> {
+    let current_depth = repo.session_lineage_depth(&session_context.session_id)?;
+    let next_child_depth = current_depth.saturating_add(1);
+    if next_child_depth > config.tools.delegate.max_depth {
+        return Err(format!(
+            "delegate_depth_exceeded: next child depth {next_child_depth} exceeds configured max_depth {}",
+            config.tools.delegate.max_depth
+        ));
+    }
+
+    Ok(next_child_depth)
+}
+
+#[cfg(feature = "memory-sqlite")]
+pub(crate) async fn with_prepared_subagent_spawn_cleanup_if_kernel_bound<
+    R: ConversationRuntime + ?Sized,
+    F,
+    Fut,
+    T,
+>(
+    runtime: &R,
+    parent_session_id: &str,
+    child_session_id: &str,
+    binding: ConversationRuntimeBinding<'_>,
+    work: F,
+) -> Result<T, String>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<T, String>>,
+{
+    prepare_subagent_spawn_if_kernel_bound(runtime, parent_session_id, child_session_id, binding)
+        .await?;
+    let work_result = work().await;
+    let notify_result = notify_subagent_ended_if_kernel_bound(
+        runtime,
+        parent_session_id,
+        child_session_id,
+        binding,
+    )
+    .await;
+    match (work_result, notify_result) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(work_error), Ok(())) => Err(work_error),
+        (Ok(_), Err(notify_error)) => {
+            Err(format!("delegate_subagent_end_hook_failed: {notify_error}"))
+        }
+        (Err(work_error), Err(notify_error)) => Err(format!(
+            "{work_error}; delegate_subagent_end_hook_failed: {notify_error}"
+        )),
+    }
+}
+
+#[cfg(feature = "memory-sqlite")]
+async fn prepare_subagent_spawn_if_kernel_bound<R: ConversationRuntime + ?Sized>(
+    runtime: &R,
+    parent_session_id: &str,
+    child_session_id: &str,
+    binding: ConversationRuntimeBinding<'_>,
+) -> Result<(), String> {
+    let Some(kernel_ctx) = binding.kernel_context() else {
+        return Ok(());
+    };
+    runtime
+        .prepare_subagent_spawn(parent_session_id, child_session_id, kernel_ctx)
+        .await
+}
+
+#[cfg(feature = "memory-sqlite")]
+async fn notify_subagent_ended_if_kernel_bound<R: ConversationRuntime + ?Sized>(
+    runtime: &R,
+    parent_session_id: &str,
+    child_session_id: &str,
+    binding: ConversationRuntimeBinding<'_>,
+) -> Result<(), String> {
+    let Some(kernel_ctx) = binding.kernel_context() else {
+        return Ok(());
+    };
+    runtime
+        .on_subagent_ended(parent_session_id, child_session_id, kernel_ctx)
+        .await
 }
 
 #[cfg(feature = "memory-sqlite")]
@@ -3882,6 +4473,9 @@ async fn execute_provider_turn_lane<R: ConversationRuntime + ?Sized>(
     ingress: Option<&ConversationIngressContext>,
 ) -> ProviderTurnLaneExecution {
     let had_tool_intents = !turn.tool_intents.is_empty();
+    let requires_provider_turn_followup = turn.tool_intents.iter().any(|intent| {
+        crate::tools::canonical_tool_name(intent.tool_name.as_str()) == "tool.search"
+    });
     let assistant_preface = turn.assistant_text.clone();
     let lane = preparation.lane_plan.decision.lane;
     let session_context = match runtime.session_context(config, session_id, binding) {
@@ -3891,6 +4485,7 @@ async fn execute_provider_turn_lane<R: ConversationRuntime + ?Sized>(
                 lane,
                 assistant_preface,
                 had_tool_intents,
+                requires_provider_turn_followup,
                 raw_tool_output_requested: preparation.raw_tool_output_requested,
                 turn_result: TurnResult::non_retryable_tool_error("session_context_failed", error),
                 safe_lane_terminal_route: None,
@@ -3909,12 +4504,25 @@ async fn execute_provider_turn_lane<R: ConversationRuntime + ?Sized>(
     let payload_summary_limit_chars = config
         .conversation
         .tool_result_payload_summary_limit_chars();
+    let parallel_tool_execution_enabled = matches!(lane, ExecutionLane::Fast)
+        && config
+            .conversation
+            .fast_lane_parallel_tool_execution_enabled;
+    let parallel_tool_execution_max_in_flight = if parallel_tool_execution_enabled {
+        config
+            .conversation
+            .fast_lane_parallel_tool_execution_max_in_flight()
+    } else {
+        1
+    };
     let use_safe_lane_plan_path = preparation
         .lane_plan
         .should_use_safe_lane_plan_path(config, turn);
-    let engine = TurnEngine::with_tool_result_payload_summary_limit(
+    let engine = TurnEngine::with_parallel_tool_execution(
         preparation.lane_plan.max_tool_steps,
         payload_summary_limit_chars,
+        parallel_tool_execution_enabled,
+        parallel_tool_execution_max_in_flight,
     );
     let validation = if use_safe_lane_plan_path {
         TurnEngine::with_tool_result_payload_summary_limit(usize::MAX, payload_summary_limit_chars)
@@ -3922,9 +4530,9 @@ async fn execute_provider_turn_lane<R: ConversationRuntime + ?Sized>(
     } else {
         engine.validate_turn_in_context(turn, &session_context)
     };
-    let (turn_result, safe_lane_terminal_route) = match validation {
-        Ok(TurnValidation::FinalText(text)) => (TurnResult::FinalText(text), None),
-        Err(failure) => (TurnResult::ToolDenied(failure), None),
+    let (turn_result, safe_lane_terminal_route, fast_lane_tool_batch_trace) = match validation {
+        Ok(TurnValidation::FinalText(text)) => (TurnResult::FinalText(text), None, None),
+        Err(failure) => (TurnResult::ToolDenied(failure), None, None),
         Ok(TurnValidation::ToolExecutionRequired) if use_safe_lane_plan_path => {
             let outcome = execute_turn_with_safe_lane_plan(
                 config,
@@ -3938,20 +4546,47 @@ async fn execute_provider_turn_lane<R: ConversationRuntime + ?Sized>(
                 ingress,
             )
             .await;
-            (outcome.result, outcome.terminal_route)
+            (outcome.result, outcome.terminal_route, None)
         }
-        Ok(TurnValidation::ToolExecutionRequired) => (
-            engine
-                .execute_turn_in_context(turn, &session_context, &app_dispatcher, binding, ingress)
-                .await,
-            None,
-        ),
+        Ok(TurnValidation::ToolExecutionRequired) => {
+            let (result, trace) = engine
+                .execute_turn_in_context_with_trace(
+                    turn,
+                    &session_context,
+                    &app_dispatcher,
+                    binding,
+                    ingress,
+                )
+                .await;
+            (result, None, trace)
+        }
     };
+
+    if let Some(trace) = fast_lane_tool_batch_trace.as_ref()
+        && emit_fast_lane_tool_batch_event(runtime, session_id, trace, binding)
+            .await
+            .is_err()
+        && let Some(ctx) = binding.kernel_context()
+    {
+        let _ = ctx.kernel.record_audit_event(
+            Some(ctx.agent_id()),
+            AuditEventKind::PlaneInvoked {
+                pack_id: ctx.pack_id().to_owned(),
+                plane: ExecutionPlane::Runtime,
+                tier: PlaneTier::Core,
+                primary_adapter: "conversation.fast_lane".to_owned(),
+                delegated_core_adapter: None,
+                operation: "conversation.fast_lane.fast_lane_tool_batch_persist_failed".to_owned(),
+                required_capabilities: Vec::new(),
+            },
+        );
+    }
 
     ProviderTurnLaneExecution {
         lane,
         assistant_preface,
         had_tool_intents,
+        requires_provider_turn_followup,
         raw_tool_output_requested: preparation.raw_tool_output_requested,
         turn_result,
         safe_lane_terminal_route,
@@ -4125,7 +4760,7 @@ async fn execute_turn_with_safe_lane_plan<R: ConversationRuntime + ?Sized>(
                     &verify_failure,
                     state.replan_budget,
                     state.metrics,
-                    state.governor,
+                    &state.governor,
                 );
                 emit_safe_lane_event(
                     config,
@@ -4237,7 +4872,7 @@ async fn execute_turn_with_safe_lane_plan<R: ConversationRuntime + ?Sized>(
                     &round_failure_meta,
                     state.replan_budget,
                     state.metrics,
-                    state.governor,
+                    &state.governor,
                 );
                 let failure_summary = summarize_plan_failure(&failure);
                 emit_safe_lane_event(
@@ -4427,6 +5062,22 @@ async fn emit_safe_lane_event<R: ConversationRuntime + ?Sized>(
             },
         );
     }
+}
+
+async fn emit_fast_lane_tool_batch_event<R: ConversationRuntime + ?Sized>(
+    runtime: &R,
+    session_id: &str,
+    trace: &ToolBatchExecutionTrace,
+    binding: ConversationRuntimeBinding<'_>,
+) -> CliResult<()> {
+    persist_conversation_event(
+        runtime,
+        session_id,
+        "fast_lane_tool_batch",
+        trace.as_event_payload(),
+        binding,
+    )
+    .await
 }
 
 async fn emit_turn_ingress_event<R: ConversationRuntime + ?Sized>(
@@ -4878,6 +5529,8 @@ fn decide_safe_lane_session_governor(
     SafeLaneSessionGovernorDecision {
         engaged,
         history_window_turns,
+        history_load_status: history.history_load_status,
+        history_load_error: history.history_load_error,
         failed_final_status_events,
         failed_final_status_threshold,
         failed_threshold_triggered,
@@ -4924,7 +5577,7 @@ async fn load_safe_lane_history_signals_for_governor(
     #[cfg(feature = "memory-sqlite")]
     {
         let memory_config = MemoryRuntimeConfig::from_memory_config(&config.memory);
-        if let Ok(assistant_contents) = load_assistant_contents_from_session_window(
+        return match load_assistant_contents_from_session_window_detailed(
             session_id,
             window_turns,
             binding,
@@ -4932,13 +5585,21 @@ async fn load_safe_lane_history_signals_for_governor(
         )
         .await
         {
-            return summarize_governor_history_signals(
-                assistant_contents.iter().map(String::as_str),
-            );
-        }
+            Ok(assistant_contents) => {
+                summarize_governor_history_signals(assistant_contents.iter().map(String::as_str))
+            }
+            Err(error) => SafeLaneGovernorHistorySignals {
+                history_load_status: SafeLaneGovernorHistoryLoadStatus::Unavailable,
+                history_load_error: Some(error.code()),
+                ..SafeLaneGovernorHistorySignals::default()
+            },
+        };
     }
 
-    SafeLaneGovernorHistorySignals::default()
+    #[cfg(not(feature = "memory-sqlite"))]
+    {
+        SafeLaneGovernorHistorySignals::default()
+    }
 }
 
 fn summarize_governor_history_signals<'a, I>(
@@ -4949,6 +5610,8 @@ where
 {
     let projection = summarize_safe_lane_history(assistant_contents);
     SafeLaneGovernorHistorySignals {
+        history_load_status: SafeLaneGovernorHistoryLoadStatus::Loaded,
+        history_load_error: None,
         summary: projection.summary,
         final_status_failed_samples: projection.final_status_failed_samples,
         backpressure_failure_samples: projection.backpressure_failure_samples,
@@ -5189,7 +5852,7 @@ impl SafeLaneFailureRoute {
         Self::terminal_with_source(reason, SafeLaneFailureRouteSource::BackpressureGuard)
     }
 
-    fn with_session_governor_override(self, governor: SafeLaneSessionGovernorDecision) -> Self {
+    fn with_session_governor_override(self, governor: &SafeLaneSessionGovernorDecision) -> Self {
         if governor.force_no_replan && self.is_base_round_budget_terminal() {
             return Self::terminal_with_source(
                 SafeLaneFailureRouteReason::SessionGovernorNoReplan,
@@ -5217,7 +5880,7 @@ fn decide_safe_lane_failure_route(
     failure: &TurnFailure,
     replan_budget: SafeLaneReplanBudget,
     metrics: SafeLaneExecutionMetrics,
-    governor: SafeLaneSessionGovernorDecision,
+    governor: &SafeLaneSessionGovernorDecision,
 ) -> SafeLaneFailureRoute {
     SafeLaneFailureRoute::from_failure(failure, replan_budget)
         .with_backpressure_guard(safe_lane_backpressure_budget(config), metrics)
@@ -5477,12 +6140,12 @@ fn terminal_turn_failure_from_verify_failure(
 
 fn turn_result_from_plan_failure(failure: PlanRunFailure) -> TurnResult {
     let failure_meta = turn_failure_from_plan_failure(&failure);
-    match failure_meta.kind {
-        TurnFailureKind::PolicyDenied => TurnResult::ToolDenied(failure_meta),
-        TurnFailureKind::Retryable | TurnFailureKind::NonRetryable => {
-            TurnResult::ToolError(failure_meta)
-        }
-        TurnFailureKind::Provider => TurnResult::ProviderError(failure_meta),
+    if matches!(failure_meta.kind, TurnFailureKind::PolicyDenied) {
+        TurnResult::ToolDenied(failure_meta)
+    } else if matches!(failure_meta.kind, TurnFailureKind::Provider) {
+        TurnResult::ProviderError(failure_meta)
+    } else {
+        TurnResult::ToolError(failure_meta)
     }
 }
 
@@ -5789,6 +6452,18 @@ mod tests {
     fn finalize_async_delegate_spawn_failure_does_not_overwrite_recovered_failure() {
         let memory_config = sqlite_memory_config("recovered-ready-child");
         let repo = SessionRepository::new(&memory_config).expect("session repository");
+        let execution = ConstrainedSubagentExecution {
+            mode: ConstrainedSubagentMode::Async,
+            depth: 1,
+            max_depth: 1,
+            active_children: 0,
+            max_active_children: 1,
+            timeout_seconds: 60,
+            allow_shell_in_child: false,
+            child_tool_allowlist: vec!["file.read".to_owned(), "file.write".to_owned()],
+            runtime_narrowing: crate::tools::runtime_config::ToolRuntimeNarrowing::default(),
+            kernel_bound: false,
+        };
         repo.create_session(NewSessionRecord {
             session_id: "root-session".to_owned(),
             kind: SessionKind::Root,
@@ -5815,6 +6490,7 @@ mod tests {
             "child-session",
             "root-session",
             Some("Child".to_owned()),
+            &execution,
             "spawn unavailable".to_owned(),
         )
         .expect("stale queued spawn failure finalizer should no-op");
@@ -5888,6 +6564,18 @@ mod tests {
     fn finalize_async_delegate_spawn_failure_with_recovery_errors_when_child_session_missing() {
         let memory_config = sqlite_memory_config("missing-ready-child");
         let repo = SessionRepository::new(&memory_config).expect("session repository");
+        let execution = ConstrainedSubagentExecution {
+            mode: ConstrainedSubagentMode::Async,
+            depth: 1,
+            max_depth: 1,
+            active_children: 0,
+            max_active_children: 1,
+            timeout_seconds: 60,
+            allow_shell_in_child: false,
+            child_tool_allowlist: vec!["file.read".to_owned(), "file.write".to_owned()],
+            runtime_narrowing: crate::tools::runtime_config::ToolRuntimeNarrowing::default(),
+            kernel_bound: false,
+        };
         repo.create_session(NewSessionRecord {
             session_id: "root-session".to_owned(),
             kind: SessionKind::Root,
@@ -5902,6 +6590,7 @@ mod tests {
             "child-session",
             "root-session",
             Some("Child".to_owned()),
+            &execution,
             "spawn unavailable".to_owned(),
         )
         .expect_err("missing child session should not bypass spawn failure recovery");
@@ -6036,6 +6725,245 @@ mod tests {
                 .any(|content| content.contains("[tool_result]\n[ok]")),
             "truncated invoke payload should stay as ordinary assistant tool_result content: {messages:?}"
         );
+    }
+
+    #[test]
+    fn build_turn_reply_followup_messages_reduces_file_read_payload_summary() {
+        let content = (0..96)
+            .map(|index| format!("line {index}: {}", "x".repeat(48)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let payload_summary = serde_json::json!({
+            "adapter": "core-tools",
+            "tool_name": "file.read",
+            "path": "/repo/README.md",
+            "bytes": 8_192,
+            "truncated": false,
+            "content": content,
+        })
+        .to_string();
+        let tool_result = format!(
+            "[ok] {}",
+            serde_json::json!({
+                "status": "ok",
+                "tool": "file.read",
+                "tool_call_id": "call-file",
+                "payload_summary": payload_summary,
+                "payload_chars": 8_192,
+                "payload_truncated": false
+            })
+        );
+
+        let messages = build_turn_reply_followup_messages(
+            &[serde_json::json!({
+                "role": "system",
+                "content": "sys"
+            })],
+            "preface",
+            ToolDrivenFollowupPayload::ToolResult { text: tool_result },
+            "summarize README.md",
+        );
+
+        let assistant_tool_result = messages
+            .iter()
+            .find(|message| {
+                message.get("role") == Some(&Value::String("assistant".to_owned()))
+                    && message
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .is_some_and(|content| content.starts_with("[tool_result]\n[ok] "))
+            })
+            .and_then(|message| message.get("content"))
+            .and_then(Value::as_str)
+            .expect("assistant tool_result followup message should exist");
+        let line = assistant_tool_result
+            .lines()
+            .nth(1)
+            .expect("assistant tool_result should keep payload line");
+        let envelope: Value = serde_json::from_str(
+            line.strip_prefix("[ok] ")
+                .expect("tool result line should preserve status prefix"),
+        )
+        .expect("reduced followup envelope should stay valid json");
+        let summary: Value = serde_json::from_str(
+            envelope["payload_summary"]
+                .as_str()
+                .expect("payload summary should stay encoded json"),
+        )
+        .expect("file.read payload summary should stay valid json");
+
+        assert_eq!(envelope["tool"], "file.read");
+        assert_eq!(envelope["payload_truncated"], true);
+        assert_eq!(summary["path"], "/repo/README.md");
+        assert_eq!(summary["bytes"], 8_192);
+        assert_eq!(summary["truncated"], false);
+        assert!(summary.get("content_preview").is_some());
+        assert!(summary.get("content_chars").is_some());
+        assert_eq!(summary["content_truncated"], true);
+    }
+
+    #[test]
+    fn build_turn_reply_followup_messages_reduces_shell_exec_payload_summary() {
+        let tool_result = format!(
+            "[ok] {}",
+            serde_json::json!({
+                "status": "ok",
+                "tool": "shell.exec",
+                "tool_call_id": "call-shell",
+                "payload_summary": serde_json::json!({
+                    "adapter": "core-tools",
+                    "tool_name": "shell.exec",
+                    "command": "cargo",
+                    "args": ["test", "--workspace"],
+                    "cwd": "/repo",
+                    "exit_code": 0,
+                    "stdout": (0..80)
+                        .map(|index| format!("stdout line {index}: {}", "x".repeat(40)))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                    "stderr": (0..48)
+                        .map(|index| format!("stderr line {index}: {}", "e".repeat(32)))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .to_string(),
+                "payload_chars": 8_192,
+                "payload_truncated": false
+            })
+        );
+
+        let messages = build_turn_reply_followup_messages(
+            &[serde_json::json!({
+                "role": "system",
+                "content": "sys"
+            })],
+            "preface",
+            ToolDrivenFollowupPayload::ToolResult { text: tool_result },
+            "summarize the test run",
+        );
+
+        let (envelope, summary) =
+            crate::conversation::turn_shared::parse_tool_result_followup_for_test(&messages);
+
+        assert_eq!(envelope["tool"], "shell.exec");
+        assert_eq!(envelope["payload_truncated"], true);
+        assert_eq!(summary["command"], "cargo");
+        assert_eq!(summary["exit_code"], 0);
+        assert!(summary.get("stdout_preview").is_some());
+        assert!(summary.get("stdout_chars").is_some());
+        assert_eq!(summary["stdout_truncated"], true);
+        assert!(summary.get("stderr_preview").is_some());
+        assert!(summary.get("stderr_chars").is_some());
+        assert_eq!(summary["stderr_truncated"], true);
+        assert!(
+            summary["stdout_preview"]
+                .as_str()
+                .expect("stdout preview should exist")
+                .contains("stdout line 0"),
+            "expected compact stdout preview, got: {summary:?}"
+        );
+        assert!(
+            summary["stderr_preview"]
+                .as_str()
+                .expect("stderr preview should exist")
+                .contains("stderr line 0"),
+            "expected compact stderr preview, got: {summary:?}"
+        );
+    }
+
+    #[test]
+    fn build_turn_reply_followup_messages_compacts_tool_search_payload_summary() {
+        let payload_summary = serde_json::json!({
+            "adapter": "core-tools",
+            "tool_name": "tool.search",
+            "query": "read repo file",
+            "returned": 2,
+            "results": [
+                {
+                    "tool_id": "file.read",
+                    "summary": "Read a UTF-8 text file from the configured workspace root and return contents.",
+                    "argument_hint": "path:string,offset?:integer,limit?:integer",
+                    "required_fields": ["path"],
+                    "required_field_groups": [["path"]],
+                    "tags": ["core", "file", "read"],
+                    "why": ["summary matches query", "tag matches read"],
+                    "lease": "lease-file"
+                },
+                {
+                    "tool_id": "shell.exec",
+                    "summary": "Execute a shell command in the workspace.",
+                    "argument_hint": "command:string,args?:string[]",
+                    "required_fields": ["command"],
+                    "required_field_groups": [["command"]],
+                    "tags": ["core", "shell", "exec"],
+                    "why": ["summary matches query", "tag matches exec"],
+                    "lease": "lease-shell"
+                }
+            ]
+        });
+        let payload_summary_str = payload_summary.to_string();
+        let tool_result = format!(
+            "[ok] {}",
+            serde_json::json!({
+                "status": "ok",
+                "tool": "tool.search",
+                "tool_call_id": "call-search",
+                "payload_chars": 2_048,
+                "payload_summary": payload_summary_str,
+                "payload_truncated": false
+            })
+        );
+
+        let messages = build_turn_reply_followup_messages(
+            &[serde_json::json!({
+                "role": "system",
+                "content": "sys"
+            })],
+            "preface",
+            ToolDrivenFollowupPayload::ToolResult { text: tool_result },
+            "find the right tool",
+        );
+
+        let (envelope, summary) =
+            crate::conversation::turn_shared::parse_tool_result_followup_for_test(&messages);
+        let summary_str = envelope["payload_summary"]
+            .as_str()
+            .expect("payload summary should stay encoded json");
+        let results = summary["results"]
+            .as_array()
+            .expect("results should be an array");
+        let first = &results[0];
+
+        assert_eq!(envelope["tool"], "tool.search");
+        assert_eq!(envelope["payload_truncated"], false);
+        assert_ne!(summary_str, payload_summary.to_string());
+        assert_eq!(summary["query"], "read repo file");
+        assert!(summary.get("adapter").is_none());
+        assert!(summary.get("tool_name").is_none());
+        assert!(summary.get("returned").is_none());
+        assert_eq!(results.len(), 2);
+        assert_eq!(first["tool_id"], "file.read");
+        assert_eq!(first["lease"], "lease-file");
+        for entry in results {
+            assert!(entry.get("tool_id").and_then(Value::as_str).is_some());
+            assert!(entry.get("summary").and_then(Value::as_str).is_some());
+            assert!(entry.get("argument_hint").and_then(Value::as_str).is_some());
+            assert!(
+                entry
+                    .get("required_fields")
+                    .and_then(Value::as_array)
+                    .is_some()
+            );
+            assert!(
+                entry
+                    .get("required_field_groups")
+                    .and_then(Value::as_array)
+                    .is_some()
+            );
+            assert!(entry.get("lease").and_then(Value::as_str).is_some());
+            assert!(entry.get("tags").is_none());
+            assert!(entry.get("why").is_none());
+        }
     }
 
     #[test]
@@ -6202,6 +7130,7 @@ mod tests {
                 lane: ExecutionLane::Safe,
                 assistant_preface: "preface".to_owned(),
                 had_tool_intents: true,
+                requires_provider_turn_followup: false,
                 raw_tool_output_requested: false,
                 turn_result: TurnResult::ToolError(TurnFailure::retryable(
                     "safe_lane_plan_node_retryable_error",
@@ -6214,6 +7143,7 @@ mod tests {
                 }),
             },
             config,
+            None,
         );
 
         let checkpoint =
@@ -6274,6 +7204,133 @@ mod tests {
     }
 
     #[test]
+    fn scope_provider_turn_tool_intents_overrides_existing_provider_ids_with_runtime_scope() {
+        let turn = ProviderTurn {
+            assistant_text: String::new(),
+            tool_intents: vec![
+                ToolIntent {
+                    tool_name: "tool.search".to_owned(),
+                    args_json: json!({"query": "read file"}),
+                    source: "provider_tool_call".to_owned(),
+                    session_id: String::new(),
+                    turn_id: String::new(),
+                    tool_call_id: "call-1".to_owned(),
+                },
+                ToolIntent {
+                    tool_name: "tool.invoke".to_owned(),
+                    args_json: json!({"tool_id": "file.read", "lease": "stub", "arguments": {"path": "README.md"}}),
+                    source: "provider_tool_call".to_owned(),
+                    session_id: "already-session".to_owned(),
+                    turn_id: "already-turn".to_owned(),
+                    tool_call_id: "call-2".to_owned(),
+                },
+            ],
+            raw_meta: Value::Null,
+        };
+
+        let scoped = scope_provider_turn_tool_intents(turn, "session-a", "turn-a");
+
+        // Provider-originated intents always get runtime scope overridden.
+        assert_eq!(scoped.tool_intents[0].session_id, "session-a");
+        assert_eq!(scoped.tool_intents[0].turn_id, "turn-a");
+        assert_eq!(scoped.tool_intents[1].session_id, "session-a");
+        assert_eq!(scoped.tool_intents[1].turn_id, "turn-a");
+    }
+
+    #[test]
+    fn scope_non_provider_turn_tool_intents_preserve_existing_ids() {
+        let turn = ProviderTurn {
+            assistant_text: String::new(),
+            tool_intents: vec![
+                ToolIntent {
+                    tool_name: "tool.search".to_owned(),
+                    args_json: json!({"query": "read file"}),
+                    source: "local_followup".to_owned(),
+                    session_id: "existing-session".to_owned(),
+                    turn_id: "existing-turn".to_owned(),
+                    tool_call_id: "call-1".to_owned(),
+                },
+                ToolIntent {
+                    tool_name: "tool.invoke".to_owned(),
+                    args_json: json!({"tool_id": "file.read", "lease": "stub", "arguments": {"path": "README.md"}}),
+                    source: "local_followup".to_owned(),
+                    session_id: String::new(),
+                    turn_id: String::new(),
+                    tool_call_id: "call-2".to_owned(),
+                },
+            ],
+            raw_meta: Value::Null,
+        };
+
+        let scoped = scope_provider_turn_tool_intents(turn, "session-a", "turn-a");
+
+        assert_eq!(scoped.tool_intents[0].session_id, "existing-session");
+        assert_eq!(scoped.tool_intents[0].turn_id, "existing-turn");
+        assert_eq!(scoped.tool_intents[1].session_id, "session-a");
+        assert_eq!(scoped.tool_intents[1].turn_id, "turn-a");
+    }
+
+    #[test]
+    fn reload_followup_provider_config_reads_provider_switch_wrapped_by_tool_invoke() {
+        use std::fs;
+
+        let root = std::env::temp_dir().join(format!(
+            "loongclaw-provider-switch-followup-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).expect("create fixture root");
+        let config_path = root.join("loongclaw.toml");
+
+        let mut expected = LoongClawConfig::default();
+        let mut openai =
+            crate::config::ProviderConfig::fresh_for_kind(crate::config::ProviderKind::Openai);
+        openai.model = "gpt-5".to_owned();
+        expected.set_active_provider_profile(
+            "openai-gpt-5",
+            crate::config::ProviderProfileConfig {
+                default_for_kind: true,
+                provider: openai.clone(),
+            },
+        );
+        expected.provider = openai;
+        expected.active_provider = Some("openai-gpt-5".to_owned());
+        fs::write(
+            &config_path,
+            crate::config::render(&expected).expect("render config"),
+        )
+        .expect("write config");
+
+        let turn = ProviderTurn {
+            assistant_text: String::new(),
+            tool_intents: vec![ToolIntent {
+                tool_name: "tool.invoke".to_owned(),
+                args_json: json!({
+                    "tool_id": "provider.switch",
+                    "lease": "ignored",
+                    "arguments": {
+                        "selector": "openai",
+                        "config_path": config_path.to_string_lossy()
+                    }
+                }),
+                source: "provider_tool_call".to_owned(),
+                session_id: "session-a".to_owned(),
+                turn_id: "turn-a".to_owned(),
+                tool_call_id: "call-1".to_owned(),
+            }],
+            raw_meta: Value::Null,
+        };
+
+        let reloaded = ConversationTurnCoordinator::reload_followup_provider_config_after_tool_turn(
+            &LoongClawConfig::default(),
+            &turn,
+        );
+
+        assert_eq!(reloaded.active_provider_id(), Some("openai-gpt-5"));
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
     fn provider_turn_continue_phase_checkpoint_keeps_direct_reply_without_followup() {
         let preparation = ProviderTurnPreparation::from_assembled_context(
             &LoongClawConfig::default(),
@@ -6290,11 +7347,13 @@ mod tests {
                 lane: ExecutionLane::Fast,
                 assistant_preface: "preface".to_owned(),
                 had_tool_intents: false,
+                requires_provider_turn_followup: false,
                 raw_tool_output_requested: false,
                 turn_result: TurnResult::FinalText("hello there".to_owned()),
                 safe_lane_terminal_route: None,
             },
             LoongClawConfig::default(),
+            None,
         );
 
         let checkpoint = phase.checkpoint(&preparation, "say hello", "hello there");
@@ -6851,6 +7910,12 @@ mod tests {
     fn turn_failure_from_plan_failure_node_error_mapping_is_stable() {
         let cases = [
             (
+                PlanNodeErrorKind::ApprovalRequired,
+                TurnFailureKind::PolicyDenied,
+                "safe_lane_plan_node_policy_denied",
+                false,
+            ),
+            (
                 PlanNodeErrorKind::PolicyDenied,
                 TurnFailureKind::PolicyDenied,
                 "safe_lane_plan_node_policy_denied",
@@ -7267,7 +8332,7 @@ mod tests {
                 total_attempts_used: 2,
                 ..SafeLaneExecutionMetrics::default()
             },
-            SafeLaneSessionGovernorDecision::default(),
+            &SafeLaneSessionGovernorDecision::default(),
         );
 
         assert_eq!(route.decision, SafeLaneFailureRouteDecision::Terminal);
@@ -7286,7 +8351,7 @@ mod tests {
             &TurnFailure::retryable("safe_lane_plan_node_retryable_error", "transient"),
             SafeLaneReplanBudget::new(1).after_replan(),
             SafeLaneExecutionMetrics::default(),
-            SafeLaneSessionGovernorDecision {
+            &SafeLaneSessionGovernorDecision {
                 force_no_replan: true,
                 ..SafeLaneSessionGovernorDecision::default()
             },
@@ -7443,6 +8508,8 @@ mod tests {
         let mut summary = SafeLaneEventSummary::default();
         summary.final_status_counts.insert("failed".to_owned(), 1);
         let history = SafeLaneGovernorHistorySignals {
+            history_load_status: SafeLaneGovernorHistoryLoadStatus::Loaded,
+            history_load_error: None,
             summary,
             final_status_failed_samples: vec![false, true, true, true],
             backpressure_failure_samples: vec![false, false, false, false],
@@ -7494,6 +8561,8 @@ mod tests {
         let mut summary = SafeLaneEventSummary::default();
         summary.final_status_counts.insert("failed".to_owned(), 1);
         let history = SafeLaneGovernorHistorySignals {
+            history_load_status: SafeLaneGovernorHistoryLoadStatus::Loaded,
+            history_load_error: None,
             summary,
             final_status_failed_samples: vec![true, false, false, false, false],
             backpressure_failure_samples: vec![true, false, false, false, false],
@@ -7518,7 +8587,7 @@ mod tests {
             force_no_replan: true,
             ..SafeLaneSessionGovernorDecision::default()
         };
-        let overridden = route.with_session_governor_override(governor);
+        let overridden = route.with_session_governor_override(&governor);
         assert_eq!(
             overridden.reason,
             SafeLaneFailureRouteReason::SessionGovernorNoReplan

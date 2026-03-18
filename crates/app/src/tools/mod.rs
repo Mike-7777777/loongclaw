@@ -5,10 +5,15 @@ use std::{
     ffi::OsString,
     future::Future,
     path::{Path, PathBuf},
+    sync::OnceLock,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use loongclaw_contracts::{Capability, ToolCoreOutcome, ToolCoreRequest};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use crate::KernelContext;
 use crate::config::ToolConfig;
@@ -17,8 +22,11 @@ use crate::memory::runtime_config::MemoryRuntimeConfig;
 pub(crate) mod approval;
 #[cfg(feature = "tool-browser")]
 mod browser;
+#[cfg(feature = "tool-browser")]
+mod browser_companion;
+mod bundled_skills;
 mod catalog;
-mod claw_import;
+mod claw_migrate;
 pub(crate) mod delegate;
 mod external_skills;
 #[cfg(feature = "feishu-integration")]
@@ -37,7 +45,7 @@ mod web_fetch;
 
 pub use catalog::{
     ToolApprovalMode, ToolAvailability, ToolCatalog, ToolDescriptor, ToolExecutionKind,
-    ToolGovernanceProfile, ToolGovernanceScope, ToolRiskClass, ToolView,
+    ToolGovernanceProfile, ToolGovernanceScope, ToolRiskClass, ToolSchedulingClass, ToolView,
     delegate_child_tool_view_for_config, delegate_child_tool_view_for_config_with_delegate,
     governance_profile_for_descriptor, governance_profile_for_tool_name,
     planned_delegate_child_tool_view, planned_root_tool_view, runtime_tool_view,
@@ -49,11 +57,21 @@ pub(crate) use feishu::{DeferredFeishuCardUpdate, drain_deferred_feishu_card_upd
 pub use kernel_adapter::MvpToolAdapter;
 
 pub(crate) const BROWSER_SESSION_SCOPE_FIELD: &str = "__loongclaw_browser_scope";
+pub const BROWSER_COMPANION_PREVIEW_SKILL_ID: &str =
+    bundled_skills::BROWSER_COMPANION_PREVIEW_SKILL_ID;
+pub const BROWSER_COMPANION_COMMAND: &str = bundled_skills::BROWSER_COMPANION_COMMAND;
 
 pub(crate) const LOONGCLAW_INTERNAL_TOOL_CONTEXT_KEY: &str = "_loongclaw";
+const LOONGCLAW_INTERNAL_TOOL_SEARCH_KEY: &str = "tool_search";
+const LOONGCLAW_INTERNAL_TOOL_SEARCH_VISIBLE_TOOL_IDS_KEY: &str = "visible_tool_ids";
+pub(crate) const LOONGCLAW_INTERNAL_RUNTIME_NARROWING_KEY: &str = "runtime_narrowing";
 
 pub fn normalize_external_skills_domain_rule(raw: &str) -> Result<String, String> {
     external_skills::normalize_domain_rule(raw)
+}
+
+pub fn normalize_external_skill_domain_rule(raw: &str) -> Result<String, String> {
+    normalize_external_skills_domain_rule(raw)
 }
 
 tokio::task_local! {
@@ -111,17 +129,25 @@ fn payload_uses_reserved_internal_tool_context(payload: &Value) -> bool {
         .as_object()
         .is_some_and(|body| body.contains_key(LOONGCLAW_INTERNAL_TOOL_CONTEXT_KEY))
 }
-
 /// Execute a tool request, routing through the kernel for
 /// policy enforcement and audit recording.
 ///
 /// All requests are dispatched via `kernel.execute_tool_core` which
-/// enforces `InvokeTool` capability, runs policy extensions, and records
-/// audit events.  Callers must always supply a `KernelContext`.
+/// enforces the derived capability set for the effective tool request, runs
+/// policy extensions, and records audit events.
+/// `kernel.execute_tool_core` which enforces the derived capability set
+/// for the effective tool request and records audit events.
 pub async fn execute_tool(
     request: ToolCoreRequest,
     kernel_ctx: &KernelContext,
 ) -> Result<ToolCoreOutcome, String> {
+    let request = prepare_kernel_tool_request(
+        request,
+        &kernel_ctx.token.allowed_capabilities,
+        Some(kernel_ctx.token.token_id.as_str()),
+        None,
+        None,
+    );
     execute_kernel_tool_request(kernel_ctx, request, false)
         .await
         .map_err(|e| format!("{e}"))
@@ -132,7 +158,7 @@ pub(crate) async fn execute_kernel_tool_request(
     request: ToolCoreRequest,
     trusted_internal_payload: bool,
 ) -> Result<ToolCoreOutcome, loongclaw_kernel::KernelError> {
-    let caps = BTreeSet::from([Capability::InvokeTool]);
+    let caps = required_capabilities_for_request(&request);
     if trusted_internal_payload {
         return with_trusted_internal_tool_payload_async(async move {
             ctx.kernel
@@ -157,6 +183,37 @@ pub fn execute_app_tool_with_config(
     memory_config: &MemoryRuntimeConfig,
     tool_config: &ToolConfig,
 ) -> Result<ToolCoreOutcome, String> {
+    execute_app_tool_with_browser_companion_readiness(
+        request,
+        current_session_id,
+        memory_config,
+        tool_config,
+        false,
+    )
+}
+
+pub(crate) fn execute_app_tool_with_visibility_checked_config(
+    request: ToolCoreRequest,
+    current_session_id: &str,
+    memory_config: &MemoryRuntimeConfig,
+    tool_config: &ToolConfig,
+) -> Result<ToolCoreOutcome, String> {
+    execute_app_tool_with_browser_companion_readiness(
+        request,
+        current_session_id,
+        memory_config,
+        tool_config,
+        true,
+    )
+}
+
+fn execute_app_tool_with_browser_companion_readiness(
+    request: ToolCoreRequest,
+    current_session_id: &str,
+    memory_config: &MemoryRuntimeConfig,
+    tool_config: &ToolConfig,
+    assume_browser_companion_ready: bool,
+) -> Result<ToolCoreOutcome, String> {
     let canonical_name = canonical_tool_name(request.tool_name.as_str());
     let request = ToolCoreRequest {
         tool_name: canonical_name.to_owned(),
@@ -180,6 +237,22 @@ pub fn execute_app_tool_with_config(
                 memory_config,
                 tool_config,
             )
+        }
+        #[cfg(feature = "tool-browser")]
+        "browser.companion.click" | "browser.companion.type" => {
+            if assume_browser_companion_ready {
+                browser_companion::execute_browser_companion_visible_app_tool_with_config(
+                    request,
+                    current_session_id,
+                    tool_config,
+                )
+            } else {
+                browser_companion::execute_browser_companion_app_tool_with_config(
+                    request,
+                    current_session_id,
+                    tool_config,
+                )
+            }
         }
         _ => Err(format!(
             "app_tool_not_found: unknown app tool `{}`",
@@ -224,7 +297,7 @@ pub async fn wait_for_session_with_config(
 /// - `..` past the filesystem root (or volume root on Windows) is silently dropped.
 /// - Relative paths preserve leading `..` components (e.g. `../../foo` stays as-is).
 ///
-/// All three path-handling modules (`file`, `claw_import`, `file_policy_ext`) use
+/// All three path-handling modules (`file`, `claw_migrate`, `file_policy_ext`) use
 /// this single implementation to avoid divergence.
 pub(super) fn normalize_without_fs(path: &Path) -> PathBuf {
     use std::path::Component;
@@ -274,6 +347,62 @@ pub(super) fn normalize_without_fs(path: &Path) -> PathBuf {
     }
 }
 
+const TOOL_SEARCH_GRANTED_CAPABILITIES_FIELD: &str = "_granted_capabilities";
+const TOOL_LEASE_TOKEN_ID_FIELD: &str = "_lease_token_id";
+const TOOL_LEASE_SESSION_ID_FIELD: &str = "_lease_session_id";
+const TOOL_LEASE_TURN_ID_FIELD: &str = "_lease_turn_id";
+
+pub(crate) fn prepare_kernel_tool_request(
+    mut request: ToolCoreRequest,
+    granted_capabilities: &BTreeSet<Capability>,
+    token_id: Option<&str>,
+    session_id: Option<&str>,
+    turn_id: Option<&str>,
+) -> ToolCoreRequest {
+    let canonical_tool_name = canonical_tool_name(request.tool_name.as_str());
+    if !matches!(canonical_tool_name, "tool.search" | "tool.invoke") {
+        return request;
+    }
+
+    if let Value::Object(payload) = &mut request.payload {
+        if canonical_tool_name == "tool.search" {
+            let granted =
+                serde_json::to_value(granted_capabilities.iter().copied().collect::<Vec<_>>())
+                    .unwrap_or_else(|_| Value::Array(Vec::new()));
+            payload.insert(TOOL_SEARCH_GRANTED_CAPABILITIES_FIELD.to_owned(), granted);
+        }
+        inject_tool_lease_binding(payload, token_id, session_id, turn_id);
+    }
+
+    request
+}
+
+fn inject_tool_lease_binding(
+    payload: &mut serde_json::Map<String, Value>,
+    token_id: Option<&str>,
+    session_id: Option<&str>,
+    turn_id: Option<&str>,
+) {
+    if let Some(token_id) = token_id {
+        payload.insert(
+            TOOL_LEASE_TOKEN_ID_FIELD.to_owned(),
+            Value::String(token_id.to_owned()),
+        );
+    }
+    if let Some(session_id) = session_id {
+        payload.insert(
+            TOOL_LEASE_SESSION_ID_FIELD.to_owned(),
+            Value::String(session_id.to_owned()),
+        );
+    }
+    if let Some(turn_id) = turn_id {
+        payload.insert(
+            TOOL_LEASE_TURN_ID_FIELD.to_owned(),
+            Value::String(turn_id.to_owned()),
+        );
+    }
+}
+
 pub fn canonical_tool_name(raw: &str) -> &str {
     let catalog = tool_catalog();
     if let Some(descriptor) = catalog.resolve(raw) {
@@ -284,6 +413,77 @@ pub fn canonical_tool_name(raw: &str) -> &str {
         return canonical;
     }
     raw
+}
+
+pub(crate) fn required_capabilities_for_request(request: &ToolCoreRequest) -> BTreeSet<Capability> {
+    required_capabilities_for_tool_name_and_payload(
+        canonical_tool_name(request.tool_name.as_str()),
+        &request.payload,
+    )
+}
+
+fn required_capabilities_for_tool_name_and_payload(
+    tool_name: &str,
+    payload: &Value,
+) -> BTreeSet<Capability> {
+    let mut caps = BTreeSet::from([Capability::InvokeTool]);
+    match tool_name {
+        "tool.invoke" => {
+            let Some((invoked_tool_name, invoked_payload)) =
+                invoked_discoverable_tool_request(payload)
+            else {
+                return caps;
+            };
+            return required_capabilities_for_tool_name_and_payload(
+                invoked_tool_name,
+                invoked_payload,
+            );
+        }
+        "file.read" => {
+            caps.insert(Capability::FilesystemRead);
+        }
+        "file.write" => {
+            caps.insert(Capability::FilesystemWrite);
+        }
+        "claw.migrate" => {
+            caps.insert(Capability::FilesystemRead);
+            if claw_migrate_mode_requires_write(payload) {
+                caps.insert(Capability::FilesystemWrite);
+            }
+        }
+        _ => {}
+    }
+    caps
+}
+
+fn invoked_discoverable_tool_request(payload: &Value) -> Option<(&str, &Value)> {
+    let tool_id = payload
+        .get("tool_id")
+        .and_then(Value::as_str)
+        .map(canonical_tool_name)?;
+    if matches!(tool_id, "tool.search" | "tool.invoke") {
+        return None;
+    }
+    let resolved = resolve_tool_execution(tool_id)?;
+    if is_provider_exposed_tool_name(resolved.canonical_name) {
+        return None;
+    }
+    Some((
+        resolved.canonical_name,
+        payload.get("arguments").unwrap_or(payload),
+    ))
+}
+
+fn claw_migrate_mode_requires_write(payload: &Value) -> bool {
+    matches!(
+        payload
+            .get("mode")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("plan"),
+        "apply" | "apply_selected" | "rollback_last_apply"
+    )
 }
 
 pub fn is_known_tool_name(raw: &str) -> bool {
@@ -304,22 +504,27 @@ pub fn is_known_tool_name(raw: &str) -> bool {
 }
 
 pub fn is_known_tool_name_in_view(raw: &str, view: &ToolView) -> bool {
-    view.contains(canonical_tool_name(raw))
+    let canonical_name = canonical_tool_name(raw);
+    is_provider_exposed_tool_name(canonical_name) || view.contains(canonical_name)
 }
 
-pub(crate) fn runtime_tool_view_from_loongclaw_config(
+pub fn is_provider_exposed_tool_name(raw: &str) -> bool {
+    catalog::find_tool_catalog_entry(canonical_tool_name(raw))
+        .is_some_and(|entry| entry.is_provider_core())
+}
+
+pub fn runtime_tool_view_from_loongclaw_config(
     config: &crate::config::LoongClawConfig,
 ) -> ToolView {
     let runtime_config = runtime_config::ToolRuntimeConfig::from_loongclaw_config(config, None);
     runtime_tool_view_with_runtime_config(&config.tools, &runtime_config)
 }
 
-pub(crate) fn runtime_tool_view_with_runtime_config(
-    tool_config: &crate::config::ToolConfig,
+fn build_runtime_tool_view_for_runtime_config(
     runtime_config: &runtime_config::ToolRuntimeConfig,
 ) -> ToolView {
     let catalog = tool_catalog();
-    let mut names = runtime_tool_view_for_config(tool_config)
+    let mut names = runtime_tool_view_for_runtime_config(runtime_config)
         .iter(&catalog)
         .map(|descriptor| descriptor.name)
         .collect::<Vec<_>>();
@@ -334,6 +539,23 @@ pub(crate) fn runtime_tool_view_with_runtime_config(
     ToolView::from_tool_names(names)
 }
 
+pub(crate) fn runtime_tool_view_with_runtime_config(
+    _tool_config: &crate::config::ToolConfig,
+    runtime_config: &runtime_config::ToolRuntimeConfig,
+) -> ToolView {
+    build_runtime_tool_view_for_runtime_config(runtime_config)
+}
+
+/// Build a tool view from runtime config (respecting runtime toggles) plus
+/// feishu entries when the feishu integration is configured. This avoids
+/// using `ToolConfig::default()` which ignores runtime-disabled tools.
+fn full_runtime_tool_view_for_runtime_config(
+    config: &runtime_config::ToolRuntimeConfig,
+) -> ToolView {
+    build_runtime_tool_view_for_runtime_config(config)
+}
+
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct ResolvedToolExecution {
     pub canonical_name: &'static str,
     pub execution_kind: ToolExecutionKind,
@@ -374,8 +596,68 @@ pub fn execute_tool_core_with_config(
         tool_name: canonical_name.to_owned(),
         payload: request.payload,
     };
+    let effective_config = trusted_runtime_narrowing_from_payload(&request.payload)?
+        .map(|narrowing| config.narrowed(&narrowing));
+    let config = effective_config.as_ref().unwrap_or(config);
     match canonical_name {
-        "claw.import" => claw_import::execute_claw_import_tool_with_config(request, config),
+        "tool.search" => execute_tool_search_tool_with_config(request, config),
+        "tool.invoke" => execute_tool_invoke_tool_with_config(request, config),
+        _ => execute_discoverable_tool_core_with_config(request, config),
+    }
+}
+
+fn trusted_runtime_narrowing_from_payload(
+    payload: &Value,
+) -> Result<Option<runtime_config::ToolRuntimeNarrowing>, String> {
+    if !trusted_internal_tool_payload_enabled() {
+        return Ok(None);
+    }
+
+    let Some(value) = payload
+        .get(LOONGCLAW_INTERNAL_TOOL_CONTEXT_KEY)
+        .and_then(|body| body.get(LOONGCLAW_INTERNAL_RUNTIME_NARROWING_KEY))
+        .cloned()
+    else {
+        return Ok(None);
+    };
+
+    serde_json::from_value(value)
+        .map(Some)
+        .map_err(|error| format!("invalid_internal_runtime_narrowing: {error}"))
+}
+
+fn merge_trusted_internal_tool_context_into_arguments(
+    arguments: &mut serde_json::Map<String, Value>,
+    internal_context: &Value,
+) -> Result<(), String> {
+    let trusted_context = internal_context.as_object().cloned().ok_or_else(|| {
+        format!("tool.invoke payload.{LOONGCLAW_INTERNAL_TOOL_CONTEXT_KEY} must be an object")
+    })?;
+    let merged_context = match arguments.remove(LOONGCLAW_INTERNAL_TOOL_CONTEXT_KEY) {
+        None => Value::Object(trusted_context),
+        Some(Value::Object(mut existing_context)) => {
+            existing_context.extend(trusted_context);
+            Value::Object(existing_context)
+        }
+        Some(_) => {
+            return Err(format!(
+                "tool.invoke payload.arguments.{LOONGCLAW_INTERNAL_TOOL_CONTEXT_KEY} must be an object"
+            ));
+        }
+    };
+    arguments.insert(
+        LOONGCLAW_INTERNAL_TOOL_CONTEXT_KEY.to_owned(),
+        merged_context,
+    );
+    Ok(())
+}
+
+fn execute_discoverable_tool_core_with_config(
+    request: ToolCoreRequest,
+    config: &runtime_config::ToolRuntimeConfig,
+) -> Result<ToolCoreOutcome, String> {
+    match request.tool_name.as_str() {
+        "claw.migrate" => claw_migrate::execute_claw_migrate_tool_with_config(request, config),
         "external_skills.inspect" => {
             external_skills::execute_external_skills_inspect_tool_with_config(request, config)
         }
@@ -396,6 +678,14 @@ pub fn execute_tool_core_with_config(
         }
         "external_skills.remove" => {
             external_skills::execute_external_skills_remove_tool_with_config(request, config)
+        }
+        #[cfg(feature = "tool-browser")]
+        "browser.companion.session.start"
+        | "browser.companion.navigate"
+        | "browser.companion.snapshot"
+        | "browser.companion.wait"
+        | "browser.companion.session.stop" => {
+            browser_companion::execute_browser_companion_core_tool_with_config(request, config)
         }
         #[cfg(feature = "tool-browser")]
         "browser.open" | "browser.extract" | "browser.click" => {
@@ -427,6 +717,16 @@ pub struct ToolRegistryEntry {
     pub description: &'static str,
 }
 
+#[derive(Debug, Clone)]
+struct SearchableToolEntry {
+    canonical_name: String,
+    summary: String,
+    argument_hint: String,
+    required_fields: Vec<String>,
+    required_field_groups: Vec<Vec<String>>,
+    tags: Vec<String>,
+}
+
 /// Returns a sorted list of all registered tools, gated by feature flags.
 pub fn tool_registry() -> Vec<ToolRegistryEntry> {
     tool_registry_with_config(Some(runtime_config::get_tool_runtime_config()))
@@ -435,20 +735,33 @@ pub fn tool_registry() -> Vec<ToolRegistryEntry> {
 pub(crate) fn tool_registry_with_config(
     config: Option<&runtime_config::ToolRuntimeConfig>,
 ) -> Vec<ToolRegistryEntry> {
-    let catalog = tool_catalog();
-    let mut entries =
-        runtime_tool_view_for_runtime_config(runtime_config::get_tool_runtime_config())
-            .iter(&catalog)
-            .map(|descriptor| ToolRegistryEntry {
-                name: descriptor.name,
-                description: descriptor.description,
-            })
-            .collect::<Vec<_>>();
+    let default_runtime_config;
+    let config = match config {
+        Some(config) => config,
+        None => {
+            default_runtime_config = runtime_config::ToolRuntimeConfig::default();
+            &default_runtime_config
+        }
+    };
+    let runtime_visible_tool_view = full_runtime_tool_view_for_runtime_config(config);
+    let mut entries: Vec<ToolRegistryEntry> = catalog::discoverable_tool_catalog()
+        .into_iter()
+        .filter(|entry| runtime_visible_tool_view.contains(entry.canonical_name))
+        .filter(|entry| tool_search_entry_is_runtime_usable(*entry, config))
+        .map(|entry| ToolRegistryEntry {
+            name: entry.canonical_name,
+            description: entry.summary,
+        })
+        .collect();
     #[cfg(feature = "feishu-integration")]
-    if feishu_runtime_enabled(config) {
-        entries.extend(feishu::feishu_tool_registry_entries());
-        entries.sort_by_key(|entry| entry.name);
+    if config.feishu.is_some() {
+        entries.extend(
+            feishu::feishu_tool_registry_entries()
+                .into_iter()
+                .filter(|entry| runtime_visible_tool_view.contains(entry.name)),
+        );
     }
+    entries.sort_by_key(|entry| entry.name);
     entries
 }
 
@@ -467,33 +780,16 @@ pub fn capability_snapshot_for_view(view: &ToolView) -> String {
 }
 
 pub(crate) fn capability_snapshot_for_view_with_config(
-    view: &ToolView,
-    config: &runtime_config::ToolRuntimeConfig,
+    _view: &ToolView,
+    _config: &runtime_config::ToolRuntimeConfig,
 ) -> String {
-    let root_view = runtime_tool_view();
-    let mut lines = vec!["[available_tools]".to_owned()];
-    if view == &root_view {
-        for entry in tool_registry_with_config(Some(config)) {
-            lines.push(format!("- {}: {}", entry.name, entry.description));
-        }
-    } else {
-        let catalog = tool_catalog();
-        for descriptor in view.iter(&catalog) {
-            lines.push(format!("- {}: {}", descriptor.name, descriptor.description));
-        }
+    let mut lines = vec!["[tool_discovery_runtime]".to_owned()];
+    for entry in catalog::provider_core_tool_catalog() {
+        lines.push(format!("- {}: {}", entry.canonical_name, entry.summary));
     }
-    let catalog = tool_catalog();
-    let includes_external_skills = view
-        .iter(&catalog)
-        .any(|descriptor| descriptor.name.starts_with("external_skills."));
-    if includes_external_skills
-        && let Ok(skill_lines) = external_skills::installed_skill_snapshot_lines_with_config(config)
-        && !skill_lines.is_empty()
-    {
-        lines.push(String::new());
-        lines.push("[available_external_skills]".to_owned());
-        lines.extend(skill_lines);
-    }
+    lines.push(
+        "Non-core tools are intentionally hidden until discovered with tool.search.".to_owned(),
+    );
     lines.join("\n")
 }
 
@@ -506,45 +802,653 @@ pub fn provider_tool_definitions() -> Vec<Value> {
 }
 
 pub(crate) fn provider_tool_definitions_with_config(
-    config: Option<&runtime_config::ToolRuntimeConfig>,
+    _config: Option<&runtime_config::ToolRuntimeConfig>,
 ) -> Vec<Value> {
+    provider_tool_definitions_for_view(&runtime_tool_view())
+}
+
+pub fn try_provider_tool_definitions_for_view(_view: &ToolView) -> Result<Vec<Value>, String> {
+    Ok(provider_tool_definitions_for_view(_view))
+}
+
+fn provider_tool_definitions_for_view(_view: &ToolView) -> Vec<Value> {
     let catalog = tool_catalog();
-    let mut tools = runtime_tool_view()
-        .iter(&catalog)
-        .map(|descriptor| {
-            debug_assert_eq!(descriptor.availability, ToolAvailability::Runtime);
-            descriptor.provider_definition()
+    let mut tools = catalog
+        .descriptors()
+        .iter()
+        .filter(|descriptor| {
+            descriptor.is_provider_core() && descriptor.availability == ToolAvailability::Runtime
         })
+        .map(ToolDescriptor::provider_definition)
         .collect::<Vec<_>>();
-    #[cfg(feature = "feishu-integration")]
-    if feishu_runtime_enabled(config) {
-        tools.extend(feishu::feishu_provider_tool_definitions());
-        tools.sort_by(|left, right| tool_function_name(left).cmp(tool_function_name(right)));
-    }
+    tools.sort_by(|left, right| tool_function_name(left).cmp(tool_function_name(right)));
     tools
 }
 
-pub fn try_provider_tool_definitions_for_view(view: &ToolView) -> Result<Vec<Value>, String> {
-    let catalog = tool_catalog();
-    let mut tools = Vec::new();
-    for descriptor in view.iter(&catalog) {
-        if descriptor.availability != ToolAvailability::Runtime {
-            return Err(format!(
-                "tool_not_advertisable: `{}` is still planned and cannot be exposed yet",
-                descriptor.name
-            ));
-        }
-        tools.push(descriptor.provider_definition());
+fn search_argument_hint_from_provider_definition(parameters: &Value) -> String {
+    let Some(properties) = parameters.get("properties").and_then(Value::as_object) else {
+        return String::new();
+    };
+    let required = schema_required_fields(parameters)
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let mut fields = properties
+        .iter()
+        .map(|(name, schema)| {
+            let schema_type = schema
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("value");
+            let suffix = if required.contains(name.as_str()) {
+                ""
+            } else {
+                "?"
+            };
+            format!("{name}{suffix}:{schema_type}")
+        })
+        .collect::<Vec<_>>();
+    fields.sort();
+    fields.join(",")
+}
+
+fn schema_required_fields(parameters: &Value) -> Vec<String> {
+    parameters
+        .get("required")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn schema_required_field_groups(parameters: &Value) -> Vec<Vec<String>> {
+    ["anyOf", "oneOf"]
+        .into_iter()
+        .filter_map(|key| parameters.get(key).and_then(Value::as_array))
+        .flatten()
+        .filter_map(|schema| {
+            let required = schema
+                .get("required")
+                .and_then(Value::as_array)?
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            if required.is_empty() {
+                None
+            } else {
+                Some(required)
+            }
+        })
+        .collect()
+}
+
+fn default_required_field_groups(
+    required_fields: &[String],
+    mut required_field_groups: Vec<Vec<String>>,
+) -> Vec<Vec<String>> {
+    if required_field_groups.is_empty() && !required_fields.is_empty() {
+        required_field_groups.push(required_fields.to_vec());
     }
-    Ok(tools)
+    required_field_groups
+}
+
+fn searchable_entry_from_catalog(entry: catalog::ToolCatalogEntry) -> SearchableToolEntry {
+    let required_fields = entry
+        .required_fields
+        .iter()
+        .map(|field| (*field).to_owned())
+        .collect::<Vec<_>>();
+    let required_field_groups = catalog::tool_required_field_groups(entry.canonical_name)
+        .iter()
+        .map(|group| {
+            group
+                .iter()
+                .map(|field| (*field).to_owned())
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let required_field_groups =
+        default_required_field_groups(&required_fields, required_field_groups);
+
+    SearchableToolEntry {
+        canonical_name: entry.canonical_name.to_owned(),
+        summary: entry.summary.to_owned(),
+        argument_hint: entry.argument_hint.to_owned(),
+        required_fields,
+        required_field_groups,
+        tags: entry.tags.iter().map(|tag| (*tag).to_owned()).collect(),
+    }
 }
 
 #[cfg(feature = "feishu-integration")]
-fn feishu_runtime_enabled(config: Option<&runtime_config::ToolRuntimeConfig>) -> bool {
-    match config {
-        Some(config) => config.feishu.is_some(),
-        None => runtime_config::get_tool_runtime_config().feishu.is_some(),
+fn feishu_searchable_entries() -> Vec<SearchableToolEntry> {
+    feishu::feishu_provider_tool_definitions()
+        .into_iter()
+        .filter_map(|tool| {
+            let function = tool.get("function")?;
+            let provider_name = function.get("name")?.as_str()?;
+            let parameters = function
+                .get("parameters")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            let required_fields = schema_required_fields(&parameters);
+            let required_field_groups = default_required_field_groups(
+                &required_fields,
+                schema_required_field_groups(&parameters),
+            );
+            Some(SearchableToolEntry {
+                canonical_name: canonical_tool_name(provider_name).to_owned(),
+                summary: function
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                argument_hint: search_argument_hint_from_provider_definition(&parameters),
+                required_field_groups,
+                required_fields,
+                tags: vec!["feishu".to_owned()],
+            })
+        })
+        .collect()
+}
+
+fn search_tool_view_from_payload(
+    payload: &serde_json::Map<String, Value>,
+    config: &runtime_config::ToolRuntimeConfig,
+) -> ToolView {
+    let visible_tool_names = if trusted_internal_tool_payload_enabled() {
+        payload
+            .get(LOONGCLAW_INTERNAL_TOOL_CONTEXT_KEY)
+            .and_then(|body| body.get(LOONGCLAW_INTERNAL_TOOL_SEARCH_KEY))
+            .and_then(|body| body.get(LOONGCLAW_INTERNAL_TOOL_SEARCH_VISIBLE_TOOL_IDS_KEY))
+            .and_then(Value::as_array)
+            .map(|tool_names| {
+                tool_names
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(canonical_tool_name)
+                    .collect::<Vec<_>>()
+            })
+    } else {
+        None
+    };
+    match visible_tool_names {
+        Some(visible_tool_names) => ToolView::from_tool_names(visible_tool_names),
+        None => full_runtime_tool_view_for_runtime_config(config),
     }
+}
+
+fn runtime_discoverable_tool_entries(
+    config: &runtime_config::ToolRuntimeConfig,
+    visible_tool_view: Option<&ToolView>,
+) -> Vec<SearchableToolEntry> {
+    let runtime_view = full_runtime_tool_view_for_runtime_config(config);
+    let intersected_view;
+    let visible_tool_view = match visible_tool_view {
+        Some(injected) => {
+            // Intersect the injected view with the runtime-visible surface so that
+            // trusted _loongclaw.tool_search.visible_tool_ids cannot re-expose
+            // tools disabled by runtime config (browser.*, session_*, etc.).
+            intersected_view = injected.intersect(&runtime_view);
+            &intersected_view
+        }
+        None => &runtime_view,
+    };
+    let mut entries = catalog::discoverable_tool_catalog()
+        .into_iter()
+        .filter(|entry| visible_tool_view.contains(entry.canonical_name))
+        .filter(|entry| tool_search_entry_is_runtime_usable(*entry, config))
+        .map(searchable_entry_from_catalog)
+        .collect::<Vec<_>>();
+    #[cfg(feature = "feishu-integration")]
+    if config.feishu.is_some() {
+        entries.extend(
+            feishu_searchable_entries()
+                .into_iter()
+                .filter(|entry| visible_tool_view.contains(entry.canonical_name.as_str())),
+        );
+    }
+    entries
+}
+
+pub fn tool_parameter_schema_types() -> BTreeMap<String, BTreeMap<String, &'static str>> {
+    let mut tools_by_name = BTreeMap::<String, BTreeMap<String, &'static str>>::new();
+    for entry in catalog::all_tool_catalog() {
+        let parameters = entry
+            .parameter_types
+            .iter()
+            .map(|(parameter_name, parameter_type)| ((*parameter_name).to_owned(), *parameter_type))
+            .collect::<BTreeMap<_, _>>();
+        if !parameters.is_empty() {
+            tools_by_name.insert(entry.canonical_name.to_owned(), parameters);
+        }
+    }
+    tools_by_name
+}
+
+const TOOL_LEASE_TTL_SECONDS: u64 = 300;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ToolLeaseClaims {
+    tool_id: String,
+    catalog_digest: String,
+    expires_at_unix: u64,
+    token_id: Option<String>,
+    session_id: Option<String>,
+    turn_id: Option<String>,
+}
+fn execute_tool_search_tool_with_config(
+    request: ToolCoreRequest,
+    config: &runtime_config::ToolRuntimeConfig,
+) -> Result<ToolCoreOutcome, String> {
+    let payload = request
+        .payload
+        .as_object()
+        .ok_or_else(|| "tool.search payload must be an object".to_owned())?;
+    let query = payload
+        .get("query")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "tool.search requires payload.query".to_owned())?;
+    let limit = payload
+        .get("limit")
+        .and_then(Value::as_u64)
+        .map(|value| value.clamp(1, 8) as usize)
+        .unwrap_or(5);
+    let granted_capabilities = payload
+        .get(TOOL_SEARCH_GRANTED_CAPABILITIES_FIELD)
+        .cloned()
+        .and_then(|value| serde_json::from_value::<BTreeSet<Capability>>(value).ok());
+    let visible_tool_view = search_tool_view_from_payload(payload, config);
+
+    let query_normalized = query.to_ascii_lowercase();
+    let tokens = tokenize_search_query(query_normalized.as_str());
+    let mut ranked: Vec<(u32, Vec<String>, SearchableToolEntry)> =
+        runtime_discoverable_tool_entries(config, Some(&visible_tool_view))
+            .into_iter()
+            .filter(|entry| {
+                tool_search_entry_is_capability_usable(
+                    entry.canonical_name.as_str(),
+                    granted_capabilities.as_ref(),
+                )
+            })
+            .filter_map(|entry| {
+                let (score, why) = search_score(&entry, query_normalized.as_str(), &tokens);
+                if score == 0 {
+                    None
+                } else {
+                    Some((score, why, entry))
+                }
+            })
+            .collect();
+    ranked.sort_by(|(left_score, _, left), (right_score, _, right)| {
+        right_score
+            .cmp(left_score)
+            .then_with(|| left.canonical_name.cmp(&right.canonical_name))
+    });
+
+    let results: Vec<Value> = ranked
+        .into_iter()
+        .take(limit)
+        .map(|(_score, why, entry)| {
+            json!({
+                "tool_id": entry.canonical_name,
+                "summary": entry.summary,
+                "argument_hint": entry.argument_hint,
+                "required_fields": entry.required_fields,
+                "required_field_groups": entry.required_field_groups,
+                "tags": entry.tags,
+                "why": why,
+                "lease": issue_tool_lease(entry.canonical_name.as_str(), payload),
+            })
+        })
+        .collect();
+
+    Ok(ToolCoreOutcome {
+        status: "ok".to_owned(),
+        payload: json!({
+            "adapter": "core-tools",
+            "tool_name": request.tool_name,
+            "query": query,
+            "returned": results.len(),
+            "results": results,
+        }),
+    })
+}
+
+fn tool_search_entry_is_runtime_usable(
+    entry: catalog::ToolCatalogEntry,
+    config: &runtime_config::ToolRuntimeConfig,
+) -> bool {
+    match entry.canonical_name {
+        "shell.exec" => {
+            !config.shell_allow.is_empty()
+                || matches!(
+                    config.shell_default_mode,
+                    crate::tools::shell_policy_ext::ShellPolicyDefault::Allow
+                )
+        }
+        "external_skills.fetch"
+        | "external_skills.install"
+        | "external_skills.inspect"
+        | "external_skills.invoke"
+        | "external_skills.list"
+        | "external_skills.remove" => config.external_skills.enabled,
+        _ => true,
+    }
+}
+
+fn tool_search_entry_is_capability_usable(
+    tool_name: &str,
+    granted_capabilities: Option<&BTreeSet<Capability>>,
+) -> bool {
+    let Some(granted_capabilities) = granted_capabilities else {
+        return true;
+    };
+    let required = required_capabilities_for_tool_name_and_payload(tool_name, &json!({}));
+    required
+        .iter()
+        .all(|capability| granted_capabilities.contains(capability))
+}
+
+pub(crate) fn resolve_tool_invoke_request(
+    request: &ToolCoreRequest,
+) -> Result<(ResolvedToolExecution, ToolCoreRequest), String> {
+    if canonical_tool_name(request.tool_name.as_str()) != "tool.invoke" {
+        return Err(format!(
+            "tool_invoke_required: expected `tool.invoke`, got `{}`",
+            request.tool_name
+        ));
+    }
+
+    let payload = request
+        .payload
+        .as_object()
+        .ok_or_else(|| "tool.invoke payload must be an object".to_owned())?;
+    let tool_id = payload
+        .get("tool_id")
+        .and_then(Value::as_str)
+        .map(canonical_tool_name)
+        .ok_or_else(|| "tool.invoke requires payload.tool_id".to_owned())?;
+    let lease = payload
+        .get("lease")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "tool.invoke requires payload.lease".to_owned())?;
+    let mut arguments = payload
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    {
+        let arguments_object = arguments
+            .as_object_mut()
+            .ok_or_else(|| "tool.invoke payload.arguments must be an object".to_owned())?;
+        if let Some(internal_context) = payload.get(LOONGCLAW_INTERNAL_TOOL_CONTEXT_KEY) {
+            merge_trusted_internal_tool_context_into_arguments(arguments_object, internal_context)?;
+        }
+    }
+
+    let resolved = resolve_tool_execution(tool_id)
+        .ok_or_else(|| format!("tool_not_found: unknown tool `{tool_id}`"))?;
+    let resolved_tool_name = resolved.canonical_name;
+    if is_provider_exposed_tool_name(resolved_tool_name) {
+        return Err(format!(
+            "tool_not_provider_exposed: {} must be called directly as a core tool",
+            resolved_tool_name
+        ));
+    }
+    validate_tool_lease(resolved_tool_name, lease, payload)?;
+
+    Ok((
+        resolved,
+        ToolCoreRequest {
+            tool_name: resolved_tool_name.to_owned(),
+            payload: arguments,
+        },
+    ))
+}
+
+fn execute_tool_invoke_tool_with_config(
+    request: ToolCoreRequest,
+    config: &runtime_config::ToolRuntimeConfig,
+) -> Result<ToolCoreOutcome, String> {
+    let (entry, effective_request) = resolve_tool_invoke_request(&request)?;
+    match entry.execution_kind {
+        ToolExecutionKind::Core => {
+            execute_discoverable_tool_core_with_config(effective_request, config)
+        }
+        ToolExecutionKind::App => Err(format!(
+            "tool_requires_app_dispatcher: {}",
+            entry.canonical_name
+        )),
+    }
+}
+
+fn tokenize_search_query(query: &str) -> Vec<String> {
+    query
+        .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_' && ch != '-')
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+fn search_score(entry: &SearchableToolEntry, query: &str, tokens: &[String]) -> (u32, Vec<String>) {
+    let name = entry.canonical_name.to_ascii_lowercase();
+    let summary = entry.summary.to_ascii_lowercase();
+    let argument_hint = entry.argument_hint.to_ascii_lowercase();
+    let tags = entry.tags.join(" ").to_ascii_lowercase();
+
+    let mut score = 0u32;
+    let mut why = Vec::new();
+
+    if name.contains(query) {
+        score += 50;
+        why.push("name_match".to_owned());
+    }
+    if summary.contains(query) {
+        score += 30;
+        why.push("summary_match".to_owned());
+    }
+    if argument_hint.contains(query) {
+        score += 20;
+        why.push("argument_match".to_owned());
+    }
+
+    for token in tokens {
+        if name.contains(token) {
+            score += 16;
+            why.push(format!("name:{token}"));
+        }
+        if summary.contains(token) {
+            score += 10;
+            why.push(format!("summary:{token}"));
+        }
+        if argument_hint.contains(token) {
+            score += 8;
+            why.push(format!("argument:{token}"));
+        }
+        if tags.contains(token) {
+            score += 12;
+            why.push(format!("tag:{token}"));
+        }
+    }
+
+    (score, why)
+}
+
+fn issue_tool_lease(tool_id: &str, payload: &serde_json::Map<String, Value>) -> String {
+    let binding = extract_tool_lease_binding(payload);
+    let claims = ToolLeaseClaims {
+        tool_id: tool_id.to_owned(),
+        catalog_digest: tool_catalog_digest(),
+        expires_at_unix: now_unix_seconds().saturating_add(TOOL_LEASE_TTL_SECONDS),
+        token_id: binding.token_id,
+        session_id: binding.session_id,
+        turn_id: binding.turn_id,
+    };
+    let claims_bytes = serde_json::to_vec(&claims).unwrap_or_default();
+    let encoded_claims = URL_SAFE_NO_PAD.encode(claims_bytes);
+    let signature = sign_tool_lease(encoded_claims.as_str());
+    format!("{encoded_claims}.{signature}")
+}
+
+#[allow(dead_code)]
+pub(crate) fn bridge_provider_tool_call_with_scope(
+    tool_name: &str,
+    args_json: Value,
+    session_id: Option<&str>,
+    turn_id: Option<&str>,
+) -> (String, Value) {
+    let canonical_name = canonical_tool_name(tool_name).to_owned();
+    let Some(entry) = catalog::find_tool_catalog_entry(canonical_name.as_str()) else {
+        return (canonical_name, args_json);
+    };
+    if !entry.is_discoverable() {
+        return (canonical_name, args_json);
+    }
+    let mut lease_payload = serde_json::Map::new();
+    inject_tool_lease_binding(&mut lease_payload, None, session_id, turn_id);
+    let lease = issue_tool_lease(entry.canonical_name, &lease_payload);
+    let mut outer_payload = serde_json::Map::new();
+    outer_payload.insert("tool_id".to_owned(), json!(entry.canonical_name));
+    outer_payload.insert("lease".to_owned(), json!(lease));
+    outer_payload.insert("arguments".to_owned(), args_json);
+    for (key, value) in lease_payload {
+        outer_payload.insert(key, value);
+    }
+    ("tool.invoke".to_owned(), Value::Object(outer_payload))
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn synthesize_test_provider_tool_call(
+    tool_name: &str,
+    args_json: Value,
+) -> (String, Value) {
+    bridge_provider_tool_call_with_scope(tool_name, args_json, None, None)
+}
+
+#[cfg(test)]
+pub(crate) fn synthesize_test_provider_tool_call_with_scope(
+    tool_name: &str,
+    args_json: Value,
+    session_id: Option<&str>,
+    turn_id: Option<&str>,
+) -> (String, Value) {
+    bridge_provider_tool_call_with_scope(tool_name, args_json, session_id, turn_id)
+}
+
+fn validate_tool_lease(
+    expected_tool_id: &str,
+    lease: &str,
+    payload: &serde_json::Map<String, Value>,
+) -> Result<(), String> {
+    let Some((encoded_claims, signature)) = lease.split_once('.') else {
+        return Err("invalid_tool_lease: malformed lease".to_owned());
+    };
+    let expected_signature = sign_tool_lease(encoded_claims);
+    if expected_signature != signature {
+        return Err("invalid_tool_lease: signature mismatch".to_owned());
+    }
+    let claims_bytes = URL_SAFE_NO_PAD
+        .decode(encoded_claims)
+        .map_err(|error| format!("invalid_tool_lease: claims decode failed: {error}"))?;
+    let claims: ToolLeaseClaims = serde_json::from_slice(&claims_bytes)
+        .map_err(|error| format!("invalid_tool_lease: claims parse failed: {error}"))?;
+    if claims.tool_id != expected_tool_id {
+        return Err("invalid_tool_lease: tool mismatch".to_owned());
+    }
+    if claims.catalog_digest != tool_catalog_digest() {
+        return Err("invalid_tool_lease: catalog mismatch".to_owned());
+    }
+    if claims.expires_at_unix <= now_unix_seconds() {
+        return Err("invalid_tool_lease: expired lease".to_owned());
+    }
+    let binding = extract_tool_lease_binding(payload);
+    if claims.token_id.is_some() && claims.token_id != binding.token_id {
+        return Err("invalid_tool_lease: token mismatch".to_owned());
+    }
+    if claims.session_id.is_some() && claims.session_id != binding.session_id {
+        return Err("invalid_tool_lease: session mismatch".to_owned());
+    }
+    if claims.turn_id.is_some() && claims.turn_id != binding.turn_id {
+        return Err("invalid_tool_lease: turn mismatch".to_owned());
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Default)]
+struct ToolLeaseBinding {
+    token_id: Option<String>,
+    session_id: Option<String>,
+    turn_id: Option<String>,
+}
+
+fn extract_tool_lease_binding(payload: &serde_json::Map<String, Value>) -> ToolLeaseBinding {
+    ToolLeaseBinding {
+        token_id: payload
+            .get(TOOL_LEASE_TOKEN_ID_FIELD)
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        session_id: payload
+            .get(TOOL_LEASE_SESSION_ID_FIELD)
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        turn_id: payload
+            .get(TOOL_LEASE_TURN_ID_FIELD)
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+    }
+}
+
+fn sign_tool_lease(encoded_claims: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(tool_lease_secret().as_bytes());
+    hasher.update(b":");
+    hasher.update(encoded_claims.as_bytes());
+    let digest = hasher.finalize();
+    format!("{digest:x}")
+}
+
+fn tool_catalog_digest() -> String {
+    let payload = serde_json::to_vec(&catalog::all_tool_catalog()).unwrap_or_default();
+    let digest = Sha256::digest(payload);
+    format!("{digest:x}")
+}
+
+fn tool_lease_secret() -> &'static str {
+    static SECRET: OnceLock<String> = OnceLock::new();
+    SECRET.get_or_init(|| {
+        // Use RandomState for OS-level entropy rather than deterministic PID+timestamp.
+        // RandomState is seeded from the OS CSPRNG on most platforms.
+        use std::collections::hash_map::RandomState;
+        use std::hash::{BuildHasher, Hasher};
+        let random_state = RandomState::new();
+        let mut hasher = random_state.build_hasher();
+        hasher.write_u64(std::process::id() as u64);
+        hasher.write_u64(now_unix_seconds());
+        let entropy = hasher.finish();
+        let seed = format!(
+            "tool-lease:{entropy:x}:{:x}",
+            random_state.build_hasher().finish()
+        );
+        let digest = Sha256::digest(seed.as_bytes());
+        format!("{digest:x}")
+    })
+}
+
+fn now_unix_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 fn tool_function_name(tool: &Value) -> &str {
@@ -558,7 +1462,7 @@ fn tool_function_name(tool: &Value) -> &str {
 fn _shape_examples() -> BTreeMap<&'static str, Value> {
     let mut shapes = BTreeMap::from([
         (
-            "claw.import",
+            "claw.migrate",
             json!({
                 "input_path": "/tmp/nanobot-workspace",
                 "mode": "plan",
@@ -623,6 +1527,34 @@ fn _shape_examples() -> BTreeMap<&'static str, Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{ScopedEnv, unique_temp_dir};
+    use std::path::{Path, PathBuf};
+
+    fn test_tool_runtime_config(root: PathBuf) -> runtime_config::ToolRuntimeConfig {
+        runtime_config::ToolRuntimeConfig {
+            shell_allow: BTreeSet::from(["echo".to_owned(), "cat".to_owned(), "ls".to_owned()]),
+            shell_deny: BTreeSet::new(),
+            shell_default_mode: crate::tools::shell_policy_ext::ShellPolicyDefault::Deny,
+            file_root: Some(root),
+            config_path: None,
+            sessions_enabled: true,
+            messages_enabled: true,
+            delegate_enabled: true,
+            browser: Default::default(),
+            browser_companion: Default::default(),
+            web_fetch: Default::default(),
+            external_skills: runtime_config::ExternalSkillsRuntimePolicy {
+                enabled: true,
+                require_download_approval: true,
+                allowed_domains: BTreeSet::new(),
+                blocked_domains: BTreeSet::new(),
+                install_root: None,
+                auto_expose_installed: false,
+            },
+            #[cfg(feature = "feishu-integration")]
+            feishu: None,
+        }
+    }
 
     fn execute_tool_core_with_test_context(
         request: ToolCoreRequest,
@@ -637,11 +1569,95 @@ mod tests {
         }
     }
 
+    fn unique_tool_temp_dir(prefix: &str) -> PathBuf {
+        unique_temp_dir(prefix)
+    }
+
+    fn browser_companion_runtime_config(
+        root: &Path,
+        command: String,
+    ) -> runtime_config::ToolRuntimeConfig {
+        let mut config = test_tool_runtime_config(root.to_path_buf());
+        config.browser_companion.enabled = true;
+        config.browser_companion.ready = true;
+        config.browser_companion.command = Some(command);
+        config
+    }
+
+    #[cfg(unix)]
+    fn write_browser_companion_script(
+        root: &Path,
+        name: &str,
+        stdout_body: &str,
+        log_path: &Path,
+    ) -> PathBuf {
+        let path = root.join(name);
+        let script = format!(
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  printf '1.2.3\\n'\n  exit 0\nfi\nBODY=\"$(cat)\"\nprintf '%s' \"$BODY\" > \"{}\"\nprintf '%s' '{}'\n",
+            log_path.display(),
+            stdout_body.replace('\'', "'\"'\"'")
+        );
+        crate::test_support::write_executable_script_atomically(&path, &script)
+            .expect("write browser companion script");
+        path
+    }
+
+    #[cfg(windows)]
+    fn write_browser_companion_script(
+        root: &Path,
+        name: &str,
+        stdout_body: &str,
+        log_path: &Path,
+    ) -> PathBuf {
+        use std::fs;
+
+        let path = root.join(format!("{name}.cmd"));
+        let script = format!(
+            "@echo off\r\nif \"%~1\"==\"--version\" (\r\n  echo 1.2.3\r\n  exit /b 0\r\n)\r\nsetlocal enableextensions\r\nset /p BODY=\r\n> \"{}\" <nul set /p =%BODY%\r\necho {}\r\n",
+            log_path.display(),
+            stdout_body
+        );
+        fs::write(&path, script).expect("write browser companion script");
+        path
+    }
+
+    #[cfg(unix)]
+    fn write_browser_companion_sleep_script(
+        root: &Path,
+        name: &str,
+        sleep_seconds: u64,
+    ) -> PathBuf {
+        let path = root.join(name);
+        let script = format!(
+            "#!/bin/sh\nsleep {sleep_seconds}\nprintf '%s' '{{\"ok\":true,\"result\":{{\"delayed\":true}}}}'\n"
+        );
+        crate::test_support::write_executable_script_atomically(&path, &script)
+            .expect("write browser companion sleep script");
+        path
+    }
+
+    #[cfg(windows)]
+    fn write_browser_companion_sleep_script(
+        root: &Path,
+        name: &str,
+        _sleep_seconds: u64,
+    ) -> PathBuf {
+        use std::fs;
+
+        let path = root.join(format!("{name}.cmd"));
+        let script = "@echo off\r\nping -n 3 127.0.0.1 > nul\r\necho {\"ok\":true,\"result\":{\"delayed\":true}}\r\n";
+        fs::write(&path, script).expect("write browser companion sleep script");
+        path
+    }
+
     #[test]
     fn capability_snapshot_is_deterministic() {
-        let snapshot =
-            capability_snapshot_with_config(&runtime_config::ToolRuntimeConfig::default());
-        assert!(snapshot.starts_with("[available_tools]"));
+        let snapshot = capability_snapshot();
+        assert!(snapshot.starts_with("[tool_discovery_runtime]"));
+        assert!(snapshot.contains("- tool.search: Discover non-core tools"));
+        assert!(snapshot.contains("- tool.invoke: Invoke a discovered non-core tool"));
+        assert!(!snapshot.contains("shell.exec"));
+        assert!(!snapshot.contains("file.read"));
 
         let snapshot2 =
             capability_snapshot_with_config(&runtime_config::ToolRuntimeConfig::default());
@@ -649,7 +1665,7 @@ mod tests {
     }
 
     #[test]
-    fn capability_snapshot_can_include_installed_external_skills() {
+    fn capability_snapshot_stays_compact_when_external_skills_are_installed() {
         use std::{
             fs,
             path::{Path, PathBuf},
@@ -680,19 +1696,7 @@ mod tests {
             "# Demo Skill\n\nUse this skill for explicit verification.\n",
         );
 
-        let config = runtime_config::ToolRuntimeConfig {
-            file_root: Some(root.clone()),
-            config_path: None,
-            external_skills: runtime_config::ExternalSkillsRuntimePolicy {
-                enabled: true,
-                require_download_approval: true,
-                allowed_domains: BTreeSet::new(),
-                blocked_domains: BTreeSet::new(),
-                install_root: None,
-                auto_expose_installed: true,
-            },
-            ..runtime_config::ToolRuntimeConfig::default()
-        };
+        let config = test_tool_runtime_config(root.clone());
         execute_tool_core_with_config(
             ToolCoreRequest {
                 tool_name: "external_skills.install".to_owned(),
@@ -705,10 +1709,10 @@ mod tests {
         .expect("install should succeed");
 
         let snapshot = capability_snapshot_with_config(&config);
-        assert!(snapshot.contains("[available_external_skills]"));
-        assert!(snapshot.contains(
-            "- demo-skill: installed managed external skill; use external_skills.inspect or external_skills.invoke for details"
-        ));
+        assert!(snapshot.starts_with("[tool_discovery_runtime]"));
+        assert!(!snapshot.contains("[available_external_skills]"));
+        assert!(!snapshot.contains("demo-skill"));
+        assert!(!snapshot.contains("external_skills.invoke"));
 
         fs::remove_dir_all(&root).ok();
     }
@@ -719,104 +1723,20 @@ mod tests {
         feature = "memory-sqlite"
     ))]
     #[test]
-    fn capability_snapshot_lists_all_tools_when_all_features_enabled() {
-        let snapshot =
-            capability_snapshot_with_config(&runtime_config::ToolRuntimeConfig::default());
-        assert!(snapshot.contains(
-            "- approval_request_resolve: Resolve one visible governed tool approval request"
-        ));
-        assert!(snapshot.contains(
-            "- approval_request_status: Inspect full detail for a visible governed tool approval request"
-        ));
-        assert!(snapshot.contains(
-            "- approval_requests_list: List visible governed tool approval requests across the current session scope"
-        ));
-        assert!(snapshot.contains(
-            "- browser.click: Follow one previously discovered page link within a bounded browser session"
-        ));
-        assert!(snapshot.contains(
-            "- browser.extract: Extract structured text or links from the current browser session page"
-        ));
-        assert!(snapshot.contains(
-            "- browser.open: Open a public web page into a bounded browser session with safe link discovery"
-        ));
-        assert!(
-            snapshot.contains(
-                "- claw.import: Import legacy Claw configs into native LoongClaw settings"
-            )
-        );
-        assert!(snapshot.contains("- delegate: Delegate a focused subtask into a child session"));
-        assert!(snapshot.contains(
-            "- delegate_async: Delegate a focused subtask into a background child session"
-        ));
-        assert!(snapshot.contains("- external_skills.policy: Read/update external skills domain allow/block policy at runtime"));
-        assert!(snapshot.contains("- file.read: Read file contents"));
-        assert!(snapshot.contains("- file.write: Write file contents"));
-        assert!(snapshot.contains(
-            "- provider.switch: Inspect current provider state or switch the default provider profile for subsequent turns"
-        ));
-        assert!(snapshot.contains(
-            "- session_archive: Archive a visible terminal session from default session listings"
-        ));
-        assert!(
-            snapshot.contains("- session_cancel: Cancel a visible async delegate child session")
-        );
-        assert!(snapshot.contains("- session_events: Fetch session events for a visible session"));
-        assert!(snapshot.contains(
-            "- session_recover: Recover an overdue queued async delegate child session by marking it failed"
-        ));
-        assert!(
-            snapshot.contains("- session_status: Inspect the current status of a visible session")
-        );
-        assert!(
-            snapshot
-                .contains("- session_wait: Wait for a visible session to reach a terminal state")
-        );
-        assert!(
-            snapshot.contains("- sessions_history: Fetch transcript history for a visible session")
-        );
-        assert!(
-            snapshot.contains("- sessions_list: List visible sessions and their high-level state")
-        );
-        assert!(snapshot.contains("- shell.exec: Execute shell commands"));
-        assert!(snapshot.contains(
-            "- web.fetch: Fetch a public web page with SSRF-safe guards and readable extraction"
-        ));
+    fn capability_snapshot_only_lists_core_discovery_tools() {
+        let snapshot = capability_snapshot();
+        assert!(snapshot.contains("- tool.search: Discover non-core tools"));
+        assert!(snapshot.contains("- tool.invoke: Invoke a discovered non-core tool"));
+        assert!(snapshot.contains("Non-core tools are intentionally hidden"));
+        assert!(!snapshot.contains("claw.migrate"));
+        assert!(!snapshot.contains("external_skills.fetch"));
+        assert!(!snapshot.contains("file.read"));
+        assert!(!snapshot.contains("shell.exec"));
 
-        // Verify sorted order matches the catalog snapshot emitted to providers.
         let lines: Vec<&str> = snapshot.lines().skip(1).collect();
-        let ordered_prefixes = vec![
-            "- approval_request_resolve",
-            "- approval_request_status",
-            "- approval_requests_list",
-            "- browser.click",
-            "- browser.extract",
-            "- browser.open",
-            "- claw.import",
-            "- delegate",
-            "- delegate_async",
-            "- external_skills.policy",
-            "- file.read",
-            "- file.write",
-            "- provider.switch",
-            "- session_archive",
-            "- session_cancel",
-            "- session_events",
-            "- session_recover",
-            "- session_status",
-            "- session_wait",
-            "- sessions_history",
-            "- sessions_list",
-            "- shell.exec",
-            "- web.fetch",
-        ];
-        assert_eq!(lines.len(), ordered_prefixes.len());
-        for (line, prefix) in lines.iter().zip(ordered_prefixes) {
-            assert!(
-                line.starts_with(prefix),
-                "expected `{prefix}`, got `{line}`"
-            );
-        }
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].starts_with("- tool.invoke"));
+        assert!(lines[1].starts_with("- tool.search"));
     }
 
     #[cfg(all(
@@ -825,9 +1745,9 @@ mod tests {
         feature = "memory-sqlite"
     ))]
     #[test]
-    fn tool_registry_returns_all_known_tools() {
+    fn tool_registry_returns_runtime_discoverable_tools_for_default_config() {
         let entries = tool_registry();
-        assert_eq!(entries.len(), 23);
+        assert_eq!(entries.len(), 22);
         let names: Vec<&str> = entries.iter().map(|e| e.name).collect();
         assert!(names.contains(&"approval_request_resolve"));
         assert!(names.contains(&"approval_request_status"));
@@ -835,11 +1755,9 @@ mod tests {
         assert!(names.contains(&"browser.click"));
         assert!(names.contains(&"browser.extract"));
         assert!(names.contains(&"browser.open"));
-        assert!(names.contains(&"claw.import"));
+        assert!(names.contains(&"claw.migrate"));
         assert!(names.contains(&"delegate"));
         assert!(names.contains(&"delegate_async"));
-        assert!(names.contains(&"external_skills.policy"));
-        assert!(names.contains(&"shell.exec"));
         assert!(names.contains(&"file.read"));
         assert!(names.contains(&"file.write"));
         assert!(names.contains(&"provider.switch"));
@@ -851,27 +1769,35 @@ mod tests {
         assert!(names.contains(&"session_wait"));
         assert!(names.contains(&"sessions_history"));
         assert!(names.contains(&"sessions_list"));
-        assert!(names.contains(&"web.fetch"));
+        assert!(!names.contains(&"external_skills.fetch"));
+        assert!(!names.contains(&"external_skills.install"));
+        assert!(!names.contains(&"external_skills.inspect"));
+        assert!(!names.contains(&"external_skills.invoke"));
+        assert!(!names.contains(&"external_skills.list"));
+        assert!(names.contains(&"external_skills.policy"));
+        assert!(!names.contains(&"external_skills.remove"));
+        assert!(!names.contains(&"shell.exec"));
+        assert!(!names.contains(&"sessions_send"));
     }
 
     #[cfg(all(feature = "tool-file", feature = "tool-shell"))]
     #[test]
-    fn capability_snapshot_for_view_only_lists_selected_tools() {
-        let view = ToolView::from_tool_names(["claw.import", "shell.exec"]);
+    fn capability_snapshot_for_view_stays_core_only_under_restricted_view() {
+        let view = ToolView::from_tool_names(["claw.migrate", "shell.exec"]);
         let snapshot = capability_snapshot_for_view(&view);
 
-        assert!(snapshot.contains("- claw.import:"));
-        assert!(snapshot.contains("- shell.exec:"));
-        assert!(!snapshot.contains("- file.read:"));
-        assert!(!snapshot.contains("- external_skills.list:"));
+        assert!(snapshot.contains("- tool.search: Discover non-core tools"));
+        assert!(snapshot.contains("- tool.invoke: Invoke a discovered non-core tool"));
+        assert!(!snapshot.contains("- claw.migrate:"));
+        assert!(!snapshot.contains("- shell.exec:"));
     }
 
     #[cfg(all(feature = "tool-file", feature = "tool-shell"))]
     #[test]
-    fn try_provider_tool_definitions_for_view_returns_sorted_subset() {
-        let view = ToolView::from_tool_names(["shell.exec", "claw.import"]);
+    fn try_provider_tool_definitions_for_view_returns_core_only_subset() {
+        let view = ToolView::from_tool_names(["shell.exec", "claw.migrate"]);
         let defs = try_provider_tool_definitions_for_view(&view)
-            .expect("restricted runtime view should be advertisable");
+            .expect("restricted runtime view should still expose provider-core schemas");
         let names: Vec<&str> = defs
             .iter()
             .filter_map(|item| item.get("function"))
@@ -879,17 +1805,7 @@ mod tests {
             .filter_map(Value::as_str)
             .collect();
 
-        assert_eq!(names, vec!["claw_import", "shell_exec"]);
-    }
-
-    #[cfg(all(feature = "tool-file", feature = "tool-shell"))]
-    #[test]
-    fn planned_root_tool_view_is_advertisable_when_all_tools_are_runtime_ready() {
-        let view = planned_root_tool_view();
-        let defs = try_provider_tool_definitions_for_view(&view)
-            .expect("all tools should now be advertisable");
-
-        assert_eq!(defs.len(), view.iter(&tool_catalog()).count());
+        assert_eq!(names, vec!["tool_invoke", "tool_search"]);
     }
 
     #[cfg(feature = "memory-sqlite")]
@@ -962,6 +1878,23 @@ mod tests {
         assert!(enabled_view.contains("external_skills.fetch"));
         assert!(enabled_view.contains("external_skills.invoke"));
         assert!(enabled_view.contains("external_skills.list"));
+    }
+
+    #[test]
+    fn runtime_tool_view_with_runtime_config_uses_runtime_external_skills_policy() {
+        let runtime_config = runtime_config::ToolRuntimeConfig {
+            external_skills: runtime_config::ExternalSkillsRuntimePolicy {
+                enabled: true,
+                ..runtime_config::ExternalSkillsRuntimePolicy::default()
+            },
+            ..runtime_config::ToolRuntimeConfig::default()
+        };
+
+        let view = runtime_tool_view_with_runtime_config(&ToolConfig::default(), &runtime_config);
+
+        assert!(view.contains("external_skills.fetch"));
+        assert!(view.contains("external_skills.invoke"));
+        assert!(view.contains("external_skills.list"));
     }
 
     #[test]
@@ -1055,11 +1988,9 @@ mod tests {
         feature = "memory-sqlite"
     ))]
     #[test]
-    fn provider_tool_definitions_are_stable_and_complete() {
-        let defs = provider_tool_definitions_with_config(Some(
-            &runtime_config::ToolRuntimeConfig::default(),
-        ));
-        assert_eq!(defs.len(), 23);
+    fn provider_tool_definitions_are_stable_and_core_only() {
+        let defs = provider_tool_definitions();
+        assert_eq!(defs.len(), 2);
 
         let names: Vec<&str> = defs
             .iter()
@@ -1067,160 +1998,46 @@ mod tests {
             .filter_map(|function| function.get("name"))
             .filter_map(Value::as_str)
             .collect();
-        assert_eq!(
-            names,
-            vec![
-                "approval_request_resolve",
-                "approval_request_status",
-                "approval_requests_list",
-                "browser_click",
-                "browser_extract",
-                "browser_open",
-                "claw_import",
-                "delegate",
-                "delegate_async",
-                "external_skills_policy",
-                "file_read",
-                "file_write",
-                "provider_switch",
-                "session_archive",
-                "session_cancel",
-                "session_events",
-                "session_recover",
-                "session_status",
-                "session_wait",
-                "sessions_history",
-                "sessions_list",
-                "shell_exec",
-                "web_fetch",
-            ]
-        );
+        assert_eq!(names, vec!["tool_invoke", "tool_search"]);
 
         for item in &defs {
             assert_eq!(item["type"], "function");
             assert_eq!(item["function"]["parameters"]["type"], "object");
         }
 
-        let claw_import = defs
+        let tool_search = defs
             .iter()
             .find(|item| {
                 item.get("function")
                     .and_then(|function| function.get("name"))
                     .and_then(Value::as_str)
-                    == Some("claw_import")
+                    == Some("tool_search")
             })
-            .expect("claw_import definition should exist");
-        let mode_enum: Vec<&str> =
-            claw_import["function"]["parameters"]["properties"]["mode"]["enum"]
-                .as_array()
-                .expect("mode enum should be an array")
-                .iter()
-                .filter_map(Value::as_str)
-                .collect();
-        assert_eq!(
-            mode_enum,
-            vec![
-                "plan",
-                "apply",
-                "discover",
-                "plan_many",
-                "recommend_primary",
-                "merge_profiles",
-                "map_external_skills",
-                "apply_selected",
-                "rollback_last_apply"
-            ]
-        );
+            .expect("tool_search definition should exist");
         assert!(
-            claw_import["function"]["parameters"]["required"]
+            tool_search["function"]["parameters"]["required"]
                 .as_array()
                 .expect("required should be an array")
-                .is_empty()
+                .contains(&Value::String("query".to_owned()))
         );
     }
 
     #[test]
-    fn provider_tool_definitions_include_delegate_when_enabled() {
-        let defs = try_provider_tool_definitions_for_view(&runtime_tool_view_for_config(
-            &crate::config::ToolConfig::default(),
-        ))
-        .expect("runtime-visible tool schemas");
-        let delegate = defs
-            .iter()
-            .find(|item| item["function"]["name"] == "delegate")
-            .expect("delegate definition");
-        let properties = delegate["function"]["parameters"]["properties"]
-            .as_object()
-            .expect("delegate properties");
-        assert!(properties.contains_key("task"));
-        assert!(properties.contains_key("label"));
-        assert!(properties.contains_key("timeout_seconds"));
-    }
-
-    #[test]
-    fn provider_tool_definitions_include_delegate_async_when_enabled() {
-        let defs = try_provider_tool_definitions_for_view(&runtime_tool_view_for_config(
-            &crate::config::ToolConfig::default(),
-        ))
-        .expect("runtime-visible tool schemas");
-        let delegate_async = defs
-            .iter()
-            .find(|item| item["function"]["name"] == "delegate_async")
-            .expect("delegate_async definition");
-        let properties = delegate_async["function"]["parameters"]["properties"]
-            .as_object()
-            .expect("delegate_async properties");
-        assert!(properties.contains_key("task"));
-        assert!(properties.contains_key("label"));
-        assert!(properties.contains_key("timeout_seconds"));
-    }
-
-    #[test]
-    fn provider_tool_definitions_include_approval_request_resolve_when_enabled() {
-        let defs = try_provider_tool_definitions_for_view(&runtime_tool_view_for_config(
-            &crate::config::ToolConfig::default(),
-        ))
-        .expect("runtime-visible tool schemas");
-        let approval_request_resolve = defs
-            .iter()
-            .find(|item| item["function"]["name"] == "approval_request_resolve")
-            .expect("approval_request_resolve definition");
-        let properties = approval_request_resolve["function"]["parameters"]["properties"]
-            .as_object()
-            .expect("approval_request_resolve properties");
-        assert!(properties.contains_key("approval_request_id"));
-        assert!(properties.contains_key("decision"));
-    }
-
-    #[test]
-    fn provider_tool_definitions_include_sessions_send_when_enabled() {
-        let mut config = crate::config::ToolConfig::default();
-        config.messages.enabled = true;
-
-        let defs = try_provider_tool_definitions_for_view(&runtime_tool_view_for_config(&config))
-            .expect("runtime-visible tool schemas");
-        let sessions_send = defs
-            .iter()
-            .find(|item| item["function"]["name"] == "sessions_send")
-            .expect("sessions_send definition");
-        let properties = sessions_send["function"]["parameters"]["properties"]
-            .as_object()
-            .expect("sessions_send properties");
-        assert!(properties.contains_key("session_id"));
-        assert!(properties.contains_key("text"));
+    fn provider_exposed_tool_gate_is_core_only() {
+        assert!(is_provider_exposed_tool_name("tool.search"));
+        assert!(is_provider_exposed_tool_name("tool.invoke"));
+        assert!(!is_provider_exposed_tool_name("file.read"));
+        assert!(!is_provider_exposed_tool_name("shell.exec"));
     }
 
     #[test]
     fn provider_tool_definitions_include_web_fetch_when_enabled() {
-        let defs = try_provider_tool_definitions_for_view(&runtime_tool_view_for_config(
-            &crate::config::ToolConfig::default(),
-        ))
-        .expect("runtime-visible tool schemas");
-        let web_fetch = defs
-            .iter()
-            .find(|item| item["function"]["name"] == "web_fetch")
-            .expect("web_fetch definition");
-        let properties = web_fetch["function"]["parameters"]["properties"]
+        let catalog = tool_catalog();
+        let web_fetch_descriptor = catalog
+            .descriptor("web.fetch")
+            .expect("web.fetch should be in the catalog");
+        let def = web_fetch_descriptor.provider_definition();
+        let properties = def["function"]["parameters"]["properties"]
             .as_object()
             .expect("web_fetch properties");
         assert!(properties.contains_key("url"));
@@ -1235,15 +2052,12 @@ mod tests {
 
     #[test]
     fn provider_tool_definitions_include_browser_open_when_enabled() {
-        let defs = try_provider_tool_definitions_for_view(&runtime_tool_view_for_config(
-            &crate::config::ToolConfig::default(),
-        ))
-        .expect("runtime-visible tool schemas");
-        let browser_open = defs
-            .iter()
-            .find(|item| item["function"]["name"] == "browser_open")
-            .expect("browser_open definition");
-        let properties = browser_open["function"]["parameters"]["properties"]
+        let catalog = tool_catalog();
+        let browser_open_descriptor = catalog
+            .descriptor("browser.open")
+            .expect("browser.open should be in the catalog");
+        let def = browser_open_descriptor.provider_definition();
+        let properties = def["function"]["parameters"]["properties"]
             .as_object()
             .expect("browser_open properties");
         assert!(properties.contains_key("url"));
@@ -1253,7 +2067,9 @@ mod tests {
 
     #[test]
     fn canonical_tool_name_maps_known_aliases() {
-        assert_eq!(canonical_tool_name("claw_import"), "claw.import");
+        assert_eq!(canonical_tool_name("tool_search"), "tool.search");
+        assert_eq!(canonical_tool_name("tool_invoke"), "tool.invoke");
+        assert_eq!(canonical_tool_name("claw_migrate"), "claw.migrate");
         assert_eq!(
             canonical_tool_name("external_skills_policy"),
             "external_skills.policy"
@@ -1317,9 +2133,1191 @@ mod tests {
     }
 
     #[test]
+    fn required_capabilities_follow_effective_tool_request() {
+        let direct_file_read = ToolCoreRequest {
+            tool_name: "file.read".to_owned(),
+            payload: json!({"path": "README.md"}),
+        };
+        assert_eq!(
+            required_capabilities_for_request(&direct_file_read),
+            BTreeSet::from([Capability::InvokeTool, Capability::FilesystemRead])
+        );
+
+        let direct_file_write = ToolCoreRequest {
+            tool_name: "file.write".to_owned(),
+            payload: json!({"path": "notes.txt", "content": "hello"}),
+        };
+        assert_eq!(
+            required_capabilities_for_request(&direct_file_write),
+            BTreeSet::from([Capability::InvokeTool, Capability::FilesystemWrite])
+        );
+
+        let invoked_file_read = ToolCoreRequest {
+            tool_name: "tool.invoke".to_owned(),
+            payload: json!({
+                "tool_id": "file.read",
+                "lease": "unused",
+                "arguments": {"path": "README.md"}
+            }),
+        };
+        assert_eq!(
+            required_capabilities_for_request(&invoked_file_read),
+            BTreeSet::from([Capability::InvokeTool, Capability::FilesystemRead])
+        );
+
+        let invoked_claw_plan = ToolCoreRequest {
+            tool_name: "tool.invoke".to_owned(),
+            payload: json!({
+                "tool_id": "claw.migrate",
+                "lease": "unused",
+                "arguments": {"mode": "plan", "input_path": "imports/nanobot"}
+            }),
+        };
+        assert_eq!(
+            required_capabilities_for_request(&invoked_claw_plan),
+            BTreeSet::from([Capability::InvokeTool, Capability::FilesystemRead])
+        );
+
+        let invoked_claw_apply = ToolCoreRequest {
+            tool_name: "tool.invoke".to_owned(),
+            payload: json!({
+                "tool_id": "claw.migrate",
+                "lease": "unused",
+                "arguments": {
+                    "mode": "apply",
+                    "input_path": "imports/nanobot",
+                    "output_path": "loongclaw.toml"
+                }
+            }),
+        };
+        assert_eq!(
+            required_capabilities_for_request(&invoked_claw_apply),
+            BTreeSet::from([
+                Capability::InvokeTool,
+                Capability::FilesystemRead,
+                Capability::FilesystemWrite,
+            ])
+        );
+
+        let malformed_invoke = ToolCoreRequest {
+            tool_name: "tool.invoke".to_owned(),
+            payload: json!({"lease": "unused"}),
+        };
+        assert_eq!(
+            required_capabilities_for_request(&malformed_invoke),
+            BTreeSet::from([Capability::InvokeTool])
+        );
+    }
+
+    #[cfg(all(feature = "tool-file", feature = "tool-shell"))]
+    #[test]
+    fn tool_search_returns_discoverable_tools_with_leases() {
+        use std::fs;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("loongclaw-tool-search-{nanos}"));
+        fs::create_dir_all(&root).expect("create fixture root");
+        fs::write(root.join("README.md"), "hello tool search").expect("write fixture");
+
+        let config = test_tool_runtime_config(root.clone());
+        let outcome = execute_tool_core_with_config(
+            ToolCoreRequest {
+                tool_name: "tool.search".to_owned(),
+                payload: json!({
+                    "query": "read repo file",
+                    "limit": 3
+                }),
+            },
+            &config,
+        )
+        .expect("tool search should succeed");
+
+        assert_eq!(outcome.status, "ok");
+        let results = outcome.payload["results"].as_array().expect("results");
+        assert!(!results.is_empty());
+        assert!(
+            results
+                .iter()
+                .all(|entry| entry["tool_id"] != "tool.search")
+        );
+        assert!(
+            results
+                .iter()
+                .any(|entry| entry["tool_id"] == "file.read" && entry["lease"].as_str().is_some())
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[cfg(all(feature = "tool-file", feature = "tool-shell"))]
+    #[test]
+    fn tool_search_hides_filesystem_tools_without_filesystem_capabilities() {
+        let root = std::env::temp_dir().join(format!(
+            "loongclaw-tool-search-cap-filter-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("create fixture root");
+
+        let config = test_tool_runtime_config(root.clone());
+        let outcome = execute_tool_core_with_config(
+            ToolCoreRequest {
+                tool_name: "tool.search".to_owned(),
+                payload: json!({
+                    "query": "read file import config",
+                    TOOL_SEARCH_GRANTED_CAPABILITIES_FIELD: serde_json::to_value(BTreeSet::from([Capability::InvokeTool]))
+                        .expect("serialize capabilities")
+                }),
+            },
+            &config,
+        )
+        .expect("tool search should succeed");
+
+        let results = outcome.payload["results"].as_array().expect("results");
+        assert!(results.iter().all(|entry| entry["tool_id"] != "file.read"));
+        assert!(results.iter().all(|entry| entry["tool_id"] != "file.write"));
+        assert!(
+            results
+                .iter()
+                .all(|entry| entry["tool_id"] != "claw.migrate")
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[cfg(feature = "tool-shell")]
+    #[test]
+    fn tool_search_hides_shell_exec_when_runtime_allowlist_is_empty() {
+        let root = std::env::temp_dir().join(format!(
+            "loongclaw-tool-search-shell-filter-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("create fixture root");
+
+        let config = runtime_config::ToolRuntimeConfig {
+            shell_allow: BTreeSet::new(),
+            shell_deny: BTreeSet::new(),
+            shell_default_mode: crate::tools::shell_policy_ext::ShellPolicyDefault::Deny,
+            file_root: Some(root.clone()),
+            config_path: None,
+            sessions_enabled: true,
+            messages_enabled: true,
+            delegate_enabled: true,
+            browser: Default::default(),
+            browser_companion: Default::default(),
+            web_fetch: Default::default(),
+            external_skills: runtime_config::ExternalSkillsRuntimePolicy::default(),
+            #[cfg(feature = "feishu-integration")]
+            feishu: None,
+        };
+        let outcome = execute_tool_core_with_config(
+            ToolCoreRequest {
+                tool_name: "tool.search".to_owned(),
+                payload: json!({"query": "shell command"}),
+            },
+            &config,
+        )
+        .expect("tool search should succeed");
+
+        let results = outcome.payload["results"].as_array().expect("results");
+        assert!(results.iter().all(|entry| entry["tool_id"] != "shell.exec"));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[cfg(feature = "tool-shell")]
+    #[test]
+    fn shell_exec_rejects_path_qualified_commands() {
+        let config = test_tool_runtime_config(std::env::temp_dir());
+        for cmd in ["/tmp/git", "./git", "../git", "..\\git", "/usr/bin/ls"] {
+            let error = execute_tool_core_with_config(
+                ToolCoreRequest {
+                    tool_name: "shell.exec".to_owned(),
+                    payload: json!({"command": cmd}),
+                },
+                &config,
+            )
+            .expect_err(&format!("path-qualified `{cmd}` should be denied"));
+            assert!(
+                error.contains("path separators"),
+                "expected path separator rejection for `{cmd}`, got: {error}"
+            );
+        }
+    }
+
+    #[cfg(feature = "tool-shell")]
+    #[test]
+    fn shell_exec_rejects_embedded_whitespace_in_command() {
+        let config = test_tool_runtime_config(std::env::temp_dir());
+        let error = execute_tool_core_with_config(
+            ToolCoreRequest {
+                tool_name: "shell.exec".to_owned(),
+                payload: json!({"command": "ls -la"}),
+            },
+            &config,
+        )
+        .expect_err("embedded whitespace should be denied");
+        assert!(
+            error.contains("embedded whitespace"),
+            "expected whitespace rejection, got: {error}"
+        );
+    }
+
+    #[cfg(all(feature = "tool-shell", unix))]
+    #[test]
+    fn shell_exec_rejects_non_lowercase_command_names_before_execution() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        fn unique_temp_dir(prefix: &str) -> PathBuf {
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock should be after epoch")
+                .as_nanos();
+            std::env::temp_dir().join(format!("{prefix}-{nanos}"))
+        }
+
+        let root = unique_temp_dir("loongclaw-shell-mixed-case");
+        fs::create_dir_all(&root).expect("create fixture root");
+
+        let script = root.join("MiXeDCmd");
+        fs::write(&script, "#!/bin/sh\nprintf '%s' \"$0\"\n").expect("write mixed-case script");
+        let mut perms = fs::metadata(&script)
+            .expect("script metadata")
+            .permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script, perms).expect("mark script executable");
+
+        let mut env = ScopedEnv::new();
+        let original_path = std::env::var_os("PATH").unwrap_or_default();
+        let mut path_value = root.clone().into_os_string();
+        if !original_path.is_empty() {
+            path_value.push(std::ffi::OsStr::new(":"));
+            path_value.push(original_path);
+        }
+        env.set("PATH", path_value);
+
+        let mut config = test_tool_runtime_config(root.clone());
+        config.shell_allow = BTreeSet::from(["mixedcmd".to_owned()]);
+
+        let error = execute_tool_core_with_config(
+            ToolCoreRequest {
+                tool_name: "shell.exec".to_owned(),
+                payload: json!({"command": "MiXeDCmd"}),
+            },
+            &config,
+        )
+        .expect_err("mixed-case commands should be rejected before execution");
+
+        assert!(
+            error.contains("lowercase"),
+            "expected lowercase command rejection, got: {error}"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[cfg(all(feature = "tool-file", feature = "tool-shell"))]
+    #[test]
+    fn tool_search_result_includes_compact_argument_hints() {
+        let root = std::env::temp_dir().join(format!(
+            "loongclaw-tool-search-hints-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("create fixture root");
+
+        let config = test_tool_runtime_config(root.clone());
+        let outcome = execute_tool_core_with_config(
+            ToolCoreRequest {
+                tool_name: "tool.search".to_owned(),
+                payload: json!({"query": "shell command"}),
+            },
+            &config,
+        )
+        .expect("tool search should succeed");
+
+        let results = outcome.payload["results"].as_array().expect("results");
+        assert!(results.iter().any(|entry| {
+            entry["tool_id"] == "shell.exec"
+                && entry["argument_hint"].as_str() == Some("command:string,args?:string[]")
+        }));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[cfg(feature = "tool-browser")]
+    #[test]
+    fn browser_companion_tool_search_returns_runtime_ready_companion_entries() {
+        let root = std::env::temp_dir().join(format!(
+            "loongclaw-tool-search-browser-companion-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("create fixture root");
+        let log_path = root.join("request.json");
+        let script_path = write_browser_companion_script(
+            &root,
+            "browser-companion-search",
+            r#"{"ok":true,"result":{"ready":true}}"#,
+            &log_path,
+        );
+        let config = browser_companion_runtime_config(&root, script_path.display().to_string());
+
+        let outcome = execute_tool_core_with_config(
+            ToolCoreRequest {
+                tool_name: "tool.search".to_owned(),
+                payload: json!({"query": "browser companion session navigate click", "limit": 8}),
+            },
+            &config,
+        )
+        .expect("tool search should succeed");
+
+        let results = outcome.payload["results"].as_array().expect("results");
+        assert!(
+            results
+                .iter()
+                .any(|entry| entry["tool_id"] == "browser.companion.session.start"),
+            "session start should be discoverable once runtime-ready: {results:?}"
+        );
+        assert!(
+            results
+                .iter()
+                .any(|entry| entry["tool_id"] == "browser.companion.navigate"),
+            "navigate should be discoverable once runtime-ready: {results:?}"
+        );
+        assert!(
+            results
+                .iter()
+                .any(|entry| entry["tool_id"] == "browser.companion.click"),
+            "click should be discoverable once runtime-ready: {results:?}"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[cfg(feature = "tool-browser")]
+    #[test]
+    fn browser_companion_tools_split_read_and_write_execution_kinds() {
+        let read = resolve_tool_execution("browser.companion.snapshot")
+            .expect("snapshot tool should resolve");
+        assert_eq!(read.canonical_name, "browser.companion.snapshot");
+        assert_eq!(read.execution_kind, ToolExecutionKind::Core);
+
+        let write =
+            resolve_tool_execution("browser.companion.click").expect("click tool should resolve");
+        assert_eq!(write.canonical_name, "browser.companion.click");
+        assert_eq!(write.execution_kind, ToolExecutionKind::App);
+    }
+
+    #[cfg(feature = "tool-browser")]
+    #[test]
+    fn browser_companion_protocol_start_issues_managed_session_id_and_records_request() {
+        let root = unique_tool_temp_dir("loongclaw-browser-companion-start");
+        std::fs::create_dir_all(&root).expect("create fixture root");
+        let log_path = root.join("request.json");
+        let script_path = write_browser_companion_script(
+            &root,
+            "browser-companion-ok",
+            r#"{"ok":true,"result":{"page_url":"https://example.com","title":"Example Domain"}}"#,
+            &log_path,
+        );
+        let config = browser_companion_runtime_config(&root, script_path.display().to_string());
+
+        let outcome = execute_tool_core_with_config(
+            ToolCoreRequest {
+                tool_name: "browser.companion.session.start".to_owned(),
+                payload: json!({
+                    "url": "https://example.com"
+                }),
+            },
+            &config,
+        )
+        .expect("browser companion start should succeed");
+
+        assert_eq!(outcome.status, "ok");
+        assert_eq!(outcome.payload["adapter"], "browser-companion");
+        assert_eq!(
+            outcome.payload["tool_name"],
+            "browser.companion.session.start"
+        );
+        let session_id = outcome.payload["session_id"]
+            .as_str()
+            .expect("session id should be text");
+        assert!(
+            session_id.starts_with("browser-companion-"),
+            "session id should be issued by LoongClaw: {session_id}"
+        );
+        assert_eq!(outcome.payload["result"]["page_url"], "https://example.com");
+
+        let request: Value = serde_json::from_str(
+            &std::fs::read_to_string(&log_path).expect("request log should exist"),
+        )
+        .expect("request log should be valid json");
+        assert_eq!(request["tool_name"], "browser.companion.session.start");
+        assert_eq!(request["operation"], "session.start");
+        assert_eq!(request["action_class"], "read");
+        assert_eq!(request["arguments"]["url"], "https://example.com");
+        assert_eq!(request["session_id"], session_id);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[cfg(feature = "tool-browser")]
+    #[test]
+    fn browser_companion_protocol_rejects_unknown_session_for_read_tools() {
+        let root = unique_tool_temp_dir("loongclaw-browser-companion-unknown-session");
+        std::fs::create_dir_all(&root).expect("create fixture root");
+        let log_path = root.join("request.json");
+        let script_path = write_browser_companion_script(
+            &root,
+            "browser-companion-unused",
+            r#"{"ok":true,"result":{"page_url":"https://example.com"}}"#,
+            &log_path,
+        );
+        let config = browser_companion_runtime_config(&root, script_path.display().to_string());
+
+        let error = execute_tool_core_with_config(
+            ToolCoreRequest {
+                tool_name: "browser.companion.navigate".to_owned(),
+                payload: json!({
+                    "session_id": "browser-companion-missing",
+                    "url": "https://example.com/next"
+                }),
+            },
+            &config,
+        )
+        .expect_err("unknown companion session should fail closed");
+
+        assert!(
+            error.contains("browser_companion_unknown_session"),
+            "error={error}"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[cfg(feature = "tool-browser")]
+    #[test]
+    fn browser_companion_protocol_surfaces_invalid_json_from_command() {
+        let root = unique_tool_temp_dir("loongclaw-browser-companion-invalid-json");
+        std::fs::create_dir_all(&root).expect("create fixture root");
+        let log_path = root.join("request.json");
+        let script_path = write_browser_companion_script(
+            &root,
+            "browser-companion-invalid-json",
+            "not-json",
+            &log_path,
+        );
+        let config = browser_companion_runtime_config(&root, script_path.display().to_string());
+
+        let error = execute_tool_core_with_config(
+            ToolCoreRequest {
+                tool_name: "browser.companion.session.start".to_owned(),
+                payload: json!({
+                    "url": "https://example.com"
+                }),
+            },
+            &config,
+        )
+        .expect_err("invalid json should become a typed adapter failure");
+
+        assert!(
+            error.contains("browser_companion_protocol_invalid_json"),
+            "error={error}"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[cfg(feature = "tool-browser")]
+    #[test]
+    fn browser_companion_protocol_times_out_stalled_command() {
+        let root = unique_tool_temp_dir("loongclaw-browser-companion-timeout");
+        std::fs::create_dir_all(&root).expect("create fixture root");
+        let script_path =
+            write_browser_companion_sleep_script(&root, "browser-companion-timeout", 2);
+        let mut config = browser_companion_runtime_config(&root, script_path.display().to_string());
+        config.browser_companion.timeout_seconds = 1;
+
+        let error = execute_tool_core_with_config(
+            ToolCoreRequest {
+                tool_name: "browser.companion.session.start".to_owned(),
+                payload: json!({
+                    "url": "https://example.com"
+                }),
+            },
+            &config,
+        )
+        .expect_err("hung command should time out");
+
+        assert!(error.contains("browser_companion_timeout"), "error={error}");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[cfg(feature = "tool-browser")]
+    #[test]
+    fn browser_companion_app_tool_click_uses_current_session_scope() {
+        let root = unique_tool_temp_dir("loongclaw-browser-companion-app-click");
+        std::fs::create_dir_all(&root).expect("create fixture root");
+        let log_path = root.join("request.json");
+        let script_path = write_browser_companion_script(
+            &root,
+            "browser-companion-app-click",
+            r#"{"ok":true,"result":{"clicked":true}}"#,
+            &log_path,
+        );
+        let runtime_config =
+            browser_companion_runtime_config(&root, script_path.display().to_string());
+        let start = execute_tool_core_with_config(
+            ToolCoreRequest {
+                tool_name: "browser.companion.session.start".to_owned(),
+                payload: json!({
+                    "url": "https://example.com",
+                    BROWSER_SESSION_SCOPE_FIELD: "root-session"
+                }),
+            },
+            &runtime_config,
+        )
+        .expect("browser companion start should succeed");
+        let session_id = start.payload["session_id"]
+            .as_str()
+            .expect("session id should exist")
+            .to_owned();
+
+        let mut env = ScopedEnv::new();
+        env.set("LOONGCLAW_BROWSER_COMPANION_READY", "true");
+
+        let mut tool_config = crate::config::ToolConfig::default();
+        tool_config.browser_companion.enabled = true;
+        tool_config.browser_companion.command = Some(script_path.display().to_string());
+
+        let outcome = execute_app_tool_with_config(
+            ToolCoreRequest {
+                tool_name: "browser.companion.click".to_owned(),
+                payload: json!({
+                    "session_id": session_id,
+                    "selector": "#submit"
+                }),
+            },
+            "root-session",
+            &crate::memory::runtime_config::MemoryRuntimeConfig::default(),
+            &tool_config,
+        )
+        .expect("browser companion click should succeed");
+
+        assert_eq!(outcome.status, "ok");
+        assert_eq!(outcome.payload["action_class"], "write");
+        assert_eq!(outcome.payload["result"]["clicked"], true);
+
+        let request: Value = serde_json::from_str(
+            &std::fs::read_to_string(&log_path).expect("request log should exist"),
+        )
+        .expect("request log should be valid json");
+        assert_eq!(request["operation"], "click");
+        assert_eq!(request["action_class"], "write");
+        assert_eq!(request["session_scope"], "root-session");
+        assert_eq!(request["arguments"]["selector"], "#submit");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[cfg(all(feature = "tool-file", feature = "tool-shell"))]
+    #[test]
+    fn tool_search_reports_alternative_required_fields_for_bundled_skill_install() {
+        let entry = catalog::find_tool_catalog_entry("external_skills.install")
+            .expect("external_skills.install should exist in the catalog");
+        let searchable = searchable_entry_from_catalog(entry);
+
+        assert!(
+            entry.required_fields.is_empty(),
+            "catalog required_fields should only list unconditional requirements"
+        );
+        assert!(
+            searchable.required_fields.is_empty(),
+            "search should not flatten grouped alternatives into required_fields"
+        );
+        assert_eq!(
+            searchable.required_field_groups,
+            vec![vec!["path".to_owned()], vec!["bundled_skill_id".to_owned()]]
+        );
+    }
+
+    #[cfg(feature = "memory-sqlite")]
+    #[test]
+    fn tool_search_respects_visible_tool_ids_from_runtime_context() {
+        let root = std::env::temp_dir().join(format!(
+            "loongclaw-tool-search-visible-filter-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("create fixture root");
+
+        let config = test_tool_runtime_config(root.clone());
+        let outcome = execute_tool_core_with_test_context(
+            ToolCoreRequest {
+                tool_name: "tool.search".to_owned(),
+                payload: json!({
+                    "query": "session history status",
+                    "_loongclaw": {
+                        "tool_search": {
+                            "visible_tool_ids": ["tool.search", "tool.invoke", "file.read"],
+                        }
+                    }
+                }),
+            },
+            &config,
+        )
+        .expect("tool search should succeed");
+
+        let results = outcome.payload["results"].as_array().expect("results");
+        assert!(
+            results.iter().all(|entry| !entry["tool_id"]
+                .as_str()
+                .is_some_and(|tool_id| tool_id.starts_with("session"))),
+            "search should honor the injected visible tool surface: {results:?}"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[cfg(feature = "memory-sqlite")]
+    #[test]
+    fn runtime_discoverable_tool_entries_intersect_injected_view_with_runtime_surface() {
+        let mut config = test_tool_runtime_config(std::env::temp_dir());
+        config.sessions_enabled = false;
+
+        let injected = ToolView::from_tool_names(["sessions_list", "claw.migrate"]);
+        let names = runtime_discoverable_tool_entries(&config, Some(&injected))
+            .into_iter()
+            .map(|entry| entry.canonical_name)
+            .collect::<Vec<_>>();
+
+        assert!(
+            names.contains(&"claw.migrate".to_owned()),
+            "expected enabled injected tool to remain visible: {names:?}"
+        );
+        assert!(
+            !names.contains(&"sessions_list".to_owned()),
+            "disabled runtime tool should not be re-exposed by injected visibility: {names:?}"
+        );
+    }
+
+    #[cfg(feature = "memory-sqlite")]
+    #[test]
+    fn tool_search_rejects_forged_visible_tool_ids_from_untrusted_payload() {
+        let root = std::env::temp_dir().join(format!(
+            "loongclaw-tool-search-visible-forged-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("create fixture root");
+
+        let config = test_tool_runtime_config(root.clone());
+        let error = execute_tool_core_with_config(
+            ToolCoreRequest {
+                tool_name: "tool.search".to_owned(),
+                payload: json!({
+                    "query": "session history status",
+                    "_loongclaw": {
+                        "tool_search": {
+                            "visible_tool_ids": ["tool.search", "tool.invoke", "file.read"],
+                        }
+                    }
+                }),
+            },
+            &config,
+        )
+        .expect_err("untrusted tool search should reject reserved internal visibility context");
+
+        assert!(
+            error.contains("payload._loongclaw is reserved for trusted internal tool context"),
+            "error={error}"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[cfg(feature = "tool-webfetch")]
+    #[test]
+    fn web_fetch_respects_runtime_narrowing_from_trusted_internal_payload() {
+        let root = std::env::temp_dir().join(format!(
+            "loongclaw-web-fetch-runtime-narrowing-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("create fixture root");
+
+        let mut config = test_tool_runtime_config(root.clone());
+        config.web_fetch.timeout_seconds = 1;
+        let error = execute_tool_core_with_test_context(
+            ToolCoreRequest {
+                tool_name: "web.fetch".to_owned(),
+                payload: json!({
+                    "url": "https://example.com/docs",
+                    "_loongclaw": {
+                        "runtime_narrowing": {
+                            "web_fetch": {
+                                "allowed_domains": ["docs.example.com"],
+                                "allow_private_hosts": false
+                            }
+                        }
+                    }
+                }),
+            },
+            &config,
+        )
+        .expect_err("runtime-narrowed child web.fetch should be denied before network access");
+
+        assert!(
+            error.contains("not in allowed_domains"),
+            "expected narrowed domain denial, got: {error}"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[cfg(feature = "tool-webfetch")]
+    #[test]
+    fn web_fetch_denies_disjoint_allowlists_when_runtime_narrowing_intersection_is_empty() {
+        let root = std::env::temp_dir().join(format!(
+            "loongclaw-web-fetch-runtime-narrowing-disjoint-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("create fixture root");
+
+        let mut config = test_tool_runtime_config(root.clone());
+        config
+            .web_fetch
+            .allowed_domains
+            .insert("api.example.com".to_owned());
+        let error = execute_tool_core_with_test_context(
+            ToolCoreRequest {
+                tool_name: "web.fetch".to_owned(),
+                payload: json!({
+                    "url": "https://api.example.com/docs",
+                    "_loongclaw": {
+                        "runtime_narrowing": {
+                            "web_fetch": {
+                                "allowed_domains": ["docs.example.com"]
+                            }
+                        }
+                    }
+                }),
+            },
+            &config,
+        )
+        .expect_err("disjoint allowlists should deny domains allowed by only one side");
+
+        assert!(
+            error.contains("not in allowed_domains"),
+            "expected empty-intersection allowlist denial, got: {error}"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[cfg(feature = "tool-webfetch")]
+    #[test]
+    fn web_fetch_fail_closes_malformed_trusted_runtime_narrowing() {
+        let root = std::env::temp_dir().join(format!(
+            "loongclaw-web-fetch-runtime-narrowing-malformed-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("create fixture root");
+
+        let config = test_tool_runtime_config(root.clone());
+        let error = execute_tool_core_with_test_context(
+            ToolCoreRequest {
+                tool_name: "web.fetch".to_owned(),
+                payload: json!({
+                    "url": "https://outside.invalid/docs",
+                    "_loongclaw": {
+                        "runtime_narrowing": "not-an-object"
+                    }
+                }),
+            },
+            &config,
+        )
+        .expect_err("malformed trusted runtime narrowing should fail closed");
+
+        assert!(
+            error.contains("invalid_internal_runtime_narrowing"),
+            "expected parse failure, got: {error}"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[cfg(feature = "tool-webfetch")]
+    #[test]
+    fn web_fetch_rejects_forged_runtime_narrowing_from_untrusted_payload() {
+        let root = std::env::temp_dir().join(format!(
+            "loongclaw-web-fetch-runtime-narrowing-forged-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("create fixture root");
+
+        let config = test_tool_runtime_config(root.clone());
+        let error = execute_tool_core_with_config(
+            ToolCoreRequest {
+                tool_name: "web.fetch".to_owned(),
+                payload: json!({
+                    "url": "https://example.com/docs",
+                    "_loongclaw": {
+                        "runtime_narrowing": {
+                            "web_fetch": {
+                                "allowed_domains": ["docs.example.com"]
+                            }
+                        }
+                    }
+                }),
+            },
+            &config,
+        )
+        .expect_err("untrusted runtime narrowing should be rejected");
+
+        assert!(
+            error.contains("payload._loongclaw is reserved for trusted internal tool context"),
+            "error={error}"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[cfg(feature = "feishu-integration")]
+    #[test]
+    fn tool_search_includes_feishu_tools_when_runtime_configured() {
+        let mut config = runtime_config::ToolRuntimeConfig::default();
+        config.feishu = Some(runtime_config::FeishuToolRuntimeConfig {
+            channel: crate::config::FeishuChannelConfig {
+                enabled: true,
+                app_id: Some("cli_a1b2c3".to_owned()),
+                app_secret: Some("app-secret".to_owned()),
+                ..crate::config::FeishuChannelConfig::default()
+            },
+            integration: crate::config::FeishuIntegrationConfig::default(),
+        });
+
+        let outcome = execute_tool_core_with_config(
+            ToolCoreRequest {
+                tool_name: "tool.search".to_owned(),
+                payload: json!({"query": "feishu message search", "limit": 8}),
+            },
+            &config,
+        )
+        .expect("tool search should succeed");
+
+        let results = outcome.payload["results"].as_array().expect("results");
+        assert!(
+            results
+                .iter()
+                .any(|entry| entry["tool_id"] == "feishu.messages.search"),
+            "feishu runtime tools should be discoverable through tool.search: {results:?}"
+        );
+        assert!(
+            results
+                .iter()
+                .any(|entry| entry["tool_id"] == "feishu.messages.send"),
+            "feishu send should be discoverable through tool.search: {results:?}"
+        );
+    }
+
+    #[cfg(feature = "feishu-integration")]
+    #[test]
+    fn feishu_searchable_entries_report_anyof_required_groups() {
+        let entry = feishu_searchable_entries()
+            .into_iter()
+            .find(|entry| entry.canonical_name == "feishu.doc.append")
+            .expect("feishu.doc.append should be discoverable");
+
+        assert_eq!(entry.required_fields, vec!["url".to_owned()]);
+        assert_eq!(
+            entry.required_field_groups,
+            vec![vec!["content".to_owned()], vec!["content_path".to_owned()]]
+        );
+    }
+
+    #[cfg(all(feature = "feishu-integration", feature = "channel-feishu"))]
+    #[test]
+    fn tool_invoke_dispatches_feishu_discovered_tool_with_a_valid_lease() {
+        use std::fs;
+
+        let temp_dir = unique_feishu_tool_temp_dir("tool-invoke-feishu-send");
+        fs::create_dir_all(&temp_dir).expect("create temp dir");
+        let sqlite_path = temp_dir.join("feishu.sqlite3");
+        let _store = seed_feishu_tool_grant(
+            &sqlite_path,
+            "u-token-tool-invoke-feishu-send",
+            &["offline_access"],
+        );
+        let config =
+            build_feishu_tool_runtime_config("http://127.0.0.1:9".to_owned(), &sqlite_path);
+
+        let search = execute_tool_core_with_config(
+            ToolCoreRequest {
+                tool_name: "tool.search".to_owned(),
+                payload: json!({"query": "send feishu message", "limit": 8}),
+            },
+            &config,
+        )
+        .expect("tool search should succeed");
+
+        let result = search.payload["results"]
+            .as_array()
+            .expect("results")
+            .iter()
+            .find(|entry| entry["tool_id"] == "feishu.messages.send")
+            .expect("feishu.messages.send search result");
+
+        let error = execute_tool_core_with_config(
+            ToolCoreRequest {
+                tool_name: "tool.invoke".to_owned(),
+                payload: json!({
+                    "tool_id": "feishu.messages.send",
+                    "lease": result["lease"].clone(),
+                    "arguments": {
+                        "text": "ship by invoke"
+                    }
+                }),
+            },
+            &config,
+        )
+        .expect_err("missing receive_id should fail after discovery-first invoke routing");
+
+        assert!(
+            error.contains("feishu.messages.send requires payload.receive_id"),
+            "error={error}"
+        );
+
+        fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    #[cfg(feature = "tool-file")]
+    #[test]
+    fn tool_invoke_dispatches_a_discovered_tool_with_a_valid_lease() {
+        use std::fs;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("loongclaw-tool-invoke-{nanos}"));
+        fs::create_dir_all(&root).expect("create fixture root");
+        fs::write(root.join("README.md"), "tool invoke fixture").expect("write fixture");
+
+        let config = test_tool_runtime_config(root.clone());
+        let search = execute_tool_core_with_config(
+            ToolCoreRequest {
+                tool_name: "tool.search".to_owned(),
+                payload: json!({"query": "read file"}),
+            },
+            &config,
+        )
+        .expect("tool search should succeed");
+
+        let result = search.payload["results"]
+            .as_array()
+            .expect("results")
+            .iter()
+            .find(|entry| entry["tool_id"] == "file.read")
+            .expect("file.read search result");
+
+        let outcome = execute_tool_core_with_config(
+            ToolCoreRequest {
+                tool_name: "tool.invoke".to_owned(),
+                payload: json!({
+                    "tool_id": "file.read",
+                    "lease": result["lease"].clone(),
+                    "arguments": {
+                        "path": "README.md",
+                        "max_bytes": 64
+                    }
+                }),
+            },
+            &config,
+        )
+        .expect("tool invoke should succeed");
+
+        assert_eq!(outcome.status, "ok");
+        assert!(
+            outcome.payload["path"]
+                .as_str()
+                .is_some_and(|path| path.ends_with("README.md"))
+        );
+        assert_eq!(outcome.payload["content"], "tool invoke fixture");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[cfg(feature = "tool-file")]
+    #[test]
+    fn tool_invoke_rejects_tampered_or_missing_leases() {
+        let root = std::env::temp_dir().join(format!(
+            "loongclaw-tool-invoke-invalid-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("create fixture root");
+
+        let config = test_tool_runtime_config(root.clone());
+        let error = execute_tool_core_with_config(
+            ToolCoreRequest {
+                tool_name: "tool.invoke".to_owned(),
+                payload: json!({
+                    "tool_id": "file.read",
+                    "lease": "tampered",
+                    "arguments": {
+                        "path": "README.md"
+                    }
+                }),
+            },
+            &config,
+        )
+        .expect_err("tampered lease should fail");
+
+        assert!(error.contains("invalid_tool_lease"), "error: {error}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[cfg(feature = "tool-file")]
+    #[test]
+    fn tool_invoke_rejects_leases_replayed_in_another_turn() {
+        let root = std::env::temp_dir().join(format!(
+            "loongclaw-tool-invoke-replay-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("create fixture root");
+
+        let config = test_tool_runtime_config(root.clone());
+        let search = execute_tool_core_with_config(
+            ToolCoreRequest {
+                tool_name: "tool.search".to_owned(),
+                payload: json!({
+                    "query": "read file",
+                    TOOL_LEASE_SESSION_ID_FIELD: "session-a",
+                    TOOL_LEASE_TURN_ID_FIELD: "turn-a"
+                }),
+            },
+            &config,
+        )
+        .expect("tool search should succeed");
+
+        let result = search.payload["results"]
+            .as_array()
+            .expect("results")
+            .iter()
+            .find(|entry| entry["tool_id"] == "file.read")
+            .expect("file.read search result");
+
+        let error = execute_tool_core_with_config(
+            ToolCoreRequest {
+                tool_name: "tool.invoke".to_owned(),
+                payload: json!({
+                    "tool_id": "file.read",
+                    "lease": result["lease"].clone(),
+                    "arguments": {
+                        "path": "README.md"
+                    },
+                    TOOL_LEASE_SESSION_ID_FIELD: "session-a",
+                    TOOL_LEASE_TURN_ID_FIELD: "turn-b"
+                }),
+            },
+            &config,
+        )
+        .expect_err("replayed turn lease should fail");
+
+        assert!(error.contains("turn mismatch"), "error: {error}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[cfg(feature = "tool-webfetch")]
+    #[test]
+    fn tool_invoke_preserves_trusted_runtime_narrowing_for_inner_execution() {
+        let root = std::env::temp_dir().join(format!(
+            "loongclaw-tool-invoke-runtime-narrowing-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("create fixture root");
+
+        let mut config = test_tool_runtime_config(root.clone());
+        config
+            .web_fetch
+            .allowed_domains
+            .insert("outside.invalid".to_owned());
+
+        let (tool_name, mut payload) = bridge_provider_tool_call_with_scope(
+            "web.fetch",
+            json!({
+                "url": "https://outside.invalid/docs"
+            }),
+            None,
+            None,
+        );
+        let payload_object = payload.as_object_mut().expect("tool.invoke payload object");
+        payload_object.insert(
+            LOONGCLAW_INTERNAL_TOOL_CONTEXT_KEY.to_owned(),
+            json!({
+                LOONGCLAW_INTERNAL_RUNTIME_NARROWING_KEY: {
+                    "web_fetch": {
+                        "allowed_domains": ["docs.example.com"]
+                    }
+                }
+            }),
+        );
+
+        let error =
+            execute_tool_core_with_test_context(ToolCoreRequest { tool_name, payload }, &config)
+                .expect_err("tool.invoke should preserve trusted narrowing for inner web.fetch");
+
+        assert!(
+            error.contains("not in allowed_domains"),
+            "expected inner web.fetch denial after narrowing, got: {error}"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn tool_search_hides_tools_exceeding_granted_capabilities() {
+        let root = std::env::temp_dir().join(format!(
+            "loongclaw-tool-search-cap-filter-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("create fixture root");
+
+        let config = test_tool_runtime_config(root.clone());
+        let result = execute_tool_core_with_config(
+            ToolCoreRequest {
+                tool_name: "tool.search".to_owned(),
+                payload: json!({
+                    "query": "read",
+                    TOOL_SEARCH_GRANTED_CAPABILITIES_FIELD: [
+                        "InvokeTool"
+                    ]
+                }),
+            },
+            &config,
+        )
+        .expect("search should succeed");
+
+        let results = result.payload["results"].as_array().expect("results array");
+        let tool_ids: Vec<&str> = results
+            .iter()
+            .filter_map(|entry| entry["tool_id"].as_str())
+            .collect();
+        assert!(
+            !tool_ids.contains(&"file.read"),
+            "file.read requires FilesystemRead, should be hidden when only InvokeTool is granted; got: {tool_ids:?}"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
     fn is_known_tool_name_accepts_canonical_and_alias_forms() {
-        assert!(is_known_tool_name("claw.import"));
-        assert!(is_known_tool_name("claw_import"));
+        assert!(is_known_tool_name("claw.migrate"));
+        assert!(is_known_tool_name("claw_migrate"));
         assert!(is_known_tool_name("external_skills.policy"));
         assert!(is_known_tool_name("external_skills_policy"));
         assert!(is_known_tool_name("external_skills.fetch"));
@@ -1404,7 +3402,7 @@ mod tests {
 
     #[cfg(feature = "feishu-integration")]
     #[test]
-    fn provider_tool_definitions_with_config_includes_feishu_functions_when_runtime_configured() {
+    fn provider_tool_definitions_with_config_remains_core_only_when_feishu_runtime_is_configured() {
         let mut config = runtime_config::ToolRuntimeConfig::default();
         config.feishu = Some(runtime_config::FeishuToolRuntimeConfig {
             channel: crate::config::FeishuChannelConfig {
@@ -1424,19 +3422,7 @@ mod tests {
             .filter_map(Value::as_str)
             .collect::<Vec<_>>();
 
-        assert!(names.contains(&"feishu_whoami"));
-        assert!(names.contains(&"feishu_doc_create"));
-        assert!(names.contains(&"feishu_doc_append"));
-        assert!(names.contains(&"feishu_doc_read"));
-        assert!(names.contains(&"feishu_messages_history"));
-        assert!(names.contains(&"feishu_messages_get"));
-        assert!(names.contains(&"feishu_messages_resource_get"));
-        assert!(names.contains(&"feishu_messages_search"));
-        assert!(names.contains(&"feishu_messages_send"));
-        assert!(names.contains(&"feishu_messages_reply"));
-        assert!(names.contains(&"feishu_card_update"));
-        assert!(names.contains(&"feishu_calendar_list"));
-        assert!(names.contains(&"feishu_calendar_freebusy"));
+        assert_eq!(names, vec!["tool_invoke", "tool_search"]);
     }
 
     #[cfg(feature = "feishu-integration")]
@@ -1497,18 +3483,7 @@ mod tests {
     #[cfg(feature = "feishu-integration")]
     #[test]
     fn provider_tool_definitions_with_config_advertises_feishu_message_write_uuid() {
-        let mut config = runtime_config::ToolRuntimeConfig::default();
-        config.feishu = Some(runtime_config::FeishuToolRuntimeConfig {
-            channel: crate::config::FeishuChannelConfig {
-                enabled: true,
-                app_id: Some("cli_a1b2c3".to_owned()),
-                app_secret: Some("app-secret".to_owned()),
-                ..crate::config::FeishuChannelConfig::default()
-            },
-            integration: crate::config::FeishuIntegrationConfig::default(),
-        });
-
-        let defs = provider_tool_definitions_with_config(Some(&config));
+        let defs = feishu::feishu_provider_tool_definitions();
         let send = defs
             .iter()
             .find(|item| item["function"]["name"] == "feishu_messages_send")
@@ -1531,18 +3506,7 @@ mod tests {
     #[cfg(feature = "feishu-integration")]
     #[test]
     fn provider_tool_definitions_with_config_advertises_feishu_message_post_and_media_payloads() {
-        let mut config = runtime_config::ToolRuntimeConfig::default();
-        config.feishu = Some(runtime_config::FeishuToolRuntimeConfig {
-            channel: crate::config::FeishuChannelConfig {
-                enabled: true,
-                app_id: Some("cli_a1b2c3".to_owned()),
-                app_secret: Some("app-secret".to_owned()),
-                ..crate::config::FeishuChannelConfig::default()
-            },
-            integration: crate::config::FeishuIntegrationConfig::default(),
-        });
-
-        let defs = provider_tool_definitions_with_config(Some(&config));
+        let defs = feishu::feishu_provider_tool_definitions();
         let send = defs
             .iter()
             .find(|item| item["function"]["name"] == "feishu_messages_send")
@@ -1637,18 +3601,7 @@ mod tests {
     #[cfg(feature = "feishu-integration")]
     #[test]
     fn provider_tool_definitions_with_config_advertises_feishu_ingress_defaults() {
-        let mut config = runtime_config::ToolRuntimeConfig::default();
-        config.feishu = Some(runtime_config::FeishuToolRuntimeConfig {
-            channel: crate::config::FeishuChannelConfig {
-                enabled: true,
-                app_id: Some("cli_a1b2c3".to_owned()),
-                app_secret: Some("app-secret".to_owned()),
-                ..crate::config::FeishuChannelConfig::default()
-            },
-            integration: crate::config::FeishuIntegrationConfig::default(),
-        });
-
-        let defs = provider_tool_definitions_with_config(Some(&config));
+        let defs = feishu::feishu_provider_tool_definitions();
         let send = defs
             .iter()
             .find(|item| item["function"]["name"] == "feishu_messages_send")
@@ -1846,18 +3799,7 @@ mod tests {
     #[cfg(feature = "feishu-integration")]
     #[test]
     fn provider_tool_definitions_with_config_advertises_feishu_card_update_shared_semantics() {
-        let mut config = runtime_config::ToolRuntimeConfig::default();
-        config.feishu = Some(runtime_config::FeishuToolRuntimeConfig {
-            channel: crate::config::FeishuChannelConfig {
-                enabled: true,
-                app_id: Some("cli_a1b2c3".to_owned()),
-                app_secret: Some("app-secret".to_owned()),
-                ..crate::config::FeishuChannelConfig::default()
-            },
-            integration: crate::config::FeishuIntegrationConfig::default(),
-        });
-
-        let defs = provider_tool_definitions_with_config(Some(&config));
+        let defs = feishu::feishu_provider_tool_definitions();
         let card_update = defs
             .iter()
             .find(|item| item["function"]["name"] == "feishu_card_update")
@@ -1891,18 +3833,7 @@ mod tests {
     #[cfg(feature = "feishu-integration")]
     #[test]
     fn provider_tool_definitions_with_config_advertises_feishu_card_update_markdown_shortcut() {
-        let mut config = runtime_config::ToolRuntimeConfig::default();
-        config.feishu = Some(runtime_config::FeishuToolRuntimeConfig {
-            channel: crate::config::FeishuChannelConfig {
-                enabled: true,
-                app_id: Some("cli_a1b2c3".to_owned()),
-                app_secret: Some("app-secret".to_owned()),
-                ..crate::config::FeishuChannelConfig::default()
-            },
-            integration: crate::config::FeishuIntegrationConfig::default(),
-        });
-
-        let defs = provider_tool_definitions_with_config(Some(&config));
+        let defs = feishu::feishu_provider_tool_definitions();
         let card_update = defs
             .iter()
             .find(|item| item["function"]["name"] == "feishu_card_update")
@@ -1926,18 +3857,7 @@ mod tests {
     #[cfg(feature = "feishu-integration")]
     #[test]
     fn provider_tool_definitions_with_config_advertises_feishu_card_update_token_budget() {
-        let mut config = runtime_config::ToolRuntimeConfig::default();
-        config.feishu = Some(runtime_config::FeishuToolRuntimeConfig {
-            channel: crate::config::FeishuChannelConfig {
-                enabled: true,
-                app_id: Some("cli_a1b2c3".to_owned()),
-                app_secret: Some("app-secret".to_owned()),
-                ..crate::config::FeishuChannelConfig::default()
-            },
-            integration: crate::config::FeishuIntegrationConfig::default(),
-        });
-
-        let defs = provider_tool_definitions_with_config(Some(&config));
+        let defs = feishu::feishu_provider_tool_definitions();
         let card_update = defs
             .iter()
             .find(|item| item["function"]["name"] == "feishu_card_update")
@@ -1954,18 +3874,7 @@ mod tests {
     #[cfg(feature = "feishu-integration")]
     #[test]
     fn provider_tool_definitions_with_config_advertises_feishu_search_ingress_scope() {
-        let mut config = runtime_config::ToolRuntimeConfig::default();
-        config.feishu = Some(runtime_config::FeishuToolRuntimeConfig {
-            channel: crate::config::FeishuChannelConfig {
-                enabled: true,
-                app_id: Some("cli_a1b2c3".to_owned()),
-                app_secret: Some("app-secret".to_owned()),
-                ..crate::config::FeishuChannelConfig::default()
-            },
-            integration: crate::config::FeishuIntegrationConfig::default(),
-        });
-
-        let defs = provider_tool_definitions_with_config(Some(&config));
+        let defs = feishu::feishu_provider_tool_definitions();
         let search = defs
             .iter()
             .find(|item| item["function"]["name"] == "feishu_messages_search")
@@ -10014,7 +11923,7 @@ mod tests {
     }
 
     #[test]
-    fn claw_import_plan_mode_returns_nativeized_preview() {
+    fn claw_migrate_plan_mode_returns_nativeized_preview() {
         use std::{
             fs,
             path::{Path, PathBuf},
@@ -10056,7 +11965,7 @@ mod tests {
         };
         let outcome = execute_tool_core_with_config(
             ToolCoreRequest {
-                tool_name: "claw.import".to_owned(),
+                tool_name: "claw.migrate".to_owned(),
                 payload: json!({
                     "mode": "plan",
                     "source": "nanobot",
@@ -10065,10 +11974,10 @@ mod tests {
             },
             &config,
         )
-        .expect("claw import plan should succeed");
+        .expect("claw migrate plan should succeed");
 
         assert_eq!(outcome.status, "ok");
-        assert_eq!(outcome.payload["tool_name"], "claw.import");
+        assert_eq!(outcome.payload["tool_name"], "claw.migrate");
         assert_eq!(outcome.payload["mode"], "plan");
         assert_eq!(outcome.payload["source"], "nanobot");
         assert_eq!(
@@ -10097,7 +12006,7 @@ mod tests {
     }
 
     #[test]
-    fn claw_import_apply_mode_writes_target_config() {
+    fn claw_migrate_apply_mode_writes_target_config() {
         use std::{
             fs,
             path::{Path, PathBuf},
@@ -10140,7 +12049,7 @@ mod tests {
         };
         let outcome = execute_tool_core_with_config(
             ToolCoreRequest {
-                tool_name: "claw_import".to_owned(),
+                tool_name: "claw_migrate".to_owned(),
                 payload: json!({
                     "mode": "apply",
                     "source": "nanobot",
@@ -10151,7 +12060,7 @@ mod tests {
             },
             &config,
         )
-        .expect("claw import apply should succeed");
+        .expect("claw migrate apply should succeed");
 
         assert_eq!(outcome.status, "ok");
         assert_eq!(outcome.payload["mode"], "apply");
@@ -10183,7 +12092,7 @@ mod tests {
     }
 
     #[test]
-    fn claw_import_discover_mode_returns_detected_sources() {
+    fn claw_migrate_discover_mode_returns_detected_sources() {
         use std::{
             fs,
             path::{Path, PathBuf},
@@ -10228,7 +12137,7 @@ mod tests {
         };
         let outcome = execute_tool_core_with_config(
             ToolCoreRequest {
-                tool_name: "claw.import".to_owned(),
+                tool_name: "claw.migrate".to_owned(),
                 payload: json!({
                     "mode": "discover",
                     "input_path": "."
@@ -10236,7 +12145,7 @@ mod tests {
             },
             &config,
         )
-        .expect("claw import discover should succeed");
+        .expect("claw migrate discover should succeed");
 
         assert_eq!(outcome.status, "ok");
         assert_eq!(outcome.payload["mode"], "discover");
@@ -10246,7 +12155,7 @@ mod tests {
     }
 
     #[test]
-    fn claw_import_plan_many_mode_returns_source_summaries_and_recommendation() {
+    fn claw_migrate_plan_many_mode_returns_source_summaries_and_recommendation() {
         use std::{
             fs,
             path::{Path, PathBuf},
@@ -10299,7 +12208,7 @@ mod tests {
         };
         let outcome = execute_tool_core_with_config(
             ToolCoreRequest {
-                tool_name: "claw.import".to_owned(),
+                tool_name: "claw.migrate".to_owned(),
                 payload: json!({
                     "mode": "plan_many",
                     "input_path": "."
@@ -10307,7 +12216,7 @@ mod tests {
             },
             &config,
         )
-        .expect("claw import plan_many should succeed");
+        .expect("claw migrate plan_many should succeed");
 
         assert_eq!(outcome.status, "ok");
         assert_eq!(outcome.payload["mode"], "plan_many");
@@ -10318,7 +12227,7 @@ mod tests {
     }
 
     #[test]
-    fn claw_import_merge_profiles_mode_preserves_prompt_owner() {
+    fn claw_migrate_merge_profiles_mode_preserves_prompt_owner() {
         use std::{
             fs,
             path::{Path, PathBuf},
@@ -10371,7 +12280,7 @@ mod tests {
         };
         let outcome = execute_tool_core_with_config(
             ToolCoreRequest {
-                tool_name: "claw.import".to_owned(),
+                tool_name: "claw.migrate".to_owned(),
                 payload: json!({
                     "mode": "merge_profiles",
                     "input_path": "."
@@ -10379,7 +12288,7 @@ mod tests {
             },
             &config,
         )
-        .expect("claw import merge_profiles should succeed");
+        .expect("claw migrate merge_profiles should succeed");
 
         assert_eq!(outcome.status, "ok");
         assert_eq!(outcome.payload["mode"], "merge_profiles");
@@ -10398,7 +12307,7 @@ mod tests {
     }
 
     #[test]
-    fn claw_import_map_external_skills_mode_returns_mapping_plan() {
+    fn claw_migrate_map_external_skills_mode_returns_mapping_plan() {
         use std::{
             fs,
             path::{Path, PathBuf},
@@ -10432,7 +12341,7 @@ mod tests {
         };
         let outcome = execute_tool_core_with_config(
             ToolCoreRequest {
-                tool_name: "claw.import".to_owned(),
+                tool_name: "claw.migrate".to_owned(),
                 payload: json!({
                     "mode": "map_external_skills",
                     "input_path": "."
@@ -10440,7 +12349,7 @@ mod tests {
             },
             &config,
         )
-        .expect("claw import map_external_skills should succeed");
+        .expect("claw migrate map_external_skills should succeed");
 
         assert_eq!(outcome.status, "ok");
         assert_eq!(outcome.payload["mode"], "map_external_skills");
@@ -10464,7 +12373,7 @@ mod tests {
     }
 
     #[test]
-    fn claw_import_apply_selected_mode_writes_manifest_and_backup() {
+    fn claw_migrate_apply_selected_mode_writes_manifest_and_backup() {
         use std::{
             fs,
             path::{Path, PathBuf},
@@ -10514,7 +12423,7 @@ mod tests {
         };
         let outcome = execute_tool_core_with_config(
             ToolCoreRequest {
-                tool_name: "claw.import".to_owned(),
+                tool_name: "claw.migrate".to_owned(),
                 payload: json!({
                     "mode": "apply_selected",
                     "input_path": ".",
@@ -10524,7 +12433,7 @@ mod tests {
             },
             &config,
         )
-        .expect("claw import apply_selected should succeed");
+        .expect("claw migrate apply_selected should succeed");
 
         assert_eq!(outcome.status, "ok");
         assert_eq!(outcome.payload["mode"], "apply_selected");
@@ -10549,7 +12458,7 @@ mod tests {
     }
 
     #[test]
-    fn claw_import_apply_selected_mode_can_apply_external_skills_plan() {
+    fn claw_migrate_apply_selected_mode_can_apply_external_skills_plan() {
         use std::{
             fs,
             path::{Path, PathBuf},
@@ -10597,7 +12506,7 @@ mod tests {
         };
         let outcome = execute_tool_core_with_config(
             ToolCoreRequest {
-                tool_name: "claw.import".to_owned(),
+                tool_name: "claw.migrate".to_owned(),
                 payload: json!({
                     "mode": "apply_selected",
                     "input_path": ".",
@@ -10608,7 +12517,7 @@ mod tests {
             },
             &config,
         )
-        .expect("claw import apply_selected with external skills should succeed");
+        .expect("claw migrate apply_selected with external skills should succeed");
 
         assert_eq!(outcome.status, "ok");
         assert_eq!(
@@ -10632,7 +12541,7 @@ mod tests {
     }
 
     #[test]
-    fn claw_import_rollback_last_apply_restores_original_config() {
+    fn claw_migrate_rollback_last_apply_restores_original_config() {
         use std::{
             fs,
             path::{Path, PathBuf},
@@ -10682,7 +12591,7 @@ mod tests {
         };
         execute_tool_core_with_config(
             ToolCoreRequest {
-                tool_name: "claw.import".to_owned(),
+                tool_name: "claw.migrate".to_owned(),
                 payload: json!({
                     "mode": "apply_selected",
                     "input_path": ".",
@@ -10692,11 +12601,11 @@ mod tests {
             },
             &config,
         )
-        .expect("claw import apply_selected should succeed");
+        .expect("claw migrate apply_selected should succeed");
 
         let rollback = execute_tool_core_with_config(
             ToolCoreRequest {
-                tool_name: "claw.import".to_owned(),
+                tool_name: "claw.migrate".to_owned(),
                 payload: json!({
                     "mode": "rollback_last_apply",
                     "output_path": "loongclaw.toml"
@@ -10704,7 +12613,7 @@ mod tests {
             },
             &config,
         )
-        .expect("claw import rollback_last_apply should succeed");
+        .expect("claw migrate rollback_last_apply should succeed");
 
         assert_eq!(rollback.status, "ok");
         assert!(

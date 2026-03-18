@@ -31,7 +31,7 @@ struct CodexModelProviderConfig {
     requires_openai_auth: Option<bool>,
 }
 
-pub(crate) fn classify_current_setup(output_path: &Path) -> CurrentSetupState {
+pub fn classify_current_setup(output_path: &Path) -> CurrentSetupState {
     if !output_path.exists() {
         return CurrentSetupState::Absent;
     }
@@ -50,12 +50,17 @@ pub(crate) fn classify_current_setup(output_path: &Path) -> CurrentSetupState {
 
     let default_config = mvp::config::LoongClawConfig::default();
     let has_only_provider_selection_changes = config.provider.has_only_selection_changes()
+        && config.cli.enabled == default_config.cli.enabled
         && config.cli.system_prompt == default_config.cli.system_prompt
+        && config.cli.prompt_pack_id == default_config.cli.prompt_pack_id
+        && config.cli.personality == default_config.cli.personality
+        && config.cli.system_prompt_addendum == default_config.cli.system_prompt_addendum
         && config.cli.exit_commands == default_config.cli.exit_commands
         && channels::registered_enabled_channel_ids(&config).is_empty()
         && config.tools.shell_allow == default_config.tools.shell_allow
         && config.tools.file_root == default_config.tools.file_root
-        && config.memory.sqlite_path == default_config.memory.sqlite_path
+        && config.memory.profile == default_config.memory.profile
+        && memory_sqlite_path_looks_default(&config.memory.sqlite_path, &default_config.memory)
         && config.memory.sliding_window == default_config.memory.sliding_window;
 
     if has_only_provider_selection_changes && !has_provider_auth {
@@ -67,9 +72,8 @@ pub(crate) fn classify_current_setup(output_path: &Path) -> CurrentSetupState {
     CurrentSetupState::Repairable
 }
 
-#[cfg(test)]
 #[allow(dead_code)]
-pub(crate) fn collect_import_candidates_with_paths(
+pub fn collect_import_candidates_with_paths(
     output_path: &Path,
     codex_config_path: Option<&Path>,
     workspace_root: Option<&Path>,
@@ -81,7 +85,7 @@ pub(crate) fn collect_import_candidates_with_paths(
     collect_import_candidates_with_path_list(output_path, &codex_config_paths, workspace_root)
 }
 
-pub(crate) fn collect_import_candidates_with_path_list(
+pub fn collect_import_candidates_with_path_list(
     output_path: &Path,
     codex_config_paths: &[PathBuf],
     workspace_root: Option<&Path>,
@@ -96,8 +100,7 @@ pub(crate) fn collect_import_candidates_with_path_list(
     )
 }
 
-#[cfg(test)]
-pub(crate) fn collect_import_candidates_with_paths_and_readiness(
+pub fn collect_import_candidates_with_paths_and_readiness(
     output_path: &Path,
     codex_config_path: Option<&Path>,
     workspace_root: Option<&Path>,
@@ -115,7 +118,7 @@ pub(crate) fn collect_import_candidates_with_paths_and_readiness(
     )
 }
 
-pub(crate) fn collect_import_candidates_with_path_list_and_readiness(
+pub fn collect_import_candidates_with_path_list_and_readiness(
     output_path: &Path,
     codex_config_paths: &[PathBuf],
     workspace_root: Option<&Path>,
@@ -182,7 +185,7 @@ pub(crate) fn collect_import_candidates_with_path_list_and_readiness(
     Ok(candidates)
 }
 
-pub(crate) fn build_import_candidate(
+pub fn build_import_candidate(
     source_kind: ImportSourceKind,
     source: String,
     config: mvp::config::LoongClawConfig,
@@ -213,7 +216,7 @@ pub(crate) fn build_import_candidate(
     })
 }
 
-pub(crate) fn detect_import_starting_config_with_channel_readiness(
+pub fn detect_import_starting_config_with_channel_readiness(
     readiness: ChannelImportReadiness,
 ) -> mvp::config::LoongClawConfig {
     apply_channel_import_readiness(mvp::config::LoongClawConfig::default(), readiness)
@@ -227,13 +230,13 @@ fn apply_channel_import_readiness(
     config
 }
 
-pub(crate) fn resolve_channel_import_readiness_from_config(
+pub fn resolve_channel_import_readiness_from_config(
     config: &mvp::config::LoongClawConfig,
 ) -> ChannelImportReadiness {
     channels::resolve_import_readiness(config)
 }
 
-pub(crate) fn detect_workspace_guidance(root: &Path) -> Vec<WorkspaceGuidanceCandidate> {
+pub fn detect_workspace_guidance(root: &Path) -> Vec<WorkspaceGuidanceCandidate> {
     let mut guidance = Vec::new();
     for kind in [
         WorkspaceGuidanceKind::Agents,
@@ -252,15 +255,14 @@ pub(crate) fn detect_workspace_guidance(root: &Path) -> Vec<WorkspaceGuidanceCan
     guidance
 }
 
-#[cfg(test)]
-pub(crate) fn collect_import_surfaces(config: &mvp::config::LoongClawConfig) -> Vec<ImportSurface> {
+pub fn collect_import_surfaces(config: &mvp::config::LoongClawConfig) -> Vec<ImportSurface> {
     collect_import_surfaces_with_channel_readiness(
         config,
         &resolve_channel_import_readiness_from_config(config),
     )
 }
 
-pub(crate) fn collect_import_surfaces_with_channel_readiness(
+pub fn collect_import_surfaces_with_channel_readiness(
     config: &mvp::config::LoongClawConfig,
     readiness: &ChannelImportReadiness,
 ) -> Vec<ImportSurface> {
@@ -345,7 +347,8 @@ fn collect_domain_previews(
     }
 
     let default_memory = mvp::config::MemoryConfig::default();
-    if config.memory.sqlite_path != default_memory.sqlite_path
+    if config.memory.profile != default_memory.profile
+        || !memory_sqlite_path_looks_default(&config.memory.sqlite_path, &default_memory)
         || config.memory.sliding_window != default_memory.sliding_window
     {
         domains.push(DomainPreview {
@@ -353,11 +356,7 @@ fn collect_domain_previews(
             status: PreviewStatus::Ready,
             decision: source_kind.default_domain_decision(),
             source: source.to_owned(),
-            summary: format!(
-                "{} · window {}",
-                config.memory.resolved_sqlite_path().display(),
-                config.memory.sliding_window
-            ),
+            summary: memory_behavior_summary(&config.memory),
         });
     }
 
@@ -408,6 +407,23 @@ fn collect_domain_previews(
     }
 
     domains
+}
+
+fn memory_sqlite_path_looks_default(
+    sqlite_path: &str,
+    default_memory: &mvp::config::MemoryConfig,
+) -> bool {
+    if sqlite_path == default_memory.sqlite_path {
+        return true;
+    }
+
+    let current_default_path = Path::new(default_memory.sqlite_path.as_str());
+    let candidate_path = Path::new(sqlite_path);
+    candidate_path.file_name() == current_default_path.file_name()
+        && candidate_path
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|component| component == ".loongclaw")
 }
 
 fn map_surface_level(level: ImportSurfaceLevel) -> PreviewStatus {
@@ -462,7 +478,7 @@ fn load_codex_import_candidate(
     ))
 }
 
-pub(crate) fn default_detected_codex_config_paths() -> Vec<PathBuf> {
+pub fn default_detected_codex_config_paths() -> Vec<PathBuf> {
     default_codex_config_paths()
 }
 
@@ -595,6 +611,9 @@ fn cli_import_surface(config: &mvp::config::LoongClawConfig) -> Option<ImportSur
     let default_cli = mvp::config::CliChannelConfig::default();
     if config.cli.enabled == default_cli.enabled
         && config.cli.system_prompt == default_cli.system_prompt
+        && config.cli.prompt_pack_id == default_cli.prompt_pack_id
+        && config.cli.personality == default_cli.personality
+        && config.cli.system_prompt_addendum == default_cli.system_prompt_addendum
         && config.cli.exit_commands == default_cli.exit_commands
     {
         return None;
@@ -603,6 +622,65 @@ fn cli_import_surface(config: &mvp::config::LoongClawConfig) -> Option<ImportSur
         name: "cli channel",
         domain: SetupDomainKind::Cli,
         level: ImportSurfaceLevel::Ready,
-        detail: "custom CLI behavior detected".to_owned(),
+        detail: cli_behavior_summary(&config.cli),
     })
+}
+
+fn cli_behavior_summary(config: &mvp::config::CliChannelConfig) -> String {
+    let default_cli = mvp::config::CliChannelConfig::default();
+    let mut parts = Vec::new();
+    if config.uses_native_prompt_pack() {
+        parts.push("native prompt pack".to_owned());
+        parts.push(format!(
+            "personality {}",
+            crate::onboard_cli::prompt_personality_id(config.resolved_personality())
+        ));
+        if config
+            .system_prompt_addendum
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty())
+        {
+            parts.push("prompt addendum configured".to_owned());
+        }
+    } else if !config.system_prompt.trim().is_empty() {
+        parts.push("inline system prompt override".to_owned());
+    }
+    if config.exit_commands != default_cli.exit_commands {
+        parts.push(format!("exit commands {}", config.exit_commands.join(", ")));
+    }
+    if parts.is_empty() {
+        "custom CLI behavior detected".to_owned()
+    } else {
+        parts.join(" · ")
+    }
+}
+
+fn memory_behavior_summary(config: &mvp::config::MemoryConfig) -> String {
+    format!(
+        "profile {} · {} · window {}",
+        config.profile.as_str(),
+        config.resolved_sqlite_path().display(),
+        config.sliding_window
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_import_surface_detects_prompt_pack_metadata_changes() {
+        let mut config = mvp::config::LoongClawConfig::default();
+        config.cli.personality = Some(mvp::prompt::PromptPersonality::FriendlyCollab);
+
+        let surfaces = collect_import_surfaces(&config);
+
+        assert!(
+            surfaces
+                .iter()
+                .any(|surface| surface.domain == SetupDomainKind::Cli),
+            "changing prompt-pack personality metadata should mark the CLI domain as imported: {surfaces:#?}"
+        );
+    }
 }

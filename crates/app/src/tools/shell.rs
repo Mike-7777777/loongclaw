@@ -7,11 +7,11 @@ use serde_json::{Value, json};
 
 pub(super) fn execute_shell_tool_with_config(
     request: ToolCoreRequest,
-    _config: &super::runtime_config::ToolRuntimeConfig,
+    config: &super::runtime_config::ToolRuntimeConfig,
 ) -> Result<ToolCoreOutcome, String> {
     #[cfg(not(feature = "tool-shell"))]
     {
-        let _ = (request, _config);
+        let _ = (request, config);
         return Err(
             "shell tool is disabled in this build (enable feature `tool-shell`)".to_owned(),
         );
@@ -45,7 +45,28 @@ pub(super) fn execute_shell_tool_with_config(
             .map(PathBuf::from)
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
-        let output = Command::new(command)
+        let normalized_command =
+            crate::tools::shell_policy_ext::validate_shell_command_name(command)?;
+        let basename = normalized_command.as_str();
+
+        if config.shell_deny.contains(basename) {
+            return Err(format!(
+                "policy_denied: shell command `{basename}` is blocked by shell policy"
+            ));
+        }
+
+        let explicitly_allowed = config.shell_allow.contains(basename);
+        let default_allows = matches!(
+            config.shell_default_mode,
+            crate::tools::shell_policy_ext::ShellPolicyDefault::Allow
+        );
+        if !explicitly_allowed && !default_allows {
+            return Err(format!(
+                "policy_denied: shell command `{basename}` is not in the allow list (default-deny policy)"
+            ));
+        }
+
+        let output = Command::new(&normalized_command)
             .args(&args)
             .current_dir(&cwd)
             .output()

@@ -6,10 +6,10 @@ use serde_json::{Map, Value, json};
 use std::{collections::BTreeSet, path::Path};
 
 #[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
-pub(crate) enum SkillsCommands {
-    /// List installed managed external skills
+pub enum SkillsCommands {
+    /// List discovered external skills across managed, user, and project scopes
     List,
-    /// Inspect one installed managed external skill
+    /// Inspect one resolved external skill
     #[command(visible_alias = "inspect")]
     Info { skill_id: String },
     /// Install a managed external skill from a local directory or archive
@@ -17,6 +17,17 @@ pub(crate) enum SkillsCommands {
         path: String,
         #[arg(long)]
         skill_id: Option<String>,
+        #[arg(long, default_value_t = false)]
+        replace: bool,
+    },
+    /// Install a first-party bundled managed external skill
+    InstallBundled {
+        skill_id: String,
+        #[arg(long, default_value_t = false)]
+        replace: bool,
+    },
+    /// Enable the managed browser preview flow and install its bundled helper skill
+    EnableBrowserPreview {
         #[arg(long, default_value_t = false)]
         replace: bool,
     },
@@ -30,7 +41,7 @@ pub(crate) enum SkillsCommands {
 }
 
 #[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
-pub(crate) enum SkillsPolicyCommands {
+pub enum SkillsPolicyCommands {
     /// Show the persisted external-skills runtime policy
     #[command(visible_alias = "show")]
     Get,
@@ -40,6 +51,8 @@ pub(crate) enum SkillsPolicyCommands {
         enabled: Option<bool>,
         #[arg(long)]
         require_download_approval: Option<bool>,
+        #[arg(long)]
+        auto_expose_installed: Option<bool>,
         #[arg(long = "allow-domain")]
         allowed_domains: Vec<String>,
         #[arg(long, default_value_t = false)]
@@ -59,19 +72,19 @@ pub(crate) enum SkillsPolicyCommands {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct SkillsCommandOptions {
+pub struct SkillsCommandOptions {
     pub config: Option<String>,
     pub json: bool,
     pub command: SkillsCommands,
 }
 
 #[derive(Debug)]
-pub(crate) struct SkillsCommandExecution {
+pub struct SkillsCommandExecution {
     pub resolved_config_path: String,
     pub outcome: ToolCoreOutcome,
 }
 
-pub(crate) fn run_skills_cli(options: SkillsCommandOptions) -> CliResult<()> {
+pub fn run_skills_cli(options: SkillsCommandOptions) -> CliResult<()> {
     let as_json = options.json;
     let execution = execute_skills_command(options)?;
     if as_json {
@@ -85,13 +98,37 @@ pub(crate) fn run_skills_cli(options: SkillsCommandOptions) -> CliResult<()> {
     Ok(())
 }
 
-pub(crate) fn execute_skills_command(
-    options: SkillsCommandOptions,
-) -> CliResult<SkillsCommandExecution> {
+pub fn execute_skills_command(options: SkillsCommandOptions) -> CliResult<SkillsCommandExecution> {
     let (resolved_path, mut config) = mvp::config::load(options.config.as_deref())?;
     let outcome = match options.command {
         SkillsCommands::Policy { command } => {
             execute_policy_command(&resolved_path, &mut config, command)?
+        }
+        SkillsCommands::EnableBrowserPreview { replace } => {
+            execute_enable_browser_preview_command(&resolved_path, &mut config, replace)?
+        }
+        command @ (SkillsCommands::List
+        | SkillsCommands::Info { .. }
+        | SkillsCommands::Install { .. }
+        | SkillsCommands::InstallBundled { .. }
+        | SkillsCommands::Remove { .. }) => {
+            execute_non_policy_skills_command(&resolved_path, &config, command)?
+        }
+    };
+    Ok(SkillsCommandExecution {
+        resolved_config_path: resolved_path.display().to_string(),
+        outcome,
+    })
+}
+
+fn execute_non_policy_skills_command(
+    resolved_path: &Path,
+    config: &mvp::config::LoongClawConfig,
+    command: SkillsCommands,
+) -> CliResult<ToolCoreOutcome> {
+    match command {
+        SkillsCommands::InstallBundled { skill_id, replace } => {
+            execute_install_bundled_skill_command(resolved_path, config, &skill_id, replace)
         }
         command @ (SkillsCommands::List
         | SkillsCommands::Info { .. }
@@ -99,17 +136,16 @@ pub(crate) fn execute_skills_command(
         | SkillsCommands::Remove { .. }) => {
             let tool_runtime_config =
                 mvp::tools::runtime_config::ToolRuntimeConfig::from_loongclaw_config(
-                    &config,
-                    Some(&resolved_path),
+                    config,
+                    Some(resolved_path),
                 );
             let request = build_skills_tool_request(command)?;
-            mvp::tools::execute_tool_core_with_config(request, &tool_runtime_config)?
+            mvp::tools::execute_tool_core_with_config(request, &tool_runtime_config)
         }
-    };
-    Ok(SkillsCommandExecution {
-        resolved_config_path: resolved_path.display().to_string(),
-        outcome,
-    })
+        SkillsCommands::Policy { .. } | SkillsCommands::EnableBrowserPreview { .. } => {
+            Err("unexpected skills CLI command routed through non-policy execution path".to_owned())
+        }
+    }
 }
 
 fn build_skills_tool_request(command: SkillsCommands) -> CliResult<ToolCoreRequest> {
@@ -139,6 +175,9 @@ fn build_skills_tool_request(command: SkillsCommands) -> CliResult<ToolCoreReque
                 tool_name: "external_skills.install".to_owned(),
                 payload: Value::Object(payload),
             })
+        }
+        SkillsCommands::InstallBundled { .. } | SkillsCommands::EnableBrowserPreview { .. } => {
+            Err("bundled skills install requests are handled directly by the daemon CLI".to_owned())
         }
         SkillsCommands::Remove { skill_id } => Ok(ToolCoreRequest {
             tool_name: "external_skills.remove".to_owned(),
@@ -177,6 +216,7 @@ fn execute_policy_command(
             config.external_skills.require_download_approval = defaults.require_download_approval;
             config.external_skills.allowed_domains = defaults.allowed_domains;
             config.external_skills.blocked_domains = defaults.blocked_domains;
+            config.external_skills.auto_expose_installed = defaults.auto_expose_installed;
             persist_config_update(resolved_path, config)?;
             Ok(ToolCoreOutcome {
                 status: "ok".to_owned(),
@@ -193,6 +233,7 @@ fn execute_policy_command(
         SkillsPolicyCommands::Set {
             enabled,
             require_download_approval,
+            auto_expose_installed,
             allowed_domains,
             clear_allowed_domains,
             blocked_domains,
@@ -214,6 +255,7 @@ fn execute_policy_command(
 
             let has_mutation = enabled.is_some()
                 || require_download_approval.is_some()
+                || auto_expose_installed.is_some()
                 || clear_allowed_domains
                 || !allowed_domains.is_empty()
                 || clear_blocked_domains
@@ -229,19 +271,20 @@ fn execute_policy_command(
             if let Some(require_download_approval) = require_download_approval {
                 config.external_skills.require_download_approval = require_download_approval;
             }
+            if let Some(auto_expose_installed) = auto_expose_installed {
+                config.external_skills.auto_expose_installed = auto_expose_installed;
+            }
             if clear_allowed_domains {
                 config.external_skills.allowed_domains.clear();
             } else if !allowed_domains.is_empty() {
                 config.external_skills.allowed_domains =
-                    normalize_domain_inputs(allowed_domains)
-                        .map_err(|error| format!("invalid --allow-domain value: {error}"))?;
+                    normalize_domain_inputs("--allow-domain", allowed_domains)?;
             }
             if clear_blocked_domains {
                 config.external_skills.blocked_domains.clear();
             } else if !blocked_domains.is_empty() {
                 config.external_skills.blocked_domains =
-                    normalize_domain_inputs(blocked_domains)
-                        .map_err(|error| format!("invalid --block-domain value: {error}"))?;
+                    normalize_domain_inputs("--block-domain", blocked_domains)?;
             }
 
             persist_config_update(resolved_path, config)?;
@@ -279,6 +322,128 @@ fn persist_config_update(
     mvp::config::write(Some(path.as_ref()), config, true).map(|_| ())
 }
 
+fn execute_install_bundled_skill_command(
+    resolved_path: &Path,
+    config: &mvp::config::LoongClawConfig,
+    skill_id: &str,
+    replace: bool,
+) -> CliResult<ToolCoreOutcome> {
+    let tool_runtime_config = mvp::tools::runtime_config::ToolRuntimeConfig::from_loongclaw_config(
+        config,
+        Some(resolved_path),
+    );
+    let request = ToolCoreRequest {
+        tool_name: "external_skills.install".to_owned(),
+        payload: json!({
+            "bundled_skill_id": skill_id,
+            "replace": replace,
+        }),
+    };
+    mvp::tools::execute_tool_core_with_config(request, &tool_runtime_config)
+}
+
+fn execute_enable_browser_preview_command(
+    resolved_path: &Path,
+    config: &mut mvp::config::LoongClawConfig,
+    replace: bool,
+) -> CliResult<ToolCoreOutcome> {
+    let mut updated_config = config.clone();
+    let config_updated = crate::browser_preview::ensure_browser_preview_config(&mut updated_config);
+    if crate::browser_preview::shell_policy_explicitly_denies_command(
+        &updated_config,
+        mvp::tools::BROWSER_COMPANION_COMMAND,
+    ) {
+        return Err(
+            "browser preview cannot be enabled while [tools].shell_deny blocks `agent-browser`; remove that entry and retry"
+                .to_owned(),
+        );
+    }
+
+    if config_updated {
+        persist_config_update(resolved_path, &updated_config)?;
+    }
+    let install_result = execute_install_bundled_skill_command(
+        resolved_path,
+        &updated_config,
+        crate::browser_preview::BROWSER_PREVIEW_SKILL_ID,
+        replace
+            || crate::browser_preview::inspect_browser_preview_state(&updated_config)
+                .skill_installed,
+    );
+    let mut outcome = match install_result {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            if config_updated {
+                persist_config_update(resolved_path, config).map_err(|rollback_error| {
+                    format!("{error}; browser preview config rollback failed: {rollback_error}")
+                })?;
+            }
+            return Err(error);
+        }
+    };
+    *config = updated_config;
+    let resolved_config_path = resolved_path.display().to_string();
+    let runtime_available =
+        crate::browser_preview::inspect_browser_preview_state(config).runtime_available;
+    let cli_enabled = config.cli.enabled;
+    let recipes = if cli_enabled {
+        crate::browser_preview::browser_preview_recipe_commands(&resolved_config_path)
+    } else {
+        Vec::new()
+    };
+    let doctor_command =
+        crate::cli_handoff::format_subcommand_with_config("doctor", &resolved_config_path);
+    let mut next_steps = if runtime_available {
+        let mut steps = Vec::new();
+        if cli_enabled && let Some(first_recipe) = recipes.first() {
+            steps.push(format!(
+                "Try browser companion preview: {}",
+                first_recipe.command
+            ));
+        }
+        steps.push(format!("Run diagnostics: {doctor_command}"));
+        steps
+    } else {
+        vec![
+            crate::browser_preview::browser_preview_install_step(),
+            crate::browser_preview::browser_preview_verify_step(),
+            format!("Run diagnostics: {doctor_command}"),
+        ]
+    };
+    if !cli_enabled {
+        next_steps.push("Re-enable `cli.enabled` before running the preview recipes.".to_owned());
+    }
+
+    if let Some(payload) = outcome.payload.as_object_mut() {
+        payload.insert(
+            "tool_name".to_owned(),
+            json!("skills.enable-browser-preview"),
+        );
+        payload.insert("config_updated".to_owned(), json!(config_updated));
+        payload.insert("browser_preview_enabled".to_owned(), json!(true));
+        payload.insert(
+            "runtime_binary_available".to_owned(),
+            json!(runtime_available),
+        );
+        payload.insert("cli_enabled".to_owned(), json!(cli_enabled));
+        payload.insert("next_steps".to_owned(), json!(next_steps));
+        payload.insert(
+            "recipes".to_owned(),
+            json!(
+                recipes
+                    .into_iter()
+                    .map(|recipe| json!({
+                        "label": recipe.label,
+                        "command": recipe.command,
+                    }))
+                    .collect::<Vec<_>>()
+            ),
+        );
+    }
+
+    Ok(outcome)
+}
+
 fn persistent_policy_payload(config: &mvp::config::LoongClawConfig) -> Value {
     json!({
         "enabled": config.external_skills.enabled,
@@ -293,16 +458,17 @@ fn persistent_policy_payload(config: &mvp::config::LoongClawConfig) -> Value {
     })
 }
 
-fn normalize_domain_inputs(entries: Vec<String>) -> Result<Vec<String>, String> {
+fn normalize_domain_inputs(flag: &str, entries: Vec<String>) -> CliResult<Vec<String>> {
     let mut normalized = BTreeSet::new();
     for entry in entries {
-        let value = mvp::tools::normalize_external_skills_domain_rule(&entry)?;
+        let value = mvp::tools::normalize_external_skill_domain_rule(entry.as_str())
+            .map_err(|error| format!("invalid domain rule for {flag}: {error}"))?;
         normalized.insert(value);
     }
     Ok(normalized.into_iter().collect())
 }
 
-pub(crate) fn skills_cli_json(execution: &SkillsCommandExecution) -> Value {
+pub fn skills_cli_json(execution: &SkillsCommandExecution) -> Value {
     json!({
         "config": execution.resolved_config_path,
         "status": execution.outcome.status,
@@ -310,7 +476,7 @@ pub(crate) fn skills_cli_json(execution: &SkillsCommandExecution) -> Value {
     })
 }
 
-pub(crate) fn render_skills_cli_text(execution: &SkillsCommandExecution) -> CliResult<String> {
+pub fn render_skills_cli_text(execution: &SkillsCommandExecution) -> CliResult<String> {
     let payload = &execution.outcome.payload;
     let tool_name = payload
         .get("tool_name")
@@ -329,23 +495,17 @@ pub(crate) fn render_skills_cli_text(execution: &SkillsCommandExecution) -> CliR
             } else {
                 lines.push("skills:".to_owned());
                 for skill in skills {
-                    let skill_id = skill
-                        .get("skill_id")
-                        .and_then(Value::as_str)
-                        .unwrap_or("<unknown>");
-                    let active = if skill.get("active").and_then(Value::as_bool).unwrap_or(true) {
-                        "active"
-                    } else {
-                        "inactive"
-                    };
-                    let display_name = skill
-                        .get("display_name")
-                        .and_then(Value::as_str)
-                        .unwrap_or("-");
-                    let summary = skill.get("summary").and_then(Value::as_str).unwrap_or("-");
-                    lines.push(format!(
-                        "- {skill_id} [{active}] display_name={display_name} summary={summary}"
-                    ));
+                    lines.push(format!("- {}", render_skill_summary_line(skill)));
+                }
+            }
+            let shadowed = payload
+                .get("shadowed_skills")
+                .and_then(Value::as_array)
+                .ok_or_else(|| "skills list payload missing `shadowed_skills` array".to_owned())?;
+            if !shadowed.is_empty() {
+                lines.push("shadowed skills:".to_owned());
+                for skill in shadowed {
+                    lines.push(format!("- {}", render_skill_summary_line(skill)));
                 }
             }
         }
@@ -366,8 +526,19 @@ pub(crate) fn render_skills_cli_text(execution: &SkillsCommandExecution) -> CliR
                     .unwrap_or("-")
             ));
             lines.push(format!(
+                "scope={}",
+                skill.get("scope").and_then(Value::as_str).unwrap_or("-")
+            ));
+            lines.push(format!(
                 "active={}",
                 skill.get("active").and_then(Value::as_bool).unwrap_or(true)
+            ));
+            lines.push(format!(
+                "source_path={}",
+                skill
+                    .get("source_path")
+                    .and_then(Value::as_str)
+                    .unwrap_or("-")
             ));
             lines.push(format!(
                 "install_path={}",
@@ -395,8 +566,18 @@ pub(crate) fn render_skills_cli_text(execution: &SkillsCommandExecution) -> CliR
                     .unwrap_or("-")
                     .to_owned(),
             );
+            let shadowed = payload
+                .get("shadowed_skills")
+                .and_then(Value::as_array)
+                .ok_or_else(|| "skills info payload missing `shadowed_skills` array".to_owned())?;
+            if !shadowed.is_empty() {
+                lines.push("shadowed skills:".to_owned());
+                for shadowed_skill in shadowed {
+                    lines.push(format!("- {}", render_skill_summary_line(shadowed_skill)));
+                }
+            }
         }
-        "external_skills.install" => {
+        "external_skills.install" | "skills.enable-browser-preview" => {
             lines.push(format!(
                 "installed skill_id={}",
                 payload
@@ -432,6 +613,30 @@ pub(crate) fn render_skills_cli_text(execution: &SkillsCommandExecution) -> CliR
                     .and_then(Value::as_bool)
                     .unwrap_or(false)
             ));
+            if tool_name == "skills.enable-browser-preview" {
+                lines.push("browser preview enabled via bundled helper skill".to_owned());
+                lines.push(format!(
+                    "config_updated={}",
+                    payload
+                        .get("config_updated")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                ));
+                lines.push(format!(
+                    "runtime_binary_available={}",
+                    payload
+                        .get("runtime_binary_available")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                ));
+                render_string_section(
+                    &mut lines,
+                    "next steps:",
+                    payload.get("next_steps"),
+                    "skills enable-browser-preview payload missing `next_steps` array",
+                )?;
+                render_recipe_section(&mut lines, payload.get("recipes"))?;
+            }
         }
         "external_skills.remove" => {
             lines.push(format!(
@@ -530,4 +735,69 @@ fn render_string_list(value: Option<&Value>) -> String {
             }
         })
         .unwrap_or_else(|| "-".to_owned())
+}
+
+fn render_string_section(
+    lines: &mut Vec<String>,
+    heading: &str,
+    value: Option<&Value>,
+    missing_error: &str,
+) -> CliResult<()> {
+    let items = value
+        .and_then(Value::as_array)
+        .ok_or_else(|| missing_error.to_owned())?;
+    if items.is_empty() {
+        return Ok(());
+    }
+
+    lines.push(heading.to_owned());
+    for item in items {
+        let rendered = item
+            .as_str()
+            .ok_or_else(|| format!("{missing_error}: entries must be strings"))?;
+        lines.push(format!("- {rendered}"));
+    }
+    Ok(())
+}
+
+fn render_recipe_section(lines: &mut Vec<String>, value: Option<&Value>) -> CliResult<()> {
+    let recipes = value.and_then(Value::as_array).ok_or_else(|| {
+        "skills enable-browser-preview payload missing `recipes` array".to_owned()
+    })?;
+    if recipes.is_empty() {
+        return Ok(());
+    }
+
+    lines.push("recipes:".to_owned());
+    for recipe in recipes {
+        let label = recipe
+            .get("label")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "browser preview recipe is missing `label`".to_owned())?;
+        let command = recipe
+            .get("command")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "browser preview recipe is missing `command`".to_owned())?;
+        lines.push(format!("- {label}: {command}"));
+    }
+    Ok(())
+}
+
+fn render_skill_summary_line(skill: &Value) -> String {
+    let skill_id = skill
+        .get("skill_id")
+        .and_then(Value::as_str)
+        .unwrap_or("<unknown>");
+    let active = if skill.get("active").and_then(Value::as_bool).unwrap_or(true) {
+        "active"
+    } else {
+        "inactive"
+    };
+    let scope = skill.get("scope").and_then(Value::as_str).unwrap_or("-");
+    let display_name = skill
+        .get("display_name")
+        .and_then(Value::as_str)
+        .unwrap_or("-");
+    let summary = skill.get("summary").and_then(Value::as_str).unwrap_or("-");
+    format!("{skill_id} [{active}] scope={scope} display_name={display_name} summary={summary}")
 }
